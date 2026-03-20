@@ -7,7 +7,7 @@
 # Build from the repository root:
 #   docker build -f docker/worker.Dockerfile -t remerge-worker .
 
-FROM rust:1.85-bookworm AS builder
+FROM rust:1.94-bookworm AS builder
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
