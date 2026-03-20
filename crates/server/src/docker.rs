@@ -3,11 +3,11 @@
 use anyhow::{Context, Result};
 use bollard::{
     Docker,
-    container::{
-        Config, CreateContainerOptions, LogsOptions, RemoveContainerOptions, StartContainerOptions,
+    models::{ContainerCreateBody, HostConfig},
+    query_parameters::{
+        BuildImageOptions, CreateContainerOptions, LogsOptions, RemoveContainerOptions,
+        StartContainerOptions,
     },
-    image::BuildImageOptions,
-    models::HostConfig,
 };
 use futures::StreamExt;
 use tracing::{debug, info};
@@ -126,12 +126,12 @@ impl DockerManager {
 
         let mut stream = self.docker.build_image(
             BuildImageOptions {
-                t: tag.to_string(),
+                t: Some(tag.to_string()),
                 rm: true,
                 ..Default::default()
             },
             None,
-            Some(tar_bytes.into()),
+            Some(bollard::body_full(tar_bytes.into())),
         );
 
         while let Some(result) = stream.next().await {
@@ -272,7 +272,7 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
         env.push(format!("REMERGE_PARALLEL_JOBS={parallel_jobs}"));
         env.push(format!("REMERGE_LOAD_AVERAGE={load_average:.1}"));
 
-        let config = Config {
+        let config = ContainerCreateBody {
             image: Some(image_tag.to_string()),
             env: Some(env),
             host_config: Some(host_config),
@@ -283,7 +283,7 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
             .docker
             .create_container(
                 Some(CreateContainerOptions {
-                    name: container_name,
+                    name: Some(container_name.to_string()),
                     ..Default::default()
                 }),
                 config,
@@ -292,7 +292,7 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
             .context("Failed to create worker container")?;
 
         self.docker
-            .start_container(&resp.id, None::<StartContainerOptions<String>>)
+            .start_container(&resp.id, None::<StartContainerOptions>)
             .await
             .context("Failed to start worker container")?;
 
@@ -308,7 +308,7 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
         self.docker
             .logs(
                 container_id,
-                Some(LogsOptions::<String> {
+                Some(LogsOptions {
                     follow: true,
                     stdout: true,
                     stderr: true,
@@ -320,7 +320,7 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
 
     /// Wait for a container to finish and return exit code.
     pub async fn wait_container(&self, container_id: &str) -> Result<i64> {
-        use bollard::container::WaitContainerOptions;
+        use bollard::query_parameters::WaitContainerOptions;
         use futures::TryStreamExt;
 
         let exit = self
@@ -328,7 +328,7 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
             .wait_container(
                 container_id,
                 Some(WaitContainerOptions {
-                    condition: "not-running",
+                    condition: String::from("not-running"),
                 }),
             )
             .try_next()
@@ -355,7 +355,7 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
 
     /// Remove a Docker image by tag.
     pub async fn remove_image(&self, tag: &str) -> Result<()> {
-        use bollard::image::RemoveImageOptions;
+        use bollard::query_parameters::RemoveImageOptions;
         self.docker
             .remove_image(
                 tag,
@@ -372,9 +372,15 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
 
     /// Stop a running container (for build cancellation).
     pub async fn stop_container(&self, container_id: &str) -> Result<()> {
-        use bollard::container::StopContainerOptions;
+        use bollard::query_parameters::StopContainerOptions;
         self.docker
-            .stop_container(container_id, Some(StopContainerOptions { t: 10 }))
+            .stop_container(
+                container_id,
+                Some(StopContainerOptions {
+                    t: Some(10),
+                    ..Default::default()
+                }),
+            )
             .await
             .context("Failed to stop container")?;
         Ok(())
