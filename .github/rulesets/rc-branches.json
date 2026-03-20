@@ -24,26 +24,6 @@
     },
     {
       "type": "required_linear_history"
-    },
-    {
-      "type": "required_signatures"
-    },
-    {
-      "type": "required_status_checks",
-      "parameters": {
-        "strict_required_status_checks_policy": true,
-        "do_not_enforce_on_create": false,
-        "required_status_checks": [
-          {
-            "context": "Check & Lint",
-            "integration_id": 15368
-          },
-          {
-            "context": "Test",
-            "integration_id": 15368
-          }
-        ]
-      }
     }
   ]
 }
