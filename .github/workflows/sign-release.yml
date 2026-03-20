@@ -1,0 +1,116 @@
+# Final PGP signing of all release artifacts + release body.
+#
+# This is the LAST step in the release pipeline:
+#   1. release.yml      — build, package, checksums, SLSA attestation, create release
+#   2. virustotal.yml   — scan assets, append VT analysis links to release body
+#   3. sign-release.yml — PGP-sign all artifacts + clear-sign the final release body
+#
+# The clear-signed release body (RELEASE.md.asc) acts as a cryptographic
+# "seal" over the complete release — including VT results and attestation
+# metadata — providing proof that the maintainer endorsed the final state.
+#
+# Enable by adding GPG_PRIVATE_KEY (and optionally GPG_PASSPHRASE) secrets.
+
+name: Sign Release
+
+on:
+  workflow_run:
+    workflows: ["VirusTotal Scan"]
+    types: [completed]
+
+permissions:
+  contents: write
+
+jobs:
+  sign:
+    name: PGP-sign release artifacts
+    runs-on: ubuntu-latest
+    if: github.event.workflow_run.conclusion == 'success'
+    env:
+      HAS_GPG_KEY: ${{ secrets.GPG_PRIVATE_KEY != '' }}
+    steps:
+      - name: Get release from triggering workflow
+        id: release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // The VirusTotal workflow triggers on release:published,
+            // so the head_branch is the tag name.
+            const tag = context.payload.workflow_run.head_branch;
+            if (!tag) {
+              core.setFailed('Could not determine tag from workflow_run');
+              return;
+            }
+
+            const { data: release } = await github.rest.repos.getReleaseByTag({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag: tag,
+            });
+
+            core.setOutput('id', release.id);
+            core.setOutput('tag', tag);
+            core.setOutput('body', release.body || '');
+            core.setOutput('upload_url', release.upload_url);
+
+      - name: Download release assets
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const releaseId = ${{ steps.release.outputs.id }};
+            const { data: assets } = await github.rest.repos.listReleaseAssets({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: releaseId,
+            });
+
+            for (const asset of assets) {
+              // Skip any pre-existing .asc files
+              if (asset.name.endsWith('.asc')) continue;
+
+              const { data } = await github.rest.repos.getReleaseAsset({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                asset_id: asset.id,
+                headers: { Accept: 'application/octet-stream' },
+              });
+
+              fs.writeFileSync(asset.name, Buffer.from(data));
+              core.info(`Downloaded: ${asset.name}`);
+            }
+
+      - name: Save release body for clear-signing
+        run: |
+          cat <<'RELEASE_BODY_EOF' > RELEASE.md
+          ${{ steps.release.outputs.body }}
+          RELEASE_BODY_EOF
+
+      - name: PGP sign all artifacts (detached)
+        if: env.HAS_GPG_KEY == 'true'
+        uses: cbrgm/pgp-sign-artifact-action@v1
+        with:
+          private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
+          detach_sign: true
+          files: |
+            *.tar.gz
+            *-SHA256SUMS.txt
+
+      - name: PGP clear-sign release body
+        if: env.HAS_GPG_KEY == 'true'
+        uses: cbrgm/pgp-sign-artifact-action@v1
+        with:
+          private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
+          clear_sign: true
+          files: |
+            RELEASE.md
+
+      - name: Upload signatures to release
+        if: env.HAS_GPG_KEY == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          files: |
+            *.asc

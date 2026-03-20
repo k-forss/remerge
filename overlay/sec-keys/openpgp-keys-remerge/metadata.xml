@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE pkgmetadata SYSTEM "https://www.gentoo.org/dtd/metadata.dtd">
+<pkgmetadata>
+  <maintainer type="person">
+    <email>kristoffer@forss.cc</email>
+    <name>Kristoffer Forss</name>
+  </maintainer>
+  <longdescription lang="en">
+    OpenPGP public key used to verify signatures on remerge release
+    artifacts from GitHub Releases.  Used by the verify-sig eclass
+    in the remerge and remerge-server binary ebuilds.
+
+    Key fingerprint: C075 B1EF DC2E 4D23 817A  1BB3 F5B0 BB05 FABD 6151
+  </longdescription>
+  <upstream>
+    <remote-id type="github">k-forss/remerge</remote-id>
+  </upstream>
+</pkgmetadata>

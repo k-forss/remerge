@@ -1,0 +1,159 @@
+# Build multi-architecture release binaries and create a GitHub Release.
+#
+# Release pipeline (three sequential workflows):
+#   1. release.yml (this)  — build, package, checksums, SLSA attestation, create release
+#   2. virustotal.yml      — scan assets, append VT analysis links to release body
+#   3. sign-release.yml    — PGP-sign all artifacts + final release body as "seal"
+#
+# Build matrix:
+#   CLI:    amd64, arm64, arm, riscv64, ppc64
+#   Server: amd64, arm64
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # CLI — all architectures
+          - name: remerge-amd64
+            target: x86_64-unknown-linux-gnu
+            binary: remerge
+            package: remerge
+            arch: amd64
+            cross: false
+          - name: remerge-arm64
+            target: aarch64-unknown-linux-gnu
+            binary: remerge
+            package: remerge
+            arch: arm64
+            cross: true
+          - name: remerge-arm
+            target: armv7-unknown-linux-gnueabihf
+            binary: remerge
+            package: remerge
+            arch: arm
+            cross: true
+          - name: remerge-riscv64
+            target: riscv64gc-unknown-linux-gnu
+            binary: remerge
+            package: remerge
+            arch: riscv64
+            cross: true
+          - name: remerge-ppc64
+            target: powerpc64le-unknown-linux-gnu
+            binary: remerge
+            package: remerge
+            arch: ppc64
+            cross: true
+          # Server — amd64 + arm64 only
+          - name: remerge-server-amd64
+            target: x86_64-unknown-linux-gnu
+            binary: remerge-server
+            package: remerge-server
+            arch: amd64
+            cross: false
+          - name: remerge-server-arm64
+            target: aarch64-unknown-linux-gnu
+            binary: remerge-server
+            package: remerge-server
+            arch: arm64
+            cross: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross
+        uses: taiki-e/install-action@cross
+
+      - name: Build
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} --bin ${{ matrix.binary }}
+          else
+            cargo build --release --target ${{ matrix.target }} --bin ${{ matrix.binary }}
+          fi
+
+      - name: Package
+        run: |
+          tar czf ${{ matrix.binary }}-${{ github.ref_name }}-${{ matrix.arch }}-linux.tar.gz \
+            -C target/${{ matrix.target }}/release ${{ matrix.binary }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: "*.tar.gz"
+
+  release:
+    name: Create release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Package overlay
+        run: |
+          tar czf remerge-${{ github.ref_name }}-overlay.tar.gz \
+            -C overlay .
+
+      - name: Generate checksums
+        run: |
+          sha256sum *.tar.gz \
+            > remerge-${{ github.ref_name }}-SHA256SUMS.txt
+
+      - name: Attest build provenance
+        uses: actions/attest@v2
+        with:
+          subject-path: "*.tar.gz"
+
+      - name: Extract changelog
+        id: changelog
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v ver="$VERSION" '
+            /^## \[/ { if (found) exit; if (index($0, "[" ver "]")) { found=1; next } }
+            found { print }
+          ' CHANGELOG.md | sed -e '/./,$!d' -e :a -e '/^\s*$/{ $d; N; ba; }' \
+            > /tmp/release-body.md
+          if [ ! -s /tmp/release-body.md ]; then
+            echo "⚠ No changelog entry found for ${VERSION}" > /tmp/release-body.md
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: /tmp/release-body.md
+          files: |
+            *.tar.gz
+            *-SHA256SUMS.txt

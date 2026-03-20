@@ -1,0 +1,32 @@
+[Unit]
+Description=remerge distributed binary package build server
+Documentation=https://github.com/k-forss/remerge
+After=network-online.target docker.service
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/remerge-server --listen 0.0.0.0:7654 --config /etc/remerge/server.toml
+Restart=on-failure
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/cache/remerge
+PrivateTmp=true
+
+# Docker socket access
+SupplementaryGroups=docker
+
+# Logging
+Environment=RUST_LOG=remerge_server=info,tower_http=info
+
+# Optional: binary package signing
+# Environment=REMERGE_GPG_KEY=0x1234567890ABCDEF
+# Environment=REMERGE_GPG_HOME=/var/cache/remerge/gnupg
+
+[Install]
+WantedBy=multi-user.target

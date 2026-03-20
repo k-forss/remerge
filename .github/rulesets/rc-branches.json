@@ -1,0 +1,42 @@
+{
+  "name": "Protect RC branches",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": {
+      "include": ["refs/heads/rc-*"],
+      "exclude": []
+    }
+  },
+  "bypass_actors": [],
+  "rules": [
+    {
+      "type": "deletion"
+    },
+    {
+      "type": "non_fast_forward"
+    },
+    {
+      "type": "required_linear_history"
+    },
+    {
+      "type": "required_signatures"
+    },
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "strict_status_checks_policy": true,
+        "required_status_checks": [
+          {
+            "context": "Check & Lint",
+            "integration_id": 15368
+          },
+          {
+            "context": "Test",
+            "integration_id": 15368
+          }
+        ]
+      }
+    }
+  ]
+}

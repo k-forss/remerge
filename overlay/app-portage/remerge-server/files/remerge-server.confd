@@ -1,0 +1,16 @@
+# /etc/conf.d/remerge-server
+#
+# Configuration for the remerge build server OpenRC service.
+
+# Listen address and port.
+REMERGE_LISTEN="0.0.0.0:7654"
+
+# Path to the server configuration file.
+REMERGE_CONFIG="/etc/remerge/server.toml"
+
+# Log level (trace, debug, info, warn, error).
+# export RUST_LOG="remerge_server=info,tower_http=info"
+
+# Optional: binary package signing
+# export REMERGE_GPG_KEY="0x1234567890ABCDEF"
+# export REMERGE_GPG_HOME="/var/cache/remerge/gnupg"

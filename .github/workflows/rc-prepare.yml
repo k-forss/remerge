@@ -1,0 +1,333 @@
+# Prepare a release candidate.
+#
+# When an `rc-*` branch is pushed, this workflow:
+#   1. Extracts the version from the branch name (e.g. rc-0.2.0 → 0.2.0)
+#   2. Updates CHANGELOG.md: renames [Unreleased] → [version] — date
+#   3. Generates CRATES variable from Cargo.lock for versioned ebuilds
+#   4. Creates versioned ebuilds for CLI and server in the overlay
+#   5. Creates versioned binary ebuilds for CLI and server
+#   6. Commits and pushes the changes to the RC branch
+#
+# After review, merge the RC branch to main to trigger tag creation
+# via the release-tag workflow.
+
+name: Prepare RC
+
+on:
+  push:
+    branches: ["rc-*"]
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    name: Prepare release candidate
+    runs-on: ubuntu-latest
+    # Skip commits made by this workflow to avoid infinite loops.
+    if: "!contains(github.event.head_commit.message, 'release: prepare')"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version from branch name
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME#rc-}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Branch name must be rc-X.Y.Z (got: $GITHUB_REF_NAME)"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "::notice::Preparing release v$VERSION"
+
+      - name: Update CHANGELOG
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          DATE=$(date +%Y-%m-%d)
+          sed -i "s/^## \[Unreleased\]/## [Unreleased]\n\n## [$VERSION] — $DATE/" CHANGELOG.md
+
+      - name: Generate CRATES list from Cargo.lock
+        run: |
+          python3 -c "
+          import tomllib, sys
+          with open('Cargo.lock', 'rb') as f:
+              lock = tomllib.load(f)
+          crates = []
+          for pkg in lock['package']:
+              if 'registry' in pkg.get('source', ''):
+                  crates.append(f\"    {pkg['name']}@{pkg['version']}\")
+          crates.sort()
+          print('\n'.join(crates))
+          " > /tmp/crates-list.txt
+          echo "::notice::Generated $(wc -l < /tmp/crates-list.txt) crate entries"
+
+      - name: Create versioned source ebuilds from 9999 templates
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+
+          generate_source_ebuild() {
+            local TEMPLATE="$1" OUTPUT="$2" PKG_NAME="$3"
+            if [ -f "$OUTPUT" ]; then
+              echo "::notice::$OUTPUT already exists, updating CRATES"
+            else
+              cp "$TEMPLATE" "$OUTPUT"
+              echo "::notice::Created $OUTPUT from 9999 template"
+            fi
+
+            # Convert live ebuild to versioned release ebuild:
+            #   - Replace CRATES=" " with the full crate list
+            #   - Remove git-r3 from inherit, add back plain cargo
+            #   - Remove EGIT_REPO_URI, PROPERTIES="live"
+            #   - Add SRC_URI and KEYWORDS
+            #   - Replace src_unpack (git-r3 + cargo_live) with standard
+            python3 << 'PYEOF'
+          import re, sys
+
+          template = "$OUTPUT"
+          crates = open("/tmp/crates-list.txt").read().strip()
+          version = "$VERSION"
+          pkg = "$PKG_NAME"
+
+          with open(template) as f:
+              content = f.read()
+
+          # Replace CRATES placeholder
+          content = re.sub(
+              r'CRATES="[^"]*"',
+              f'CRATES="\n{crates}\n"',
+              content,
+              count=1,
+          )
+
+          # Switch inherit: remove git-r3
+          content = re.sub(
+              r'inherit cargo git-r3(.*)',
+              r'inherit cargo\1',
+              content,
+          )
+
+          # Remove EGIT_REPO_URI line
+          content = re.sub(r'EGIT_REPO_URI="[^"]*"\n', '', content)
+
+          # Remove PROPERTIES="live" line
+          content = re.sub(r'PROPERTIES="live"\n', '', content)
+
+          # Add SRC_URI after HOMEPAGE (crates.io source tarball + CARGO_CRATE_URIS)
+          src_uri = 'SRC_URI="\n'
+          src_uri += '\thttps://github.com/k-forss/remerge/archive/refs/tags/v${PV}.tar.gz -> remerge-${PV}.tar.gz\n'
+          src_uri += '\t${CARGO_CRATE_URIS}\n'
+          src_uri += '"\n'
+          content = re.sub(
+              r'(HOMEPAGE="[^"]*"\n)',
+              r'\1' + src_uri,
+              content,
+          )
+
+          # Add KEYWORDS after SLOT
+          content = re.sub(
+              r'(SLOT="0"\n)',
+              r'\1KEYWORDS="~amd64 ~arm64"\n',
+              content,
+          )
+
+          # Replace the live src_unpack with nothing (cargo.eclass handles it)
+          content = re.sub(
+              r'src_unpack\(\) \{\n\tgit-r3_src_unpack\n\tcargo_live_src_unpack\n\}\n\n',
+              '',
+              content,
+          )
+
+          with open(template, 'w') as f:
+              f.write(content)
+          PYEOF
+          }
+
+          # CLI source ebuild
+          generate_source_ebuild \
+            "overlay/app-portage/remerge/remerge-9999.ebuild" \
+            "overlay/app-portage/remerge/remerge-${VERSION}.ebuild" \
+            "remerge"
+
+          # Server source ebuild
+          generate_source_ebuild \
+            "overlay/app-portage/remerge-server/remerge-server-9999.ebuild" \
+            "overlay/app-portage/remerge-server/remerge-server-${VERSION}.ebuild" \
+            "remerge-server"
+
+      - name: Create versioned binary ebuilds
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+
+          # --- CLI binary ebuild ---
+          CLI_BIN="overlay/app-portage/remerge-bin/remerge-bin-${VERSION}.ebuild"
+          if [ ! -f "$CLI_BIN" ]; then
+            cat > "$CLI_BIN" << 'EBUILD_EOF'
+          # Copyright 2026 Kristoffer Forss
+          # Distributed under the terms of the GNU General Public License v2
+
+          EAPI=8
+
+          inherit verify-sig
+
+          MY_PN="${PN/-bin/}"
+
+          DESCRIPTION="Drop-in emerge wrapper that offloads builds to a remote binary host (pre-built)"
+          HOMEPAGE="https://github.com/k-forss/remerge"
+
+          SRC_URI="
+          	amd64? ( https://github.com/k-forss/remerge/releases/download/v${PV}/${MY_PN}-v${PV}-amd64-linux.tar.gz )
+          	arm64? ( https://github.com/k-forss/remerge/releases/download/v${PV}/${MY_PN}-v${PV}-arm64-linux.tar.gz )
+          	arm? ( https://github.com/k-forss/remerge/releases/download/v${PV}/${MY_PN}-v${PV}-arm-linux.tar.gz )
+          	ppc64? ( https://github.com/k-forss/remerge/releases/download/v${PV}/${MY_PN}-v${PV}-ppc64-linux.tar.gz )
+          	riscv? ( https://github.com/k-forss/remerge/releases/download/v${PV}/${MY_PN}-v${PV}-riscv64-linux.tar.gz )
+          	verify-sig? (
+          		amd64? ( https://github.com/k-forss/remerge/releases/download/v${PV}/${MY_PN}-v${PV}-amd64-linux.tar.gz.asc )
+          		arm64? ( https://github.com/k-forss/remerge/releases/download/v${PV}/${MY_PN}-v${PV}-arm64-linux.tar.gz.asc )
+          		arm? ( https://github.com/k-forss/remerge/releases/download/v${PV}/${MY_PN}-v${PV}-arm-linux.tar.gz.asc )
+          		ppc64? ( https://github.com/k-forss/remerge/releases/download/v${PV}/${MY_PN}-v${PV}-ppc64-linux.tar.gz.asc )
+          		riscv? ( https://github.com/k-forss/remerge/releases/download/v${PV}/${MY_PN}-v${PV}-riscv64-linux.tar.gz.asc )
+          	)
+          "
+
+          LICENSE="GPL-2"
+          SLOT="0"
+          KEYWORDS="~amd64 ~arm ~arm64 ~ppc64 ~riscv"
+          IUSE="verify-sig"
+
+          RDEPEND="
+          	sys-apps/portage
+          	!app-portage/remerge
+          "
+          BDEPEND="verify-sig? ( sec-keys/openpgp-keys-remerge )"
+
+          VERIFY_SIG_OPENPGP_KEY_PATH="/usr/share/openpgp-keys/remerge.asc"
+
+          QA_PREBUILT="usr/bin/remerge"
+
+          S="${WORKDIR}"
+
+          src_install() {
+          	exeinto /usr/bin
+          	doexe remerge
+
+          	insinto /etc
+          	newins - remerge.conf <<-EOF
+          	# remerge CLI configuration
+          	#
+          	# server: URL of the remerge build server.
+          	# client_id: auto-generated unique identifier for this machine.
+
+          	server = "http://localhost:7654"
+          	# client_id is generated automatically on first run.
+          	EOF
+          }
+
+          pkg_postinst() {
+          	elog "Edit /etc/remerge.conf and set 'server' to your remerge build server URL."
+          	elog ""
+          	elog "  server = \"http://remerge.example.com:7654\""
+          	elog ""
+          	elog "A client_id will be generated automatically on first run."
+          }
+          EBUILD_EOF
+            echo "::notice::Created $CLI_BIN"
+          fi
+
+          # --- Server binary ebuild ---
+          SRV_BIN="overlay/app-portage/remerge-server-bin/remerge-server-bin-${VERSION}.ebuild"
+          if [ ! -f "$SRV_BIN" ]; then
+            cat > "$SRV_BIN" << 'EBUILD_EOF'
+          # Copyright 2026 Kristoffer Forss
+          # Distributed under the terms of the GNU General Public License v2
+
+          EAPI=8
+
+          inherit verify-sig systemd
+
+          MY_PN="${PN/-bin/}"
+
+          DESCRIPTION="Distributed binary package build server for Gentoo Linux (pre-built)"
+          HOMEPAGE="https://github.com/k-forss/remerge"
+
+          SRC_URI="
+          	amd64? ( https://github.com/k-forss/remerge/releases/download/v${PV}/${MY_PN}-v${PV}-amd64-linux.tar.gz )
+          	arm64? ( https://github.com/k-forss/remerge/releases/download/v${PV}/${MY_PN}-v${PV}-arm64-linux.tar.gz )
+          	verify-sig? (
+          		amd64? ( https://github.com/k-forss/remerge/releases/download/v${PV}/${MY_PN}-v${PV}-amd64-linux.tar.gz.asc )
+          		arm64? ( https://github.com/k-forss/remerge/releases/download/v${PV}/${MY_PN}-v${PV}-arm64-linux.tar.gz.asc )
+          	)
+          "
+
+          LICENSE="GPL-2"
+          SLOT="0"
+          KEYWORDS="~amd64 ~arm64"
+          IUSE="verify-sig"
+
+          RDEPEND="
+          	app-containers/docker
+          	!app-portage/remerge-server
+          "
+          BDEPEND="verify-sig? ( sec-keys/openpgp-keys-remerge )"
+
+          VERIFY_SIG_OPENPGP_KEY_PATH="/usr/share/openpgp-keys/remerge.asc"
+
+          QA_PREBUILT="usr/bin/remerge-server"
+
+          S="${WORKDIR}"
+
+          src_install() {
+          	exeinto /usr/bin
+          	doexe remerge-server
+
+          	insinto /etc/remerge
+          	newins - server.toml <<-EOF
+          	# remerge server configuration
+          	#
+          	# See https://github.com/k-forss/remerge for all options.
+
+          	binpkg_dir = "/var/cache/remerge/binpkgs"
+          	binhost_url = "http://localhost:7654/binpkgs"
+          	docker_socket = "unix:///var/run/docker.sock"
+          	worker_image_prefix = "remerge-worker"
+          	max_workers = 4
+          	worker_idle_timeout = 3600
+          	worker_binpkg_mount = "/var/cache/binpkgs"
+          	EOF
+
+          	keepdir /var/cache/remerge/binpkgs
+          	fowners root:root /var/cache/remerge/binpkgs
+          	fperms 0755 /var/cache/remerge/binpkgs
+
+          	newinitd "${FILESDIR}"/remerge-server.initd remerge-server
+          	newconfd "${FILESDIR}"/remerge-server.confd remerge-server
+          	systemd_dounit "${FILESDIR}"/remerge-server.service
+          }
+
+          pkg_postinst() {
+          	elog "Configure the server in /etc/remerge/server.toml"
+          	elog ""
+          	elog "Start with OpenRC:"
+          	elog "  rc-service remerge-server start"
+          	elog "  rc-update add remerge-server default"
+          	elog ""
+          	elog "Start with systemd:"
+          	elog "  systemctl enable --now remerge-server"
+          }
+          EBUILD_EOF
+            echo "::notice::Created $SRV_BIN"
+          fi
+
+      - name: Commit and push
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "::notice::Nothing to commit — release already prepared"
+            exit 0
+          fi
+          git commit -m "release: prepare v${VERSION}"
+          git push

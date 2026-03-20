@@ -1,0 +1,61 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cli",
+    "crates/server",
+    "crates/worker",
+    "crates/types",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+repository = "https://github.com/k-forss/remerge"
+rust-version = "1.88"
+
+[workspace.dependencies]
+# Shared types crate
+remerge-types = { path = "crates/types" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# HTTP
+axum = { version = "0.8", features = ["ws"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Docker
+bollard = "0.18"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Utilities
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+tokio-stream = "0.1"
+sha2 = "0.10"
+hex = "0.4"
+regex = "1"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
