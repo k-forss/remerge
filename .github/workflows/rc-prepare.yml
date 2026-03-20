@@ -319,15 +319,12 @@ jobs:
             echo "::notice::Created $SRV_BIN"
           fi
 
-      - name: Commit and push
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          if git diff --cached --quiet; then
-            echo "::notice::Nothing to commit — release already prepared"
-            exit 0
-          fi
-          git commit -m "release: prepare v${VERSION}"
-          git push
+      - name: Commit and push (signed)
+        uses: ryancyq/github-signed-commit@v1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          files: |
+            CHANGELOG.md
+            overlay/**/*.ebuild
+          commit-message: "release: prepare v${{ steps.version.outputs.version }}"

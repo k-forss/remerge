@@ -26,12 +26,32 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Extract version and create tag
+      - name: Extract version
+        id: version
         run: |
           VERSION="${{ github.event.pull_request.head.ref }}"
           VERSION="${VERSION#rc-}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "::notice::Creating tag v${VERSION}"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "v${VERSION}" -m "Release v${VERSION}"
-          git push origin "v${VERSION}"
+
+      - name: Create signed release tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          COMMIT_SHA=$(git rev-parse HEAD)
+
+          # Create annotated tag object via API (GitHub signs it)
+          TAG_SHA=$(gh api "repos/${{ github.repository }}/git/tags" \
+            -f tag="v${VERSION}" \
+            -f message="Release v${VERSION}" \
+            -f object="${COMMIT_SHA}" \
+            -f type="commit" \
+            --jq '.sha')
+
+          # Create tag ref pointing to the tag object
+          gh api "repos/${{ github.repository }}/git/refs" \
+            -f ref="refs/tags/v${VERSION}" \
+            -f sha="${TAG_SHA}"
+
+          echo "::notice::Created signed tag v${VERSION} at ${COMMIT_SHA}"
