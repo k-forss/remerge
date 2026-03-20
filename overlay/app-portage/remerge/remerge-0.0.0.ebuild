@@ -302,7 +302,10 @@ LICENSE="GPL-2"
 SLOT="0"
 KEYWORDS="~amd64 ~arm64"
 
-RDEPEND="sys-apps/portage"
+RDEPEND="
+	!app-portage/remerge-bin
+	sys-apps/portage
+"
 BDEPEND="virtual/rust"
 
 QA_FLAGS_IGNORED="usr/bin/remerge"

@@ -293,6 +293,9 @@ inherit cargo systemd
 
 DESCRIPTION="Distributed binary package build server for Gentoo Linux"
 HOMEPAGE="https://github.com/k-forss/remerge"
+MY_P="remerge-v${PV}"
+S="${WORKDIR}/${MY_P}"
+
 SRC_URI="
 	https://github.com/k-forss/remerge/archive/refs/tags/v${PV}.tar.gz -> remerge-${PV}.tar.gz
 	${CARGO_CRATE_URIS}
