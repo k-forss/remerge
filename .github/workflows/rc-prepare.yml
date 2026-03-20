@@ -82,13 +82,13 @@ jobs:
             #   - Remove EGIT_REPO_URI, PROPERTIES="live"
             #   - Add SRC_URI and KEYWORDS
             #   - Replace src_unpack (git-r3 + cargo_live) with standard
-            python3 << 'PYEOF'
-          import re, sys
+            OUTPUT="$OUTPUT" VERSION="$VERSION" PKG_NAME="$PKG_NAME" python3 << 'PYEOF'
+          import re, os
 
-          template = "$OUTPUT"
+          template = os.environ["OUTPUT"]
           crates = open("/tmp/crates-list.txt").read().strip()
-          version = "$VERSION"
-          pkg = "$PKG_NAME"
+          version = os.environ["VERSION"]
+          pkg = os.environ["PKG_NAME"]
 
           with open(template) as f:
               content = f.read()
