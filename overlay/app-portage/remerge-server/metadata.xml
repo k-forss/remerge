@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE pkgmetadata SYSTEM "https://www.gentoo.org/dtd/metadata.dtd">
+<pkgmetadata>
+  <maintainer type="person">
+    <email>kristoffer@forss.cc</email>
+    <name>Kristoffer Forss</name>
+  </maintainer>
+  <longdescription lang="en">
+    remerge-server is the central daemon that receives build workorders
+    from remerge CLI clients, manages Docker-based worker containers,
+    and serves the resulting binary packages over HTTP as a portage
+    binhost.  Includes OpenRC and systemd service files.
+  </longdescription>
+  <upstream>
+    <remote-id type="github">k-forss/remerge</remote-id>
+    <bugs-to>https://github.com/k-forss/remerge/issues</bugs-to>
+  </upstream>
+</pkgmetadata>

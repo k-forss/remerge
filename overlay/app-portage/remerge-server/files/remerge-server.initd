@@ -1,0 +1,21 @@
+#!/sbin/openrc-run
+# Copyright 2026 Kristoffer Forss
+# Distributed under the terms of the GNU General Public License v2
+
+description="remerge distributed binary package build server"
+command="/usr/bin/remerge-server"
+command_args="--listen ${REMERGE_LISTEN:-0.0.0.0:7654} --config ${REMERGE_CONFIG:-/etc/remerge/server.toml}"
+command_background=true
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/${RC_SVCNAME}.log"
+error_log="/var/log/${RC_SVCNAME}.log"
+
+depend() {
+	need net
+	need docker
+	after dns
+}
+
+start_pre() {
+	checkpath --directory --owner root:root --mode 0755 /var/cache/remerge/binpkgs
+}

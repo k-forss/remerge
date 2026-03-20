@@ -1,0 +1,30 @@
+# Scan all release assets with VirusTotal after a release is published.
+#
+# Results are appended to the GitHub Release body as analysis links.
+# Requires a VT_API_KEY repository secret (free tier works fine).
+
+name: VirusTotal Scan
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write   # needed to update release body
+
+jobs:
+  scan:
+    name: Scan release assets
+    runs-on: ubuntu-latest
+    steps:
+      - name: VirusTotal Scan
+        uses: crazy-max/ghaction-virustotal@v5
+        with:
+          vt_api_key: ${{ secrets.VT_API_KEY }}
+          update_release_body: true
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          request_rate: 4  # free-tier rate limit
+          files: |
+            .tar.gz$
+            SHA256SUMS
+            .asc$

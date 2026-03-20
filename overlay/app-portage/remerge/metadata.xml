@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE pkgmetadata SYSTEM "https://www.gentoo.org/dtd/metadata.dtd">
+<pkgmetadata>
+  <maintainer type="person">
+    <email>kristoffer@forss.cc</email>
+    <name>Kristoffer Forss</name>
+  </maintainer>
+  <longdescription lang="en">
+    remerge is a drop-in wrapper for emerge that offloads Gentoo package
+    compilation to a remote build server running Docker workers.  The CLI
+    reads local portage configuration, submits a workorder to the server,
+    streams build progress in real-time, then installs the resulting binary
+    packages via portage's native binhost support.
+  </longdescription>
+  <upstream>
+    <remote-id type="github">k-forss/remerge</remote-id>
+    <bugs-to>https://github.com/k-forss/remerge/issues</bugs-to>
+  </upstream>
+</pkgmetadata>

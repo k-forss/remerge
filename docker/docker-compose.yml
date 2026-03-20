@@ -1,0 +1,73 @@
+# remerge server — example docker-compose deployment
+#
+# Usage:
+#   docker compose up -d
+#
+# The server image is pulled from GitHub Container Registry (ghcr.io).
+# All configuration is provided via environment variables below.
+#
+# Prerequisites:
+#   - Docker with compose v2
+#   - The server needs access to the Docker socket to manage worker containers.
+
+services:
+  server:
+    image: ghcr.io/k-forss/remerge-server:latest
+    container_name: remerge-server
+    restart: unless-stopped
+    ports:
+      - "7654:7654"
+    volumes:
+      # Docker socket — the server creates worker containers.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Persistent binpkg storage.
+      - remerge-binpkgs:/var/cache/remerge/binpkgs
+      # Persistent state (workorders, results, client registry).
+      - remerge-state:/var/lib/remerge
+    environment:
+      RUST_LOG: "remerge_server=info,tower_http=info"
+
+      # ── Server configuration ────────────────────────────────────
+      # All settings can be provided via REMERGE_ prefixed env vars.
+      # They override the config file.
+
+      # Base URL that clients use to fetch binary packages.
+      # Set this to your server's public address.
+      REMERGE_BINHOST_URL: "http://remerge.example.com:7654/binpkgs"
+
+      # Maximum concurrent worker containers.
+      REMERGE_MAX_WORKERS: "4"
+
+      # Seconds to keep idle worker containers before removing them.
+      REMERGE_WORKER_IDLE_TIMEOUT: "3600"
+
+      # Docker image prefix for worker images.
+      REMERGE_WORKER_IMAGE_PREFIX: "remerge-worker"
+
+      # ── State & retention ─────────────────────────────────────
+      # REMERGE_STATE_DIR: "/var/lib/remerge"
+      # REMERGE_RETENTION_HOURS: "24"
+      # REMERGE_MAX_RETAINED_WORKORDERS: "1000"
+
+      # ── Build tuning ──────────────────────────────────────────
+      # Omit to auto-detect from CPU count.
+      # REMERGE_PARALLEL_JOBS: "8"
+      # REMERGE_LOAD_AVERAGE: "8.0"
+
+      # ── Observability ─────────────────────────────────────────
+      # REMERGE_LOG_JSON: "false"
+      # REMERGE_BINPKG_DISK_WARN_BYTES: "10737418240"   # 10 GiB
+
+      # ── Binary package signing (optional) ─────────────────────
+      # Uncomment to enable GPG signing of binary packages.
+      # REMERGE_GPG_KEY: "0x1234567890ABCDEF"
+      # REMERGE_GPG_HOME: "/var/cache/remerge/gnupg"
+    # volumes:
+    #   # Uncomment if using binpkg signing:
+    #   - /path/to/gnupg:/var/cache/remerge/gnupg:ro
+
+volumes:
+  remerge-binpkgs:
+    driver: local
+  remerge-state:
+    driver: local

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE pkgmetadata SYSTEM "https://www.gentoo.org/dtd/metadata.dtd">
+<pkgmetadata>
+  <maintainer type="person">
+    <email>kristoffer@forss.cc</email>
+    <name>Kristoffer Forss</name>
+  </maintainer>
+  <longdescription lang="en">
+    Pre-built remerge CLI binary downloaded from signed GitHub Releases.
+    Use this for bootstrapping or on machines where building from source
+    (which requires the full Rust toolchain) is impractical.
+
+    The source-based ebuild is available as app-portage/remerge.
+  </longdescription>
+  <upstream>
+    <remote-id type="github">k-forss/remerge</remote-id>
+    <bugs-to>https://github.com/k-forss/remerge/issues</bugs-to>
+  </upstream>
+</pkgmetadata>

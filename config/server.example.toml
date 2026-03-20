@@ -1,0 +1,101 @@
+# remerge server configuration
+#
+# Copy this to /etc/remerge/server.toml or mount it into the container.
+# All settings can also be set via REMERGE_* environment variables.
+
+# Directory where binary packages are stored.
+# This is also served over HTTP as the binhost.
+binpkg_dir = "/var/cache/remerge/binpkgs"
+
+# Base URL that clients use to reach the binhost repository.
+# Set this to your server's public address.
+binhost_url = "http://localhost:7654/binpkgs"
+
+# Docker socket path.
+docker_socket = "unix:///var/run/docker.sock"
+
+# Prefix for worker Docker images.
+# Images are tagged as: <prefix>:<arch>-<profile>-gcc<version>
+worker_image_prefix = "remerge-worker"
+
+# Maximum concurrent worker containers.
+max_workers = 4
+
+# Seconds to keep idle worker containers before removing them.
+# The reaper preserves the most recently used image per
+# (CHOST, profile, GCC) tuple and only evicts duplicates.
+worker_idle_timeout = 3600
+
+# Path inside worker containers where binpkgs are written.
+# This is bind-mounted from the host's binpkg_dir.
+worker_binpkg_mount = "/var/cache/binpkgs"
+
+# ── Build tuning ─────────────────────────────────────────────────
+# Number of parallel emerge jobs (-j flag).
+# Omit or set to 0 to auto-detect from CPU count.
+# parallel_jobs = 8
+
+# Maximum system load average (-l flag).
+# Omit or set to 0 to auto-detect from CPU count.
+# load_average = 8.0
+
+# ── State & retention ───────────────────────────────────────────
+# Directory for persisting workorders, results, and client registry
+# across server restarts.
+state_dir = "/var/lib/remerge"
+
+# How many hours to keep completed/failed workorders before automatic
+# eviction.
+retention_hours = 24
+
+# Maximum number of completed/failed workorders to keep in memory.
+# Oldest terminal entries are evicted first when the cap is exceeded.
+# Set to 0 to disable (rely only on retention_hours).
+max_retained_workorders = 1000
+
+# ── Observability ────────────────────────────────────────────────
+# Enable JSON-formatted structured log output.
+# Useful for log aggregation pipelines (ELK, Loki, etc.).
+# log_json = false
+
+# Disk usage warning threshold for the binpkg directory, in bytes.
+# A warning log + metric is emitted when exceeded.  Set to 0 to disable.
+# Default: 10 GiB (10737418240).
+# binpkg_disk_warn_bytes = 10737418240
+
+# ── Worker binary ───────────────────────────────────────────────
+# Path to the remerge-worker binary on the host.
+# When set, it is COPY'd into Docker images during build.
+# worker_binary = "/usr/local/bin/remerge-worker"
+
+# ── Native TLS (optional) ───────────────────────────────────────
+# For direct HTTPS without a reverse proxy.
+# Omit the entire section to serve plain HTTP.
+#
+# [tls]
+# cert = "/etc/remerge/cert.pem"
+# key = "/etc/remerge/key.pem"
+
+# ── Binary package OpenPGP signing (optional) ────────────────────
+# When configured, worker containers sign all .gpkg packages with
+# the specified GPG key.  The keyring directory is mounted read-only
+# into each worker.
+#
+# See: https://wiki.gentoo.org/wiki/Binary_package_guide#Binary_package_OpenPGP_signing
+#
+# [signing]
+# gpg_key = "0x1234567890ABCDEF"
+# gpg_home = "/var/cache/remerge/gnupg"
+
+# ── Authentication (optional) ───────────────────────────────────
+# Three modes: "none" (default), "mtls", "mixed".
+#
+# [auth]
+# mode = "none"
+# cert_header = "X-Client-Cert-Fingerprint"
+#
+# [[auth.certs]]
+# fingerprint = "SHA256:..."
+# client_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+# role = "main"
+# label = "my workstation"
