@@ -31,7 +31,7 @@ jobs:
     steps:
       - name: Get release from triggering workflow
         id: release
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             // The VirusTotal workflow triggers on release:published,
@@ -54,7 +54,7 @@ jobs:
             core.setOutput('upload_url', release.upload_url);
 
       - name: Download release assets
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const fs = require('fs');
