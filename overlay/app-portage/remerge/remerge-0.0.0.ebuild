@@ -297,9 +297,14 @@ SRC_URI="
 	https://github.com/k-forss/remerge/archive/refs/tags/v${PV}.tar.gz -> remerge-${PV}.tar.gz
 	${CARGO_CRATE_URIS}
 "
+SRC_URI="
+	https://github.com/k-forss/remerge/archive/refs/tags/v${PV}.tar.gz -> remerge-${PV}.tar.gz
+	${CARGO_CRATE_URIS}
+"
 
 LICENSE="GPL-2"
 SLOT="0"
+KEYWORDS="~amd64 ~arm64"
 KEYWORDS="~amd64 ~arm64"
 
 RDEPEND="
