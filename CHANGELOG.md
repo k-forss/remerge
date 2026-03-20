@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.0.0] — 2026-03-20
 
+## [0.0.0] — 2026-03-20
+
 Initial release — distributed binary package builder for Gentoo Linux.
 
 ### Added
