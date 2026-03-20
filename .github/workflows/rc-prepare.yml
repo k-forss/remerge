@@ -114,7 +114,7 @@ jobs:
           # Remove PROPERTIES="live" line
           content = re.sub(r'PROPERTIES="live"\n', '', content)
 
-          # Add SRC_URI after HOMEPAGE (crates.io source tarball + CARGO_CRATE_URIS).
+          # Add SRC_URI after HOMEPAGE (GitHub source tarball + CARGO_CRATE_URIS).
           # For remerge-server, also add MY_P and S because the GitHub archive
           # unpacks to remerge-v${PV}/ (the repo name), not remerge-server-v${PV}/.
           my_p_s = ''
