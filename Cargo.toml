@@ -36,7 +36,7 @@ tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
 clap = { version = "4", features = ["derive", "env"] }
 
 # Docker
-bollard = "0.18"
+bollard = "0.20"
 
 # Logging
 tracing = "0.1"
