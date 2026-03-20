@@ -114,8 +114,13 @@ jobs:
           # Remove PROPERTIES="live" line
           content = re.sub(r'PROPERTIES="live"\n', '', content)
 
-          # Add SRC_URI after HOMEPAGE (crates.io source tarball + CARGO_CRATE_URIS)
-          src_uri = 'SRC_URI="\n'
+          # Add SRC_URI after HOMEPAGE (crates.io source tarball + CARGO_CRATE_URIS).
+          # For remerge-server, also add MY_P and S because the GitHub archive
+          # unpacks to remerge-v${PV}/ (the repo name), not remerge-server-v${PV}/.
+          my_p_s = ''
+          if pkg == 'remerge-server':
+              my_p_s = 'MY_P="remerge-v${PV}"\nS="${WORKDIR}/${MY_P}"\n\n'
+          src_uri = my_p_s + 'SRC_URI="\n'
           src_uri += '\thttps://github.com/k-forss/remerge/archive/refs/tags/v${PV}.tar.gz -> remerge-${PV}.tar.gz\n'
           src_uri += '\t${CARGO_CRATE_URIS}\n'
           src_uri += '"\n'
