@@ -428,9 +428,12 @@ async fn ws_progress(
         .await
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    // Raw PTY output channel — created alongside the progress channel so
-    // it is guaranteed to exist if subscribe_progress succeeded.
-    let raw_rx = state.subscribe_raw_output(&id).await;
+    // Raw PTY output channel — the raw channel is inserted before the progress
+    // channel in create_progress_channel, so it is guaranteed to exist here.
+    let raw_rx = state
+        .subscribe_raw_output(&id)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
 
     let ws_state = state.clone();
 
@@ -440,7 +443,7 @@ async fn ws_progress(
 async fn handle_ws(
     socket: ws::WebSocket,
     mut rx: tokio::sync::broadcast::Receiver<BuildProgress>,
-    raw_rx: Option<tokio::sync::broadcast::Receiver<Vec<u8>>>,
+    mut raw_rx: tokio::sync::broadcast::Receiver<bytes::Bytes>,
     state: SharedState,
     workorder_id: uuid::Uuid,
 ) {
@@ -454,22 +457,30 @@ async fn handle_ws(
         use futures::SinkExt;
         use tokio::sync::broadcast::error::RecvError;
 
-        let mut raw_rx = raw_rx;
-        let mut raw_done = raw_rx.is_none();
+        let mut raw_done = false;
 
         loop {
             if raw_done {
-                // Raw channel closed or absent — only wait for structured events.
+                // Raw channel closed — only wait for structured events.
                 match rx.recv().await {
                     Ok(progress) => {
                         // Log events are superseded by the raw channel.
                         if matches!(progress.event, BuildEvent::Log { .. }) {
                             continue;
                         }
-                        if let Ok(text) = serde_json::to_string(&progress)
-                            && ws_write.send(ws::Message::Text(text.into())).await.is_err()
-                        {
-                            break;
+                        match serde_json::to_string(&progress) {
+                            Ok(text) => {
+                                if ws_write
+                                    .send(ws::Message::Text(text.into()))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = ?e, "Failed to serialize build progress to JSON; dropping message");
+                            }
                         }
                         if matches!(progress.event, BuildEvent::Finished { .. }) {
                             let _ = ws_write.send(ws::Message::Close(None)).await;
@@ -482,13 +493,12 @@ async fn handle_ws(
                     Err(RecvError::Closed) => break,
                 }
             } else {
-                let raw = raw_rx.as_mut().unwrap();
                 tokio::select! {
                     biased; // prefer raw output — highest throughput path
-                    result = raw.recv() => {
+                    result = raw_rx.recv() => {
                         match result {
                             Ok(bytes) => {
-                                if ws_write.send(ws::Message::Binary(bytes.into())).await.is_err() {
+                                if ws_write.send(ws::Message::Binary(bytes)).await.is_err() {
                                     break;
                                 }
                             }
@@ -506,13 +516,19 @@ async fn handle_ws(
                                 if matches!(progress.event, BuildEvent::Log { .. }) {
                                     continue;
                                 }
-                                if let Ok(text) = serde_json::to_string(&progress)
-                                    && ws_write
-                                        .send(ws::Message::Text(text.into()))
-                                        .await
-                                        .is_err()
-                                {
-                                    break;
+                                match serde_json::to_string(&progress) {
+                                    Ok(text) => {
+                                        if ws_write
+                                            .send(ws::Message::Text(text.into()))
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(error = ?e, "Failed to serialize build progress to JSON; dropping message");
+                                    }
                                 }
                                 if matches!(progress.event, BuildEvent::Finished { .. }) {
                                     let _ = ws_write.send(ws::Message::Close(None)).await;

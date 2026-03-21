@@ -54,6 +54,7 @@ tokio-stream = "0.1"
 sha2 = "0.10"
 hex = "0.4"
 regex = "1"
+bytes = "1"
 
 [profile.release]
 lto = true

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
+use bytes::Bytes;
 use tokio::sync::{RwLock, Semaphore, broadcast, mpsc};
 
 use remerge_types::workorder::{BuildProgress, Workorder, WorkorderId, WorkorderResult};
@@ -38,7 +39,8 @@ pub struct AppState {
 
     /// Per-workorder broadcast channels for raw PTY output (binary bytes).
     /// Sent as WS Binary frames — this is the primary output channel.
-    pub raw_output_txs: RwLock<HashMap<WorkorderId, broadcast::Sender<Vec<u8>>>>,
+    /// Uses `Bytes` (reference-counted) to avoid a full allocation clone per receiver.
+    pub raw_output_txs: RwLock<HashMap<WorkorderId, broadcast::Sender<Bytes>>>,
 
     /// Per-workorder stdin channels for forwarding client input to the
     /// worker container (supports interactive emerge, `--ask`, etc.).
@@ -109,12 +111,13 @@ impl AppState {
         &self,
         id: WorkorderId,
     ) -> broadcast::Sender<BuildProgress> {
-        let (tx, _) = broadcast::channel(256);
-        self.progress_txs.write().await.insert(id, tx.clone());
-
-        // Also create the raw output channel.
+        // Insert raw channel first so that a subscriber who observes the
+        // progress channel is guaranteed to also find the raw channel.
         let (raw_tx, _) = broadcast::channel(512);
         self.raw_output_txs.write().await.insert(id, raw_tx);
+
+        let (tx, _) = broadcast::channel(256);
+        self.progress_txs.write().await.insert(id, tx.clone());
 
         tx
     }
@@ -135,7 +138,7 @@ impl AppState {
     pub async fn subscribe_raw_output(
         &self,
         id: &WorkorderId,
-    ) -> Option<broadcast::Receiver<Vec<u8>>> {
+    ) -> Option<broadcast::Receiver<Bytes>> {
         self.raw_output_txs
             .read()
             .await
@@ -161,5 +164,6 @@ impl AppState {
     pub async fn remove_stdin_channel(&self, id: &WorkorderId) {
         self.stdin_txs.write().await.remove(id);
         self.raw_output_txs.write().await.remove(id);
+        self.progress_txs.write().await.remove(id);
     }
 }
