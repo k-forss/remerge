@@ -87,6 +87,18 @@ pub struct MakeConf {
 
     /// Any additional variables we should forward.
     pub extra: BTreeMap<String, String>,
+
+    /// Whether `use_flags` contains the fully-resolved USE string
+    /// (profile defaults + make.conf merged via `portageq envvar USE`).
+    ///
+    /// When `true`, the worker prefixes `USE` with `-*` to override its own
+    /// profile defaults — otherwise extra flags from the worker profile could
+    /// leak into the build.
+    ///
+    /// Defaults to `false` for backward compatibility with older clients that
+    /// only send the literal `make.conf` USE value.
+    #[serde(default)]
+    pub use_flags_resolved: bool,
 }
 
 /// A single entry from `/etc/portage/package.use`.
@@ -161,6 +173,56 @@ impl Default for MakeConf {
             original_cflags: None,
             use_expand: BTreeMap::new(),
             extra: BTreeMap::new(),
+            use_flags_resolved: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Old clients don't send `use_flags_resolved` — it should default to `false`.
+    #[test]
+    fn deserialize_without_use_flags_resolved() {
+        let json = r#"{
+            "cflags": "-O2 -pipe",
+            "cxxflags": "${CFLAGS}",
+            "ldflags": "",
+            "makeopts": "-j4",
+            "use_flags": ["X", "wayland"],
+            "features": [],
+            "accept_license": "*",
+            "accept_keywords": "amd64",
+            "emerge_default_opts": "",
+            "chost": "x86_64-pc-linux-gnu",
+            "use_expand": {},
+            "extra": {}
+        }"#;
+        let mc: MakeConf = serde_json::from_str(json).unwrap();
+        assert!(!mc.use_flags_resolved, "should default to false");
+    }
+
+    /// New clients send `use_flags_resolved: true`.
+    #[test]
+    fn deserialize_with_use_flags_resolved() {
+        let json = r#"{
+            "cflags": "-O2 -pipe",
+            "cxxflags": "${CFLAGS}",
+            "ldflags": "",
+            "makeopts": "-j4",
+            "use_flags": ["X", "dbus", "wayland"],
+            "features": [],
+            "accept_license": "*",
+            "accept_keywords": "amd64",
+            "emerge_default_opts": "",
+            "chost": "x86_64-pc-linux-gnu",
+            "use_expand": {},
+            "extra": {},
+            "use_flags_resolved": true
+        }"#;
+        let mc: MakeConf = serde_json::from_str(json).unwrap();
+        assert!(mc.use_flags_resolved, "should be true when explicitly set");
+        assert_eq!(mc.use_flags, vec!["X", "dbus", "wayland"]);
     }
 }
