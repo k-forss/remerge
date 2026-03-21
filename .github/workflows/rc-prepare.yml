@@ -19,6 +19,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   prepare:
@@ -333,3 +334,20 @@ jobs:
             CHANGELOG.md
             overlay/**/*.ebuild
           commit-message: "release: prepare v${{ steps.version.outputs.version }}"
+
+      - name: Create pull request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          EXISTING=$(gh pr list --head "$GITHUB_REF_NAME" --base main --json number --jq '.[0].number')
+          if [ -n "$EXISTING" ]; then
+            echo "::notice::PR #${EXISTING} already exists"
+          else
+            gh pr create \
+              --title "release: v${VERSION}" \
+              --body "Merge this PR to create the \`v${VERSION}\` tag and trigger the release pipeline." \
+              --base main \
+              --head "$GITHUB_REF_NAME"
+            echo "::notice::Created PR for v${VERSION}"
+          fi
