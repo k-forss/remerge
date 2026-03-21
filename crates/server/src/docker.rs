@@ -11,6 +11,7 @@ use bollard::{
     },
 };
 use futures::StreamExt;
+use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 
 use remerge_types::portage::SystemIdentity;
@@ -32,6 +33,9 @@ pub struct DockerManager {
     gpg_home: Option<String>,
     /// Path to the remerge-worker binary for injection into images.
     worker_binary: Option<String>,
+    /// SHA-256 hash of the worker binary (computed at startup) for
+    /// cache-invalidating images when the binary is recompiled.
+    worker_binary_hash: Option<String>,
 }
 
 impl DockerManager {
@@ -47,6 +51,29 @@ impl DockerManager {
             "Connected to Docker"
         );
 
+        let worker_binary = config
+            .worker_binary
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string());
+
+        // Compute SHA-256 of the worker binary so we can detect when it
+        // changes (e.g. recompiled) and rebuild stale images.
+        let worker_binary_hash = if let Some(path) = worker_binary.as_deref() {
+            match tokio::fs::read(path).await {
+                Ok(data) => {
+                    let hash = hex::encode(Sha256::digest(&data));
+                    info!(path, hash = &hash[..12], "Worker binary hash computed");
+                    Some(hash)
+                }
+                Err(e) => {
+                    tracing::warn!(path, error = %e, "Failed to hash worker binary");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             docker,
             image_prefix: config.worker_image_prefix.clone(),
@@ -55,10 +82,8 @@ impl DockerManager {
             max_workers: config.max_workers,
             gpg_key: config.signing.gpg_key.clone(),
             gpg_home: config.signing.gpg_home.clone(),
-            worker_binary: config
-                .worker_binary
-                .as_ref()
-                .map(|p| p.to_string_lossy().to_string()),
+            worker_binary,
+            worker_binary_hash,
         })
     }
 
@@ -87,9 +112,41 @@ impl DockerManager {
         )
     }
 
-    /// Check if a worker image already exists.
-    pub async fn image_exists(&self, tag: &str) -> bool {
-        self.docker.inspect_image(tag).await.is_ok()
+    /// Check whether a worker image needs to be (re)built.
+    ///
+    /// Returns `true` if:
+    /// - The image does not exist, OR
+    /// - The image exists but was built with a different worker binary
+    ///   (detected via the `remerge.worker.sha256` label).
+    pub async fn image_needs_rebuild(&self, tag: &str) -> bool {
+        let info = match self.docker.inspect_image(tag).await {
+            Ok(info) => info,
+            Err(_) => return true, // Image doesn't exist.
+        };
+
+        // If we have a worker binary hash, compare it to the label baked
+        // into the image.  A mismatch means the binary was recompiled.
+        if let Some(ref expected) = self.worker_binary_hash {
+            let stored = info
+                .config
+                .as_ref()
+                .and_then(|c| c.labels.as_ref())
+                .and_then(|l| l.get("remerge.worker.sha256"));
+
+            match stored {
+                Some(h) if h == expected => false, // Up to date.
+                Some(_) => {
+                    info!(%tag, "Worker binary changed — image rebuild needed");
+                    true
+                }
+                None => {
+                    info!(%tag, "Image missing worker hash label — rebuild needed");
+                    true
+                }
+            }
+        } else {
+            false // No binary configured — can't check.
+        }
     }
 
     /// Build a worker image from the bundled Dockerfile.
@@ -206,10 +263,17 @@ RUN echo 'CHOST="{chost}"' >> /etc/portage/make.conf && \
 
         let binary_install = "# Install remerge-worker binary from build context.\nCOPY remerge-worker /usr/local/bin/remerge-worker\nRUN chmod +x /usr/local/bin/remerge-worker";
 
+        let hash_label = self
+            .worker_binary_hash
+            .as_ref()
+            .map(|h| format!("LABEL remerge.worker.sha256=\"{h}\""))
+            .unwrap_or_default();
+
         format!(
             r#"FROM {base_image}
 
 {binary_install}
+{hash_label}
 
 # Set up portage for building.
 RUN emerge --sync --quiet || true
@@ -228,6 +292,7 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
 "#,
             base_image = base_image,
             binary_install = binary_install,
+            hash_label = hash_label,
             crossdev_block = crossdev_block,
             binpkg_mount = self.worker_binpkg_mount,
         )
