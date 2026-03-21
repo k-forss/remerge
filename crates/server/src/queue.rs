@@ -271,12 +271,17 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
         while let Some(result) = output.next().await {
             match result {
                 Ok(log_output) => {
-                    // Send raw bytes to connected clients for direct PTY relay.
-                    let raw_bytes: Vec<u8> = log_output.into_bytes().to_vec();
-                    let _ = raw_tx.send(raw_bytes.clone());
+                    // `into_bytes()` already returns `Bytes` (reference-counted),
+                    // so the broadcast clone is a cheap pointer increment rather
+                    // than a full copy.
+                    let raw_bytes: bytes::Bytes = log_output.into_bytes();
 
-                    // Accumulate bytes for line-based event detection.
+                    // Accumulate bytes for line-based event detection before
+                    // broadcasting, so we only hold one allocation.
                     line_buf.extend_from_slice(&raw_bytes);
+
+                    // Send raw bytes to connected clients for direct PTY relay.
+                    let _ = raw_tx.send(raw_bytes);
 
                     // Cap buffer to prevent unbounded growth.
                     const MAX_LINE_BUF: usize = 64 * 1024;
@@ -595,7 +600,7 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
 
     // ── 7. Cleanup ──────────────────────────────────────────────────
     state.container_ids.write().await.remove(&id);
-    state.remove_stdin_channel(&id).await;
+    state.remove_workorder_channels(&id).await;
     state
         .clients
         .clear_active_workorder(&workorder.client_id)
