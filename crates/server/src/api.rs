@@ -443,24 +443,38 @@ async fn handle_ws(
 
     // Task 1: Forward build progress events to the client.
     let send_task = tokio::spawn(async move {
-        while let Ok(progress) = rx.recv().await {
-            let text = match serde_json::to_string(&progress) {
-                Ok(t) => t,
-                Err(e) => {
-                    error!("Failed to serialise progress: {e}");
+        loop {
+            match rx.recv().await {
+                Ok(progress) => {
+                    let text = match serde_json::to_string(&progress) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            error!("Failed to serialise progress: {e}");
+                            continue;
+                        }
+                    };
+
+                    use futures::SinkExt;
+                    if ws_write.send(ws::Message::Text(text.into())).await.is_err() {
+                        break; // Client disconnected.
+                    }
+
+                    // If the build is finished, close the socket.
+                    if matches!(progress.event, BuildEvent::Finished { .. }) {
+                        let _ = ws_write.send(ws::Message::Close(None)).await;
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    // The receiver fell behind — some log lines were lost.
+                    // This is expected for large builds; continue to pick up
+                    // new events (especially the final Finished event).
+                    warn!(skipped = n, "WebSocket broadcast receiver lagged");
                     continue;
                 }
-            };
-
-            use futures::SinkExt;
-            if ws_write.send(ws::Message::Text(text.into())).await.is_err() {
-                break; // Client disconnected.
-            }
-
-            // If the build is finished, close the socket.
-            if matches!(progress.event, BuildEvent::Finished { .. }) {
-                let _ = ws_write.send(ws::Message::Close(None)).await;
-                break;
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    break; // Channel closed — sender dropped.
+                }
             }
         }
     });

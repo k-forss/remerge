@@ -34,6 +34,12 @@ pub async fn build_packages(workorder: &Workorder, emerge_cmd: &str) -> Result<(
         "--verbose".to_string(),
         "--color=y".to_string(),
         "--keep-going".to_string(),
+        // --newuse and --update are essential: the container may have
+        // pre-installed packages built with different USE/PYTHON_TARGETS
+        // than the client's config.  Without these, emerge would report
+        // slot conflicts instead of rebuilding the mismatched packages.
+        "--newuse".to_string(),
+        "--update".to_string(),
     ];
 
     // Forward any additional emerge arguments from the workorder,
@@ -42,6 +48,7 @@ pub async fn build_packages(workorder: &Workorder, emerge_cmd: &str) -> Result<(
         match arg.as_str() {
             // Skip arguments we already set or that don't make sense in the worker.
             "--pretend" | "-p" | "--getbinpkg" | "-g" |
+            "--newuse" | "-N" | "--update" | "-u" |
             // Dangerous flags that must never run in the worker.
             "--depclean" | "--unmerge" | "-C" | "--deselect" |
             "--sync" | "--info" | "--search" | "-s" | "--searchdesc" | "-S" |
