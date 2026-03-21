@@ -53,11 +53,17 @@ src_install() {
 	max_workers = 4
 	worker_idle_timeout = 3600
 	worker_binpkg_mount = "/var/cache/binpkgs"
+	state_dir = "/var/lib/remerge"
+	retention_hours = 24
 	EOF
 
 	keepdir /var/cache/remerge/binpkgs
 	fowners root:root /var/cache/remerge/binpkgs
 	fperms 0755 /var/cache/remerge/binpkgs
+
+	keepdir /var/lib/remerge
+	fowners root:root /var/lib/remerge
+	fperms 0750 /var/lib/remerge
 
 	newinitd "${FILESDIR}"/remerge-server.initd remerge-server
 	newconfd "${FILESDIR}"/remerge-server.confd remerge-server

@@ -336,6 +336,10 @@ src_install() {
 	fowners root:root /var/cache/remerge/binpkgs
 	fperms 0755 /var/cache/remerge/binpkgs
 
+	keepdir /var/lib/remerge
+	fowners root:root /var/lib/remerge
+	fperms 0750 /var/lib/remerge
+
 	# OpenRC
 	newinitd "${FILESDIR}"/remerge-server.initd remerge-server
 	newconfd "${FILESDIR}"/remerge-server.confd remerge-server
