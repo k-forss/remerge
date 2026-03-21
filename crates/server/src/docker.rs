@@ -58,20 +58,21 @@ impl DockerManager {
 
         // Compute SHA-256 of the worker binary so we can detect when it
         // changes (e.g. recompiled) and rebuild stale images.
-        let worker_binary_hash =
-            worker_binary
-                .as_deref()
-                .and_then(|path| match std::fs::read(path) {
-                    Ok(data) => {
-                        let hash = hex::encode(Sha256::digest(&data));
-                        info!(path, hash = &hash[..12], "Worker binary hash computed");
-                        Some(hash)
-                    }
-                    Err(e) => {
-                        tracing::warn!(path, error = %e, "Failed to hash worker binary");
-                        None
-                    }
-                });
+        let worker_binary_hash = if let Some(path) = worker_binary.as_deref() {
+            match tokio::fs::read(path).await {
+                Ok(data) => {
+                    let hash = hex::encode(Sha256::digest(&data));
+                    info!(path, hash = &hash[..12], "Worker binary hash computed");
+                    Some(hash)
+                }
+                Err(e) => {
+                    tracing::warn!(path, error = %e, "Failed to hash worker binary");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         Ok(Self {
             docker,
