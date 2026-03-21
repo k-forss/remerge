@@ -18,6 +18,7 @@ on:
     branches: ["rc-*"]
 
 permissions:
+  actions: write
   contents: write
   pull-requests: write
   statuses: write
@@ -401,3 +402,4 @@ jobs:
               -f target_url="$URL" --silent
             echo "::notice::$CHECK → $STATE"
           done
+
