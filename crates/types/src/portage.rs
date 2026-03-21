@@ -22,6 +22,18 @@ pub struct PortageConfig {
     /// Per-package license acceptances from `/etc/portage/package.license`.
     pub package_license: Vec<PackageLicenseEntry>,
 
+    /// Masked package atoms from `/etc/portage/package.mask`.
+    ///
+    /// Each entry is a package atom (e.g. `>=dev-libs/foo-2.0`).
+    #[serde(default)]
+    pub package_mask: Vec<String>,
+
+    /// Unmasked package atoms from `/etc/portage/package.unmask`.
+    ///
+    /// Each entry is a package atom that overrides profile or repo masks.
+    #[serde(default)]
+    pub package_unmask: Vec<String>,
+
     /// The active portage profile path (e.g. `default/linux/amd64/23.0`).
     pub profile: String,
 

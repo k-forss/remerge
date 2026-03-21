@@ -225,6 +225,8 @@ mod tests {
             package_use: Vec::new(),
             package_accept_keywords: Vec::new(),
             package_license: Vec::new(),
+            package_mask: Vec::new(),
+            package_unmask: Vec::new(),
             profile: "default/linux/amd64/23.0".into(),
             world: Vec::new(),
         }

@@ -40,6 +40,11 @@ pub async fn build_packages(workorder: &Workorder, emerge_cmd: &str) -> Result<(
         // slot conflicts instead of rebuilding the mismatched packages.
         "--newuse".to_string(),
         "--update".to_string(),
+        // Auto-apply USE / keyword changes that emerge suggests (e.g.
+        // REQUIRED_USE constraints like `wayland? ( gles2 )`, missing
+        // keywords, etc.) and continue the build without prompting.
+        "--autounmask-write".to_string(),
+        "--autounmask-continue".to_string(),
     ];
 
     // Forward any additional emerge arguments from the workorder,
@@ -49,6 +54,7 @@ pub async fn build_packages(workorder: &Workorder, emerge_cmd: &str) -> Result<(
             // Skip arguments we already set or that don't make sense in the worker.
             "--pretend" | "-p" | "--getbinpkg" | "-g" |
             "--newuse" | "-N" | "--update" | "-u" |
+            "--autounmask-write" | "--autounmask-continue" |
             // Dangerous flags that must never run in the worker.
             "--depclean" | "--unmerge" | "-C" | "--deselect" |
             "--sync" | "--info" | "--search" | "-s" | "--searchdesc" | "-S" |
@@ -196,7 +202,17 @@ pub async fn build_packages(workorder: &Workorder, emerge_cmd: &str) -> Result<(
 }
 
 /// Sync the portage tree.
+///
+/// When `REMERGE_SKIP_SYNC=1` is set (i.e. the server bind-mounted its own
+/// repos directory into the container), syncing is skipped entirely.  This
+/// avoids re-downloading the tree on every build and ensures the worker
+/// uses the exact same ebuild repo as the server.
 async fn sync_portage() -> Result<()> {
+    if std::env::var("REMERGE_SKIP_SYNC").is_ok() {
+        info!("Skipping portage sync (repos are bind-mounted from the server)");
+        return Ok(());
+    }
+
     info!("Syncing portage tree");
 
     let status = Command::new("emerge")

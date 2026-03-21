@@ -41,6 +41,8 @@ impl PortageReader {
         let package_use = self.read_package_use()?;
         let package_accept_keywords = self.read_package_accept_keywords()?;
         let package_license = self.read_package_license()?;
+        let package_mask = self.read_package_mask()?;
+        let package_unmask = self.read_package_unmask()?;
         let profile = self.read_profile()?;
         let world = self.read_world()?;
 
@@ -49,6 +51,8 @@ impl PortageReader {
             package_use,
             package_accept_keywords,
             package_license,
+            package_mask,
+            package_unmask,
             profile,
             world,
         })
@@ -273,6 +277,32 @@ impl PortageReader {
                 atom: parts[0].to_string(),
                 licenses: parts[1..].iter().map(|s| s.to_string()).collect(),
             })
+        })
+    }
+
+    /// Read masked atoms from `/etc/portage/package.mask`.
+    ///
+    /// Each non-comment, non-empty line is a package atom to mask.
+    fn read_package_mask(&self) -> Result<Vec<String>> {
+        self.read_package_atoms("package.mask")
+    }
+
+    /// Read unmasked atoms from `/etc/portage/package.unmask`.
+    ///
+    /// Each non-comment, non-empty line is a package atom to unmask
+    /// (overriding profile or repository masks).
+    fn read_package_unmask(&self) -> Result<Vec<String>> {
+        self.read_package_atoms("package.unmask")
+    }
+
+    /// Read a simple atom-per-line file (used for package.mask / package.unmask).
+    fn read_package_atoms(&self, name: &str) -> Result<Vec<String>> {
+        self.read_package_entries(name, |line| {
+            let atom = line.split_whitespace().next()?;
+            if atom.is_empty() {
+                return None;
+            }
+            Some(atom.to_string())
         })
     }
 

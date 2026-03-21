@@ -30,6 +30,8 @@ pub async fn apply_config(
     write_package_use(config).await?;
     write_package_accept_keywords(config).await?;
     write_package_license(config).await?;
+    write_package_mask(config).await?;
+    write_package_unmask(config).await?;
     info!("Portage configuration applied");
     Ok(())
 }
@@ -240,6 +242,50 @@ async fn write_package_license(config: &PortageConfig) -> Result<()> {
         .context("Failed to write package.license")?;
 
     info!("Wrote /etc/portage/package.license/remerge");
+    Ok(())
+}
+
+/// Write `/etc/portage/package.mask/remerge`.
+async fn write_package_mask(config: &PortageConfig) -> Result<()> {
+    if config.package_mask.is_empty() {
+        return Ok(());
+    }
+
+    ensure_dir("/etc/portage/package.mask").await?;
+
+    let content: String = config
+        .package_mask
+        .iter()
+        .map(|atom| format!("{atom}\n"))
+        .collect();
+
+    fs::write("/etc/portage/package.mask/remerge", &content)
+        .await
+        .context("Failed to write package.mask")?;
+
+    info!("Wrote /etc/portage/package.mask/remerge");
+    Ok(())
+}
+
+/// Write `/etc/portage/package.unmask/remerge`.
+async fn write_package_unmask(config: &PortageConfig) -> Result<()> {
+    if config.package_unmask.is_empty() {
+        return Ok(());
+    }
+
+    ensure_dir("/etc/portage/package.unmask").await?;
+
+    let content: String = config
+        .package_unmask
+        .iter()
+        .map(|atom| format!("{atom}\n"))
+        .collect();
+
+    fs::write("/etc/portage/package.unmask/remerge", &content)
+        .await
+        .context("Failed to write package.unmask")?;
+
+    info!("Wrote /etc/portage/package.unmask/remerge");
     Ok(())
 }
 

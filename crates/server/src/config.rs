@@ -94,6 +94,20 @@ pub struct ServerConfig {
     #[serde(default)]
     pub log_json: bool,
 
+    /// Host path to the portage ebuild repositories (e.g. `/var/db/repos`).
+    ///
+    /// When set, this directory is bind-mounted read-only into worker
+    /// containers, and the per-build `emerge --sync` is skipped.  This
+    /// ensures all workers use the exact same ebuild tree as the server
+    /// and eliminates the 2–3 minute sync penalty on every build.
+    ///
+    /// Keep the directory in sync via a cron job or systemd timer:
+    /// ```sh
+    /// emaint sync -a   # or emerge --sync
+    /// ```
+    #[serde(default)]
+    pub repos_dir: Option<PathBuf>,
+
     /// Disk usage warning threshold for the binpkg directory, in bytes.
     ///
     /// When the repository exceeds this size, a warning metric is exposed
@@ -207,6 +221,7 @@ impl Default for ServerConfig {
             worker_binary: None,
             max_retained_workorders: default_max_retained_workorders(),
             log_json: false,
+            repos_dir: None,
             binpkg_disk_warn_bytes: default_binpkg_disk_warn_bytes(),
         }
     }
@@ -305,6 +320,9 @@ impl ServerConfig {
         }
         if let Ok(v) = std::env::var("REMERGE_LOG_JSON") {
             config.log_json = v == "1" || v.eq_ignore_ascii_case("true");
+        }
+        if let Ok(v) = std::env::var("REMERGE_REPOS_DIR") {
+            config.repos_dir = Some(v.into());
         }
         if let Ok(v) = std::env::var("REMERGE_BINPKG_DISK_WARN_BYTES")
             && let Ok(n) = v.parse()
