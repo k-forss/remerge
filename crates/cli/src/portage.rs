@@ -762,8 +762,13 @@ impl PortageReader {
             return false;
         };
 
-        // Extract the package name and the constraint version.
-        let (pkg_name, constraint_version) = split_name_version(name_maybe_version);
+        // When there is no operator, treat the entire right-hand side as the
+        // package name — no version constraint.  This avoids mis-splitting
+        // names that contain `-<digit>` (e.g. `python-exec-2`).
+        let (pkg_name, constraint_version) = match op {
+            AtomOp::None => (name_maybe_version, None),
+            _ => split_name_version(name_maybe_version),
+        };
 
         let pkg_dir = self.root.join("var/db/pkg").join(category);
         let Ok(entries) = std::fs::read_dir(&pkg_dir) else {
@@ -1174,10 +1179,9 @@ fn split_revision(version: &str) -> (&str, Option<&str>) {
 ///
 /// Handles:
 /// - Numeric component comparison (`1.9` < `1.10`)
+/// - Trailing letter comparison (`1.1.1a` < `1.1.1z`)
 /// - Suffix ordering (`_alpha` < `_beta` < `_pre` < `_rc` < (none) < `_p`)
 /// - Revision comparison (`-r0` < `-r1`)
-///
-/// This is a simplified but correct implementation for the common cases.
 fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
     use std::cmp::Ordering;
 
@@ -1185,8 +1189,8 @@ fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
     let (b_base, b_rev) = split_revision(b);
 
     // Split base version into components on `.` and `_`.
-    let a_parts: Vec<&str> = a_base.split(|c| c == '.' || c == '_').collect();
-    let b_parts: Vec<&str> = b_base.split(|c| c == '.' || c == '_').collect();
+    let a_parts: Vec<&str> = a_base.split(['.', '_']).collect();
+    let b_parts: Vec<&str> = b_base.split(['.', '_']).collect();
 
     let suffix_order = |s: &str| -> i32 {
         match s {
@@ -1199,53 +1203,79 @@ fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
         }
     };
 
+    /// Split a version component into its numeric prefix and optional
+    /// trailing letter (PMS §3.2).  e.g. `"1w"` → `(Some(1), Some('w'))`.
+    fn split_numeric_letter(s: &str) -> (Option<u64>, Option<char>) {
+        let num_end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+        let num = if num_end > 0 {
+            s[..num_end].parse::<u64>().ok()
+        } else {
+            None
+        };
+        let letter = s[num_end..]
+            .chars()
+            .next()
+            .filter(|c| c.is_ascii_lowercase());
+        (num, letter)
+    }
+
     let max_len = a_parts.len().max(b_parts.len());
     for i in 0..max_len {
         let pa = a_parts.get(i).copied().unwrap_or("");
         let pb = b_parts.get(i).copied().unwrap_or("");
 
-        // Try numeric comparison first.
-        match (pa.parse::<u64>(), pb.parse::<u64>()) {
-            (Ok(na), Ok(nb)) => {
-                let cmp = na.cmp(&nb);
+        // Check for PMS suffixes first.
+        let sa = suffix_order(pa);
+        let sb = suffix_order(pb);
+
+        if sa != 0 || sb != 0 {
+            // At least one side is a suffix keyword.
+            if sa != 0 && sb != 0 {
+                let cmp = sa.cmp(&sb);
                 if cmp != Ordering::Equal {
                     return cmp;
                 }
+                continue;
             }
-            // One is a suffix like "alpha", "beta", "pre", "rc", "p".
-            (Ok(_), Err(_)) => {
-                // Numeric vs suffix: the numeric part comes first in
-                // the version.  If we reach a suffix component on one
-                // side and a number on the other, the suffix side is
-                // "shorter" in the numeric part — but PMS says a present
-                // numeric part beats a missing one.
-                let sb = suffix_order(pb);
-                if sb != 0 {
-                    return 0i32.cmp(&sb); // no-suffix vs suffix
+            // One is a suffix, the other is not — the suffix side
+            // modifies the preceding version component.
+            if sa != 0 {
+                return sa.cmp(&0i32);
+            }
+            return 0i32.cmp(&sb);
+        }
+
+        // Split each component into numeric + optional trailing letter.
+        let (na, la) = split_numeric_letter(pa);
+        let (nb, lb) = split_numeric_letter(pb);
+
+        match (na, nb) {
+            (Some(a_num), Some(b_num)) => {
+                let cmp = a_num.cmp(&b_num);
+                if cmp != Ordering::Equal {
+                    return cmp;
                 }
-                return Ordering::Greater; // has more components
-            }
-            (Err(_), Ok(_)) => {
-                let sa = suffix_order(pa);
-                if sa != 0 {
-                    return sa.cmp(&0i32);
+                // Numeric parts equal — compare trailing letters.
+                // No letter < letter (PMS: `1.1.1` < `1.1.1a`).
+                match (la, lb) {
+                    (None, None) => {}
+                    (None, Some(_)) => return Ordering::Less,
+                    (Some(_), None) => return Ordering::Greater,
+                    (Some(a_c), Some(b_c)) => {
+                        let cmp = a_c.cmp(&b_c);
+                        if cmp != Ordering::Equal {
+                            return cmp;
+                        }
+                    }
                 }
-                return Ordering::Less;
             }
-            (Err(_), Err(_)) => {
-                // Both are suffix strings.
-                let sa = suffix_order(pa);
-                let sb = suffix_order(pb);
-                if sa != 0 || sb != 0 {
-                    let cmp = sa.cmp(&sb);
-                    if cmp != Ordering::Equal {
-                        return cmp;
-                    }
-                } else {
-                    let cmp = pa.cmp(pb);
-                    if cmp != Ordering::Equal {
-                        return cmp;
-                    }
+            (Some(_), None) => return Ordering::Greater,
+            (None, Some(_)) => return Ordering::Less,
+            (None, None) => {
+                // Both non-numeric, non-suffix — lexicographic.
+                let cmp = pa.cmp(pb);
+                if cmp != Ordering::Equal {
+                    return cmp;
                 }
             }
         }
@@ -1361,6 +1391,19 @@ VIDEO_CARDS="amdgpu radeonsi"
         assert_eq!(compare_versions("1.0_pre", "1.0_rc"), Ordering::Less);
         assert_eq!(compare_versions("1.0_rc", "1.0"), Ordering::Less);
         assert_eq!(compare_versions("1.0", "1.0_p"), Ordering::Less);
+    }
+
+    #[test]
+    fn compare_versions_trailing_letter() {
+        use std::cmp::Ordering;
+        // PMS §3.2: trailing letter sorts after bare version.
+        assert_eq!(compare_versions("1.1.1", "1.1.1a"), Ordering::Less);
+        assert_eq!(compare_versions("1.1.1a", "1.1.1b"), Ordering::Less);
+        assert_eq!(compare_versions("1.1.1w", "1.1.1z"), Ordering::Less);
+        assert_eq!(compare_versions("1.1.1z", "1.1.2"), Ordering::Less);
+        // Typical openssl version: 1.1.1w
+        assert_eq!(compare_versions("1.1.1w", "1.1.1w"), Ordering::Equal);
+        assert_eq!(compare_versions("1.1.1w", "3.1.0"), Ordering::Less);
     }
 
     #[test]

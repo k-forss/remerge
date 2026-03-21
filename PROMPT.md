@@ -204,7 +204,8 @@ directory.
 let tmp = tempdir()?;
 let root = tmp.path();
 // Create /etc/portage/make.conf, package.use/, repos.conf, etc.
-let reader = PortageReader::new(root.to_path_buf());
+std::env::set_var("ROOT", root);
+let reader = PortageReader::new()?;
 let config = reader.read_config()?;
 ```
 

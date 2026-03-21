@@ -389,6 +389,14 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
         _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
             warn!("Log stream did not finish within 5 s — aborting");
             log_handle.abort();
+            // After requesting abort, wait briefly for the task to
+            // terminate so that the raw-output channel sender is
+            // dropped deterministically.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                &mut log_handle,
+            )
+            .await;
         }
     }
 

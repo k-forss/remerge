@@ -173,10 +173,10 @@ async fn discover_configured_repos() -> Vec<(String, String)> {
                 repos.extend(crate::portage_setup::parse_repo_sections(&content));
             }
         }
-    } else if conf_path.is_file() {
-        if let Ok(content) = tokio::fs::read_to_string(conf_path).await {
-            repos.extend(crate::portage_setup::parse_repo_sections(&content));
-        }
+    } else if conf_path.is_file()
+        && let Ok(content) = tokio::fs::read_to_string(conf_path).await
+    {
+        repos.extend(crate::portage_setup::parse_repo_sections(&content));
     }
 
     repos

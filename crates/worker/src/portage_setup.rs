@@ -35,9 +35,9 @@ pub async fn apply_config(
     write_package_env(config).await?;
     write_env_files(config).await?;
     write_repos_conf(config).await?;
-    set_profile(config).await?;
     write_profile_overlay(config).await?;
     write_patches(config).await?;
+    set_profile(config).await?;
     info!("Portage configuration applied");
     Ok(())
 }
@@ -435,13 +435,38 @@ async fn write_repos_conf(config: &PortageConfig) -> Result<()> {
 /// mount, the overlay is remapped to a writable path under
 /// `/var/tmp/remerge-repos/` and the repos.conf entry is updated.
 async fn ensure_repo_locations(config: &PortageConfig) -> Result<()> {
+    use std::path::Component;
+
     let repos_mounted_ro = std::env::var("REMERGE_SKIP_SYNC").is_ok();
 
     for (filename, content) in &config.repos_conf {
         for (name, location) in parse_repo_sections(content) {
+            // Validate location: must be absolute and contain only
+            // normal components (no `..` traversal).
             let loc = Path::new(&location);
-            if loc.exists() {
-                continue;
+            if !loc.is_absolute()
+                || loc
+                    .components()
+                    .any(|c| !matches!(c, Component::RootDir | Component::Normal(_)))
+            {
+                anyhow::bail!(
+                    "Repo '{name}' has invalid location '{location}': \
+                     must be an absolute path with no traversal components"
+                );
+            }
+
+            // Check if the path already exists (use symlink_metadata to
+            // detect dangling symlinks too).
+            if let Ok(meta) = loc.symlink_metadata() {
+                if meta.is_dir() || (meta.is_symlink() && loc.is_dir()) {
+                    // Already a directory (or valid symlink to one).
+                    continue;
+                }
+                // Exists but is not a directory — remove it so we can
+                // replace with a proper dir or symlink.
+                fs::remove_file(loc).await.with_context(|| {
+                    format!("Failed to remove non-directory at {location} for repo '{name}'")
+                })?;
             }
 
             // Check if the repo is available under the bind-mount.
@@ -507,11 +532,12 @@ async fn rewrite_repo_location(filename: &str, old_loc: &str, new_loc: &str) -> 
     let mut output = String::with_capacity(content.len());
     for line in content.lines() {
         let trimmed = line.trim();
-        if let Some((key, value)) = trimmed.split_once('=') {
-            if key.trim().eq_ignore_ascii_case("location") && value.trim() == old_loc {
-                output.push_str(&format!("location = {new_loc}\n"));
-                continue;
-            }
+        if let Some((key, value)) = trimmed.split_once('=')
+            && key.trim().eq_ignore_ascii_case("location")
+            && value.trim() == old_loc
+        {
+            output.push_str(&format!("location = {new_loc}\n"));
+            continue;
         }
         output.push_str(line);
         output.push('\n');
@@ -536,8 +562,13 @@ async fn write_profile_overlay(config: &PortageConfig) -> Result<()> {
     }
 
     for (relative_path, content) in &config.profile_overlay {
-        // Validate path components — reject traversal and absolute paths.
-        if relative_path.contains("..") || relative_path.starts_with('/') {
+        // Validate path components — only allow normal segments (no `..',
+        // absolute paths, or other traversal tricks).
+        use std::path::Component;
+        let has_unsafe_component = std::path::Path::new(relative_path)
+            .components()
+            .any(|c| !matches!(c, Component::Normal(_)));
+        if has_unsafe_component || relative_path.is_empty() {
             tracing::warn!(
                 path = %relative_path,
                 "Skipping profile overlay file with invalid path"
@@ -635,8 +666,13 @@ async fn write_patches(config: &PortageConfig) -> Result<()> {
     }
 
     for (relative_path, content) in &config.patches {
-        // Validate path components — reject traversal and absolute paths.
-        if relative_path.contains("..") || relative_path.starts_with('/') {
+        // Validate path components — only allow normal segments (no `..',
+        // absolute paths, or other traversal tricks).
+        use std::path::Component;
+        let has_unsafe_component = std::path::Path::new(relative_path)
+            .components()
+            .any(|c| !matches!(c, Component::Normal(_)));
+        if has_unsafe_component || relative_path.is_empty() {
             tracing::warn!(
                 path = %relative_path,
                 "Skipping patch with invalid path"
@@ -684,10 +720,10 @@ pub(crate) fn parse_repo_sections(content: &str) -> Vec<(String, String)> {
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
             flush(&current_name, current_location.take(), &mut repos);
             current_name = trimmed[1..trimmed.len() - 1].to_string();
-        } else if let Some((key, value)) = trimmed.split_once('=') {
-            if key.trim().eq_ignore_ascii_case("location") {
-                current_location = Some(value.trim().to_string());
-            }
+        } else if let Some((key, value)) = trimmed.split_once('=')
+            && key.trim().eq_ignore_ascii_case("location")
+        {
+            current_location = Some(value.trim().to_string());
         }
     }
     flush(&current_name, current_location, &mut repos);

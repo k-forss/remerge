@@ -52,14 +52,16 @@ These are pure-logic tests that need no Docker, no server, no filesystem.
 
 Tests that create a temp directory tree mimicking `/etc/portage/` and `/var/db/pkg/`.
 
-- [ ] **2.1** `read_config` golden path: populate a full temp portage tree,
-      call `PortageReader::new(root).read_config()`, assert every field
+- [ ] **2.1** `read_config` golden path: populate a full temp portage tree in a
+      temp dir, set `ROOT` to that dir, call `PortageReader::new()?.read_config()`,
+      assert every field
 - [ ] **2.2** `read_config` with missing optional dirs (no `package.use/`,
       no `patches/`, no `profile/` overlay) — should succeed with empty maps
 - [ ] **2.3** `read_config` with `package.use` as a single file vs. a directory
       of files (Portage supports both)
 - [ ] **2.4** `read_profile_overlay` round-trip: write files into
-      `<root>/etc/portage/profile/`, call reader, assert `BTreeMap` keys and
+      `<ROOT>/etc/portage/profile/` in the temp dir, call
+      `PortageReader::new()?.read_profile_overlay()`, assert `BTreeMap` keys and
       content
 - [ ] **2.5** `read_patches_recursive` with nested `category/package/*.patch`
 - [ ] **2.6** `read_repos_conf` with multiple `[section]` blocks, verify
