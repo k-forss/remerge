@@ -262,8 +262,8 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
         while let Some(result) = output.next().await {
             match result {
                 Ok(log_output) => {
-                    let line = log_output.to_string();
-                    let trimmed = line.trim_end().to_string();
+                    let raw = log_output.to_string();
+                    let trimmed = raw.trim().to_string();
 
                     // Check for structured events emitted by the worker.
                     if let Some(json_str) = trimmed.strip_prefix("REMERGE_EVENT:")
@@ -273,7 +273,7 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
                         continue;
                     }
 
-                    // Parse emerge output patterns.
+                    // Parse emerge output patterns (using trimmed text).
                     if let Some(caps) = re_emerging.captures(&trimmed) {
                         if let Some(atom) = caps.get(1) {
                             current_package = Some((atom.as_str().to_string(), Instant::now()));
@@ -336,10 +336,11 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
                             .await;
                     }
 
-                    // Forward as log line.
+                    // Forward the raw output (preserving \r\n and partial
+                    // lines) so prompts render correctly on the client.
                     let _ = log_tx.send(BuildProgress {
                         workorder_id: id,
-                        event: BuildEvent::Log { line: trimmed },
+                        event: BuildEvent::Log { line: raw },
                         timestamp: Utc::now(),
                     });
                 }

@@ -87,24 +87,26 @@ impl RemergeClient {
 
         let mut final_result: Option<WorkorderResult> = None;
 
+        // Disable local terminal echo so we don't double-echo input.
+        // The container's PTY already echoes back everything we send.
+        let _echo_guard = EchoGuard::disable();
+
         // Spawn a task that reads from terminal stdin and sends to the
         // server via the WebSocket.  This enables interactive emerge
         // prompts like --ask to work through the worker container.
         let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
 
-        // Stdin reader task — runs on a blocking thread since stdin I/O
-        // blocks.  Only active while the WebSocket connection is alive.
+        // Stdin reader task — reads raw bytes (not lines) so that input
+        // reaches the container immediately without waiting for Enter.
         let stdin_handle = tokio::spawn(async move {
-            use tokio::io::AsyncBufReadExt;
-            let stdin = tokio::io::stdin();
-            let mut reader = tokio::io::BufReader::new(stdin);
-            let mut line = String::new();
+            use tokio::io::AsyncReadExt;
+            let mut stdin = tokio::io::stdin();
+            let mut buf = [0u8; 256];
             loop {
-                line.clear();
-                match reader.read_line(&mut line).await {
+                match stdin.read(&mut buf).await {
                     Ok(0) => break, // EOF
-                    Ok(_) => {
-                        if stdin_tx.send(line.as_bytes().to_vec()).await.is_err() {
+                    Ok(n) => {
+                        if stdin_tx.send(buf[..n].to_vec()).await.is_err() {
                             break; // Channel closed — build finished.
                         }
                     }
@@ -153,12 +155,20 @@ impl RemergeClient {
 
     /// Print a build event to the terminal.
     fn print_event(event: &BuildEvent) {
+        use std::io::Write;
         match event {
             BuildEvent::StatusChanged { from: _, to } => {
                 println!(">>> Status: {to:?}");
             }
             BuildEvent::Log { line } => {
-                println!("{line}");
+                // Write the raw log output without adding a newline.
+                // The container PTY output already includes \r\n where
+                // appropriate, and prompts intentionally omit it so the
+                // cursor stays on the same line for user input.
+                let stdout = std::io::stdout();
+                let mut out = stdout.lock();
+                let _ = out.write_all(line.as_bytes());
+                let _ = out.flush();
             }
             BuildEvent::PackageBuilt {
                 atom,
@@ -198,5 +208,54 @@ impl RemergeClient {
             .await?;
 
         status_resp.result.context("Workorder has no result yet")
+    }
+}
+
+// ─── Terminal echo control ──────────────────────────────────────────
+
+/// RAII guard that disables terminal echo on creation and restores it on drop.
+///
+/// When the container has a TTY (`tty: true`), it echoes all input back in
+/// its output stream.  If the client's terminal ALSO echoes locally, every
+/// keystroke appears twice.  This guard disables local echo so only the
+/// remote PTY echo is visible.
+struct EchoGuard {
+    original: Option<libc::termios>,
+}
+
+impl EchoGuard {
+    /// Disable echo on stdin.  Returns a guard that restores the original
+    /// settings on drop.  If stdin is not a TTY (e.g. piped), this is a
+    /// no-op.
+    fn disable() -> Self {
+        unsafe {
+            let mut termios: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(libc::STDIN_FILENO, &mut termios) != 0 {
+                return Self { original: None };
+            }
+            let original = termios;
+
+            // Disable ECHO and ICANON (canonical mode) so we get raw
+            // character-at-a-time input without local echo.
+            termios.c_lflag &= !(libc::ECHO | libc::ICANON);
+            // Read returns after 1 byte.
+            termios.c_cc[libc::VMIN] = 1;
+            termios.c_cc[libc::VTIME] = 0;
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &termios);
+
+            Self {
+                original: Some(original),
+            }
+        }
+    }
+}
+
+impl Drop for EchoGuard {
+    fn drop(&mut self) {
+        if let Some(ref original) = self.original {
+            unsafe {
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, original);
+            }
+        }
     }
 }
