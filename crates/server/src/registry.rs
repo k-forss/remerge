@@ -227,6 +227,9 @@ mod tests {
             package_license: Vec::new(),
             package_mask: Vec::new(),
             package_unmask: Vec::new(),
+            package_env: Vec::new(),
+            env_files: BTreeMap::new(),
+            repos_conf: BTreeMap::new(),
             profile: "default/linux/amd64/23.0".into(),
             world: Vec::new(),
         }

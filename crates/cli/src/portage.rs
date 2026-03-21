@@ -43,6 +43,9 @@ impl PortageReader {
         let package_license = self.read_package_license()?;
         let package_mask = self.read_package_mask()?;
         let package_unmask = self.read_package_unmask()?;
+        let package_env = self.read_package_env()?;
+        let env_files = self.read_env_files()?;
+        let repos_conf = self.read_repos_conf()?;
         let profile = self.read_profile()?;
         let world = self.read_world()?;
 
@@ -53,6 +56,9 @@ impl PortageReader {
             package_license,
             package_mask,
             package_unmask,
+            package_env,
+            env_files,
+            repos_conf,
             profile,
             world,
         })
@@ -304,6 +310,98 @@ impl PortageReader {
             }
             Some(atom.to_string())
         })
+    }
+
+    /// Read per-package environment overrides from `/etc/portage/package.env`.
+    ///
+    /// Each line maps an atom to an env file name:
+    /// ```text
+    /// dev-qt/qtwebengine no-lto.conf
+    /// sys-apps/systemd custom-cflags.conf
+    /// ```
+    fn read_package_env(&self) -> Result<Vec<PackageEnvEntry>> {
+        self.read_package_entries("package.env", |line| {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 2 {
+                return None;
+            }
+            Some(PackageEnvEntry {
+                atom: parts[0].to_string(),
+                env_file: parts[1].to_string(),
+            })
+        })
+    }
+
+    /// Read all environment override files from `/etc/portage/env/`.
+    ///
+    /// Returns a map of filename → content.  These files are referenced
+    /// by `package.env` entries and can set per-package variables like
+    /// `CFLAGS`, `MAKEOPTS`, `CMAKE_BUILD_TYPE`, etc.
+    fn read_env_files(&self) -> Result<BTreeMap<String, String>> {
+        let path = self.root.join("etc/portage/env");
+        let mut files = BTreeMap::new();
+
+        if path.is_dir() {
+            if let Ok(dir) = fs::read_dir(&path) {
+                for entry in dir.flatten() {
+                    if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                        let fname = entry.file_name();
+                        let fname_str = fname.to_string_lossy();
+                        if !fname_str.starts_with('.') {
+                            if let Ok(content) = fs::read_to_string(entry.path()) {
+                                debug!(file = %fname_str, "Read env file");
+                                files.insert(fname_str.into_owned(), content);
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            debug!("No /etc/portage/env/ directory — skipping");
+        }
+
+        if !files.is_empty() {
+            info!(count = files.len(), "Read portage env files");
+        }
+        Ok(files)
+    }
+
+    /// Read portage repository configuration from `/etc/portage/repos.conf`.
+    ///
+    /// May be a single file or a directory of `.conf` files.  Returns a map
+    /// of filename → raw INI content.  This captures custom overlay
+    /// definitions, sync URIs, and repo priorities.
+    fn read_repos_conf(&self) -> Result<BTreeMap<String, String>> {
+        let path = self.root.join("etc/portage/repos.conf");
+        let mut files = BTreeMap::new();
+
+        if path.is_dir() {
+            if let Ok(dir) = fs::read_dir(&path) {
+                for entry in dir.flatten() {
+                    if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                        let fname = entry.file_name();
+                        let fname_str = fname.to_string_lossy();
+                        if !fname_str.starts_with('.') {
+                            if let Ok(content) = fs::read_to_string(entry.path()) {
+                                debug!(file = %fname_str, "Read repos.conf file");
+                                files.insert(fname_str.into_owned(), content);
+                            }
+                        }
+                    }
+                }
+            }
+        } else if path.is_file() {
+            if let Ok(content) = fs::read_to_string(&path) {
+                files.insert("repos.conf".to_string(), content);
+            }
+        } else {
+            debug!("No /etc/portage/repos.conf — skipping");
+        }
+
+        if !files.is_empty() {
+            info!(count = files.len(), "Read repos.conf files");
+        }
+        Ok(files)
     }
 
     /// Generic reader for `/etc/portage/<name>` which may be a file or directory.

@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use regex::Regex;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tracing::info;
 
@@ -66,6 +66,14 @@ pub async fn build_packages(workorder: &Workorder, emerge_cmd: &str) -> Result<(
     // Add the package atoms.
     args.extend(workorder.atoms.iter().cloned());
 
+    // Warn about expensive operations that are technically valid but risky.
+    if args.iter().any(|a| a == "--emptytree" || a == "-e") {
+        tracing::warn!(
+            "--emptytree requested — this will rebuild the entire dependency \
+             tree from scratch and may take many hours"
+        );
+    }
+
     info!(cmd = %emerge_cmd, ?args, "Running emerge");
 
     let mut child = Command::new(emerge_cmd)
@@ -76,19 +84,30 @@ pub async fn build_packages(workorder: &Workorder, emerge_cmd: &str) -> Result<(
         .spawn()
         .with_context(|| format!("Failed to spawn {emerge_cmd}"))?;
 
-    // Spawn stderr streaming.
-    let stderr_handle = child.stderr.take().map(|stderr| {
+    // Spawn stderr streaming — forward raw bytes to preserve formatting.
+    let stderr_handle = child.stderr.take().map(|mut stderr| {
         tokio::spawn(async move {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                eprintln!("{line}");
+            let mut writer = tokio::io::stderr();
+            let mut buf = [0u8; 4096];
+            loop {
+                match stderr.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let _ = writer.write_all(&buf[..n]).await;
+                        let _ = writer.flush().await;
+                    }
+                }
             }
         })
     });
 
     // Read and parse stdout for structured build events.
-    if let Some(stdout) = child.stdout.take() {
+    //
+    // We read raw bytes and forward them to container stdout immediately,
+    // preserving exact formatting (ANSI escape codes, \r\n line endings,
+    // partial lines for progress bars, etc.).  A separate line buffer
+    // accumulates bytes for regex-based event detection.
+    if let Some(mut stdout) = child.stdout.take() {
         let re_emerging = Regex::new(r">>> Emerging \(\d+ of \d+\) (.+)::").expect("valid regex");
         let re_completed = Regex::new(r">>> Completed \(\d+ of \d+\) (.+)::").expect("valid regex");
         let re_error = Regex::new(r"\* ERROR: (.+)::(\S+) failed").expect("valid regex");
@@ -101,84 +120,102 @@ pub async fn build_packages(workorder: &Workorder, emerge_cmd: &str) -> Result<(
         let re_fetch_fail =
             Regex::new(r"(?:Couldn't download|!!! Fetch failed)").expect("valid regex");
 
-        let reader = BufReader::new(stdout);
-        let mut lines = reader.lines();
+        let mut stdout_writer = tokio::io::stdout();
+        let mut line_buf = Vec::with_capacity(8192);
+        let mut read_buf = [0u8; 4096];
         let mut current_package: Option<(String, Instant)> = None;
 
-        while let Ok(Some(line)) = lines.next_line().await {
-            // Always print the raw line to container stdout.
-            println!("{line}");
+        loop {
+            let n = match stdout.read(&mut read_buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
 
-            // Parse for structured events.
-            if let Some(caps) = re_emerging.captures(&line) {
-                if let Some(atom) = caps.get(1) {
-                    current_package = Some((atom.as_str().to_string(), Instant::now()));
-                }
-            } else if let Some(caps) = re_completed.captures(&line) {
-                if let Some(atom_match) = caps.get(1) {
-                    let atom = atom_match.as_str().to_string();
-                    let duration = current_package
-                        .as_ref()
-                        .filter(|(pkg, _)| *pkg == atom)
-                        .map(|(_, start)| start.elapsed().as_secs())
-                        .unwrap_or(0);
+            // Forward raw bytes to container stdout immediately.
+            let _ = stdout_writer.write_all(&read_buf[..n]).await;
+            let _ = stdout_writer.flush().await;
 
-                    // Emit structured event for the server to parse.
-                    println!(
-                        "REMERGE_EVENT:{}",
-                        serde_json::json!({
-                            "type": "package_built",
-                            "atom": atom,
-                            "duration_secs": duration,
-                        })
-                    );
-                    current_package = None;
-                }
-            } else if let Some(caps) = re_error.captures(&line) {
-                if let Some(atom_match) = caps.get(1) {
-                    let atom = atom_match.as_str().to_string();
+            // Accumulate for line-based event parsing.
+            line_buf.extend_from_slice(&read_buf[..n]);
+
+            // Process complete lines from the buffer.
+            while let Some(newline_pos) = line_buf.iter().position(|&b| b == b'\n') {
+                let line = String::from_utf8_lossy(&line_buf[..newline_pos])
+                    .trim_end_matches('\r')
+                    .to_string();
+                line_buf.drain(..=newline_pos);
+
+                // Parse for structured events.
+                if let Some(caps) = re_emerging.captures(&line) {
+                    if let Some(atom) = caps.get(1) {
+                        current_package = Some((atom.as_str().to_string(), Instant::now()));
+                    }
+                } else if let Some(caps) = re_completed.captures(&line) {
+                    if let Some(atom_match) = caps.get(1) {
+                        let atom = atom_match.as_str().to_string();
+                        let duration = current_package
+                            .as_ref()
+                            .filter(|(pkg, _)| *pkg == atom)
+                            .map(|(_, start)| start.elapsed().as_secs())
+                            .unwrap_or(0);
+
+                        // Emit structured event for the server to parse.
+                        println!(
+                            "REMERGE_EVENT:{}",
+                            serde_json::json!({
+                                "type": "package_built",
+                                "atom": atom,
+                                "duration_secs": duration,
+                            })
+                        );
+                        current_package = None;
+                    }
+                } else if let Some(caps) = re_error.captures(&line) {
+                    if let Some(atom_match) = caps.get(1) {
+                        let atom = atom_match.as_str().to_string();
+                        println!(
+                            "REMERGE_EVENT:{}",
+                            serde_json::json!({
+                                "type": "package_failed",
+                                "atom": atom,
+                                "reason": line.trim(),
+                                "failure_kind": "build_error",
+                            })
+                        );
+                    }
+                } else if let Some(caps) = re_missing_dep.captures(&line) {
+                    if let Some(dep) = caps.get(1) {
+                        println!(
+                            "REMERGE_EVENT:{}",
+                            serde_json::json!({
+                                "type": "package_failed",
+                                "atom": dep.as_str(),
+                                "reason": line.trim(),
+                                "failure_kind": "missing_dependency",
+                            })
+                        );
+                    }
+                } else if re_use_conflict.is_match(&line) {
                     println!(
                         "REMERGE_EVENT:{}",
                         serde_json::json!({
                             "type": "package_failed",
-                            "atom": atom,
+                            "atom": current_package.as_ref().map(|(a, _)| a.as_str()).unwrap_or("unknown"),
                             "reason": line.trim(),
-                            "failure_kind": "build_error",
+                            "failure_kind": "use_conflict",
                         })
                     );
-                }
-            } else if let Some(caps) = re_missing_dep.captures(&line) {
-                if let Some(dep) = caps.get(1) {
+                } else if re_fetch_fail.is_match(&line) {
                     println!(
                         "REMERGE_EVENT:{}",
                         serde_json::json!({
                             "type": "package_failed",
-                            "atom": dep.as_str(),
+                            "atom": current_package.as_ref().map(|(a, _)| a.as_str()).unwrap_or("unknown"),
                             "reason": line.trim(),
-                            "failure_kind": "missing_dependency",
+                            "failure_kind": "fetch_failure",
                         })
                     );
                 }
-            } else if re_use_conflict.is_match(&line) {
-                println!(
-                    "REMERGE_EVENT:{}",
-                    serde_json::json!({
-                        "type": "package_failed",
-                        "atom": current_package.as_ref().map(|(a, _)| a.as_str()).unwrap_or("unknown"),
-                        "reason": line.trim(),
-                        "failure_kind": "use_conflict",
-                    })
-                );
-            } else if re_fetch_fail.is_match(&line) {
-                println!(
-                    "REMERGE_EVENT:{}",
-                    serde_json::json!({
-                        "type": "package_failed",
-                        "atom": current_package.as_ref().map(|(a, _)| a.as_str()).unwrap_or("unknown"),
-                        "reason": line.trim(),
-                        "failure_kind": "fetch_failure",
-                    })
-                );
             }
         }
     }
