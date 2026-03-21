@@ -165,34 +165,63 @@ impl PortageReader {
         };
 
         // ── Collect USE_EXPAND variables ─────────────────────────────
-        // Use portageq to resolve these too, so profile defaults (e.g.
-        // PYTHON_TARGETS from eselect) are captured.
-        let use_expand_keys = [
-            "ABI_X86",
-            "VIDEO_CARDS",
-            "INPUT_DEVICES",
-            "L10N",
-            "PYTHON_TARGETS",
-            "PYTHON_SINGLE_TARGET",
-            "RUBY_TARGETS",
-            "LUA_TARGETS",
-            "LUA_SINGLE_TARGET",
-        ];
+        // Dynamically discover all USE_EXPAND variable names from portage
+        // so we capture LLVM_SLOT, LLVM_TARGETS, and any other vars that
+        // eselect or profiles define.  Without this, the worker container
+        // won't know which LLVM slot, Python targets, etc. to use.
+        let use_expand_keys: Vec<String> = match Self::portageq_envvar("USE_EXPAND") {
+            Ok(expand_str) => {
+                let keys: Vec<String> =
+                    expand_str.split_whitespace().map(String::from).collect();
+                info!(
+                    count = keys.len(),
+                    "Discovered USE_EXPAND variables via portageq"
+                );
+                keys
+            }
+            Err(e) => {
+                warn!(
+                    %e,
+                    "Failed to query USE_EXPAND — using hardcoded fallback"
+                );
+                [
+                    "ABI_X86",
+                    "VIDEO_CARDS",
+                    "INPUT_DEVICES",
+                    "L10N",
+                    "PYTHON_TARGETS",
+                    "PYTHON_SINGLE_TARGET",
+                    "RUBY_TARGETS",
+                    "LUA_TARGETS",
+                    "LUA_SINGLE_TARGET",
+                    "LLVM_SLOT",
+                    "LLVM_TARGETS",
+                ]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+            }
+        };
+
         let mut use_expand = BTreeMap::new();
         for key in &use_expand_keys {
+            // CPU_FLAGS_* are handled separately via cpuid2cpuflags.
+            if key.starts_with("CPU_FLAGS_") {
+                continue;
+            }
             // Try portageq first for fully-resolved values, fall back to make.conf.
             let vals = match Self::portageq_envvar(key) {
                 Ok(resolved) => {
                     let v: Vec<String> = resolved.split_whitespace().map(String::from).collect();
                     if !v.is_empty() {
-                        debug!(key, ?v, "USE_EXPAND resolved via portageq");
+                        debug!(key = %key, ?v, "USE_EXPAND resolved via portageq");
                     }
                     v
                 }
                 Err(_) => split_flags(key),
             };
             if !vals.is_empty() {
-                use_expand.insert((*key).to_string(), vals);
+                use_expand.insert(key.clone(), vals);
             }
         }
 
@@ -210,8 +239,8 @@ impl PortageReader {
             "CHOST",
         ]
         .iter()
-        .chain(use_expand_keys.iter())
         .copied()
+        .chain(use_expand_keys.iter().map(|s| s.as_str()))
         .collect();
 
         let extra: BTreeMap<String, String> = vars

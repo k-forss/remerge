@@ -392,6 +392,11 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
         }
     }
 
+    // Ensure the task is fully complete so its captured `raw_tx` clone
+    // is dropped.  Without this, the raw broadcast channel stays open
+    // and the WS handler never transitions to text-only mode.
+    let _ = log_handle.await;
+
     // Close the raw PTY channel *before* sending Finished so the WS
     // handler transitions to text-only mode and is guaranteed to pick
     // up the Finished event on the progress channel.

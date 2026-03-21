@@ -386,6 +386,11 @@ async fn write_env_files(config: &PortageConfig) -> Result<()> {
 /// overlays, sync URIs, and repo priorities.  When the server bind-mounts
 /// its repos directory, the repos are already present — these conf files
 /// just tell portage where to find them.
+///
+/// Sections whose `location` directory does not exist inside the container
+/// are silently dropped.  This prevents errors from client overlays
+/// (layman, eselect-repository, etc.) that aren't available in the
+/// ephemeral worker environment.
 async fn write_repos_conf(config: &PortageConfig) -> Result<()> {
     if config.repos_conf.is_empty() {
         return Ok(());
@@ -393,22 +398,94 @@ async fn write_repos_conf(config: &PortageConfig) -> Result<()> {
 
     ensure_dir("/etc/portage/repos.conf").await?;
 
+    let mut written = 0usize;
     for (filename, content) in &config.repos_conf {
         if filename.trim().is_empty() || filename.contains('/') || filename.contains("..") {
             tracing::warn!(filename, "Skipping repos.conf file with invalid filename");
             continue;
         }
+        // Filter out sections referencing non-existent repo locations
+        // (e.g. client layman overlays, eselect-repository paths).
+        let filtered = filter_repos_conf_sections(content);
+        if filtered.trim().is_empty() {
+            info!(filename, "All sections filtered from repos.conf file — skipping");
+            continue;
+        }
         let path = format!("/etc/portage/repos.conf/{filename}");
-        fs::write(&path, content)
+        fs::write(&path, &filtered)
             .await
             .with_context(|| format!("Failed to write {path}"))?;
+        written += 1;
     }
 
     info!(
-        count = config.repos_conf.len(),
+        written,
+        total = config.repos_conf.len(),
         "Wrote /etc/portage/repos.conf/ files"
     );
     Ok(())
+}
+
+/// Filter a repos.conf INI file, dropping sections whose `location`
+/// directory does not exist in the container.
+///
+/// The `[DEFAULT]` section and sections without an explicit `location`
+/// are always kept.
+fn filter_repos_conf_sections(content: &str) -> String {
+    let mut output = String::new();
+    let mut section_name = String::new();
+    let mut section_lines: Vec<&str> = Vec::new();
+    let mut section_location: Option<String> = None;
+
+    let flush =
+        |out: &mut String, name: &str, lines: &[&str], location: &Option<String>| {
+            // DEFAULT and pre-section lines are always kept.
+            if name.is_empty() || name.eq_ignore_ascii_case("DEFAULT") {
+                for line in lines {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+                return;
+            }
+            match location {
+                Some(loc) if !Path::new(loc.trim()).exists() => {
+                    info!(
+                        section = name,
+                        location = %loc,
+                        "Filtering repos.conf section — location does not exist"
+                    );
+                }
+                _ => {
+                    // No location or location exists — keep.
+                    for line in lines {
+                        out.push_str(line);
+                        out.push('\n');
+                    }
+                }
+            }
+        };
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            // New section — flush previous one.
+            flush(&mut output, &section_name, &section_lines, &section_location);
+            section_name = trimmed[1..trimmed.len() - 1].to_string();
+            section_lines = vec![line];
+            section_location = None;
+        } else {
+            section_lines.push(line);
+            if let Some((key, value)) = trimmed.split_once('=') {
+                if key.trim().eq_ignore_ascii_case("location") {
+                    section_location = Some(value.trim().to_string());
+                }
+            }
+        }
+    }
+    // Flush the last section.
+    flush(&mut output, &section_name, &section_lines, &section_location);
+
+    output
 }
 
 /// Ensure a directory exists (convert file to directory if needed).
@@ -572,5 +649,47 @@ mod tests {
             !content.contains("-*"),
             "Should not contain -* for unresolved flags"
         );
+    }
+
+    #[test]
+    fn filter_repos_conf_keeps_default_and_existing() {
+        // DEFAULT and sections without location are always kept.
+        let input = "[DEFAULT]\nmain-repo = gentoo\n\n[gentoo]\nlocation = /\nsync-type = rsync\n";
+        let result = filter_repos_conf_sections(input);
+        assert!(result.contains("[DEFAULT]"), "DEFAULT section must be kept");
+        assert!(
+            result.contains("[gentoo]"),
+            "Section with existing location must be kept"
+        );
+    }
+
+    #[test]
+    fn filter_repos_conf_drops_missing_location() {
+        let input = "[missing-overlay]\nlocation = /nonexistent/path/to/overlay\nsync-type = git\n";
+        let result = filter_repos_conf_sections(input);
+        assert!(
+            !result.contains("[missing-overlay]"),
+            "Section with non-existent location must be dropped"
+        );
+    }
+
+    #[test]
+    fn filter_repos_conf_mixed() {
+        let input = "\
+[DEFAULT]
+main-repo = gentoo
+
+[gentoo]
+location = /
+sync-type = rsync
+
+[broken-overlay]
+location = /var/lib/layman/does-not-exist
+sync-type = git
+";
+        let result = filter_repos_conf_sections(input);
+        assert!(result.contains("[DEFAULT]"));
+        assert!(result.contains("[gentoo]"));
+        assert!(!result.contains("[broken-overlay]"));
     }
 }

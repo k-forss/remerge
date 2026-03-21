@@ -277,6 +277,9 @@ RUN echo 'CHOST="{chost}"' >> /etc/portage/make.conf && \
 
 # Set up portage for building.
 RUN emerge --sync --quiet || true
+
+# Git is needed for syncing git-based overlays (e.g. GURU, custom repos).
+RUN emerge --oneshot --quiet dev-vcs/git || true
 {crossdev_block}
 # Create binpkg output directory.
 RUN mkdir -p {binpkg_mount}
