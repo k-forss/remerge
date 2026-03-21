@@ -133,9 +133,10 @@ impl RemergeClient {
                     if let Ok(progress) = serde_json::from_str::<BuildProgress>(&text) {
                         Self::print_event(&progress.event);
 
-                        // If we get a Finished event, try to fetch the result.
+                        // If we get a Finished event, fetch the result and exit.
                         if matches!(progress.event, BuildEvent::Finished { .. }) {
                             final_result = self.fetch_result(progress.workorder_id).await.ok();
+                            break;
                         }
                     } else {
                         debug!("Unrecognised WS message: {text}");
