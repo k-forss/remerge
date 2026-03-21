@@ -111,6 +111,40 @@ impl PortageReader {
         // CHOST: prefer make.conf, fall back to detected.
         let chost = vars.get("CHOST").cloned().unwrap_or(resolved.chost);
 
+        // ── Resolve USE flags ────────────────────────────────────────
+        // Profile-inherited flags (e.g. `dbus` from the desktop profile)
+        // are NOT present in make.conf.  Use `portageq envvar USE` to get
+        // the fully merged value (profile defaults + make.conf + profile
+        // force/mask).
+        let (use_flags, use_flags_resolved) = match Self::portageq_envvar("USE") {
+            Ok(resolved_use) => {
+                let flags: Vec<String> =
+                    resolved_use.split_whitespace().map(String::from).collect();
+                info!(
+                    count = flags.len(),
+                    "Resolved USE flags via portageq (includes profile defaults)"
+                );
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    let make_conf_use = split_flags("USE");
+                    let extra: Vec<_> = flags
+                        .iter()
+                        .filter(|f| !make_conf_use.contains(f))
+                        .collect();
+                    if !extra.is_empty() {
+                        debug!(?extra, "USE flags from profile defaults (not in make.conf)");
+                    }
+                }
+                (flags, true)
+            }
+            Err(e) => {
+                warn!(
+                    %e,
+                    "Failed to resolve USE via portageq — falling back to make.conf"
+                );
+                (split_flags("USE"), false)
+            }
+        };
+
         // ── Collect USE_EXPAND variables ─────────────────────────────
         let use_expand_keys = [
             "VIDEO_CARDS",
@@ -159,7 +193,7 @@ impl PortageReader {
             cxxflags,
             ldflags: get("LDFLAGS"),
             makeopts: get("MAKEOPTS"),
-            use_flags: split_flags("USE"),
+            use_flags,
             features: split_flags("FEATURES"),
             accept_license: get("ACCEPT_LICENSE"),
             accept_keywords: get("ACCEPT_KEYWORDS"),
@@ -169,6 +203,7 @@ impl PortageReader {
             original_cflags,
             use_expand,
             extra,
+            use_flags_resolved,
         })
     }
 
@@ -573,6 +608,9 @@ impl PortageReader {
     ///
     /// Handles `VAR="value"` and `VAR='value'` and `VAR=value` forms.
     /// Does NOT handle multi-line values, command substitution, etc.
+    ///
+    /// For variables that need full resolution (including `source` directives
+    /// and profile inheritance), use [`portageq_envvar`] instead.
     fn parse_shell_vars(content: &str) -> BTreeMap<String, String> {
         let mut vars = BTreeMap::new();
 
@@ -606,6 +644,35 @@ impl PortageReader {
         }
 
         vars
+    }
+
+    /// Query a fully-resolved portage variable via `portageq envvar`.
+    ///
+    /// This uses portage's own resolution logic, which handles:
+    /// - `source` directives in `make.conf`
+    /// - `${VAR}` variable expansion
+    /// - Profile-inherited defaults (`make.defaults`, `use.force`, `use.mask`)
+    /// - Parent profile chain
+    ///
+    /// Falls back with an error if `portageq` is unavailable (non-Gentoo host).
+    fn portageq_envvar(var: &str) -> Result<String> {
+        let output = std::process::Command::new("portageq")
+            .args(["envvar", var])
+            .output()
+            .with_context(|| format!("Failed to run `portageq envvar {var}`"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "`portageq envvar {var}` exited with {}: {stderr}",
+                output.status
+            );
+        }
+
+        Ok(String::from_utf8(output.stdout)
+            .context("portageq output is not valid UTF-8")?
+            .trim()
+            .to_string())
     }
 }
 
