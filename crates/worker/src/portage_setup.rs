@@ -382,15 +382,14 @@ async fn write_env_files(config: &PortageConfig) -> Result<()> {
 
 /// Write portage repository configuration to `/etc/portage/repos.conf/`.
 ///
-/// Forwards the client's repos.conf so the worker knows about custom
-/// overlays, sync URIs, and repo priorities.  When the server bind-mounts
-/// its repos directory, the repos are already present — these conf files
-/// just tell portage where to find them.
+/// Forwards the client's repos.conf so the worker has the same overlay
+/// definitions, sync URIs, and repo priorities as the client.  ALL
+/// sections are written — the worker's sync step will fetch any repos
+/// that aren't already present (e.g. via bind-mount from the server).
 ///
-/// Sections whose `location` directory does not exist inside the container
-/// are silently dropped.  This prevents errors from client overlays
-/// (layman, eselect-repository, etc.) that aren't available in the
-/// ephemeral worker environment.
+/// After writing, [`ensure_repo_locations`] creates missing location
+/// directories (or symlinks them to bind-mounted repos under
+/// `/var/db/repos/`) so portage doesn't error out before sync.
 async fn write_repos_conf(config: &PortageConfig) -> Result<()> {
     if config.repos_conf.is_empty() {
         return Ok(());
@@ -398,94 +397,110 @@ async fn write_repos_conf(config: &PortageConfig) -> Result<()> {
 
     ensure_dir("/etc/portage/repos.conf").await?;
 
-    let mut written = 0usize;
     for (filename, content) in &config.repos_conf {
         if filename.trim().is_empty() || filename.contains('/') || filename.contains("..") {
             tracing::warn!(filename, "Skipping repos.conf file with invalid filename");
             continue;
         }
-        // Filter out sections referencing non-existent repo locations
-        // (e.g. client layman overlays, eselect-repository paths).
-        let filtered = filter_repos_conf_sections(content);
-        if filtered.trim().is_empty() {
-            info!(filename, "All sections filtered from repos.conf file — skipping");
-            continue;
-        }
         let path = format!("/etc/portage/repos.conf/{filename}");
-        fs::write(&path, &filtered)
+        fs::write(&path, content)
             .await
             .with_context(|| format!("Failed to write {path}"))?;
-        written += 1;
     }
 
+    // Ensure every referenced repo location exists so portage doesn't
+    // error out before we get a chance to sync.
+    ensure_repo_locations(config).await?;
+
     info!(
-        written,
-        total = config.repos_conf.len(),
+        count = config.repos_conf.len(),
         "Wrote /etc/portage/repos.conf/ files"
     );
     Ok(())
 }
 
-/// Filter a repos.conf INI file, dropping sections whose `location`
-/// directory does not exist in the container.
+/// Ensure every repo's `location` directory exists.
 ///
-/// The `[DEFAULT]` section and sections without an explicit `location`
-/// are always kept.
-fn filter_repos_conf_sections(content: &str) -> String {
-    let mut output = String::new();
-    let mut section_name = String::new();
-    let mut section_lines: Vec<&str> = Vec::new();
-    let mut section_location: Option<String> = None;
+/// For repos already available under `/var/db/repos/<name>` (bind-mounted
+/// from the server), a symlink is created from the repos.conf `location`
+/// to the bind-mount path.  For repos not present in the bind-mount, an
+/// empty directory is created so `emerge --sync` / `emaint sync` can
+/// populate it.
+async fn ensure_repo_locations(config: &PortageConfig) -> Result<()> {
+    for (_filename, content) in &config.repos_conf {
+        for (name, location) in parse_repo_sections(content) {
+            let loc = Path::new(&location);
+            if loc.exists() {
+                continue;
+            }
 
-    let flush =
-        |out: &mut String, name: &str, lines: &[&str], location: &Option<String>| {
-            // DEFAULT and pre-section lines are always kept.
-            if name.is_empty() || name.eq_ignore_ascii_case("DEFAULT") {
-                for line in lines {
-                    out.push_str(line);
-                    out.push('\n');
+            // Check if the repo is available under the bind-mount.
+            let bind_path = Path::new("/var/db/repos").join(&name);
+            if bind_path.is_dir() {
+                if let Some(parent) = loc.parent() {
+                    fs::create_dir_all(parent).await.with_context(|| {
+                        format!("Failed to create parent dir for {location}")
+                    })?;
                 }
-                return;
+                tokio::fs::symlink(&bind_path, loc).await.with_context(|| {
+                    format!(
+                        "Failed to symlink {location} → {}",
+                        bind_path.display()
+                    )
+                })?;
+                info!(
+                    repo = %name,
+                    location = %location,
+                    bind_path = %bind_path.display(),
+                    "Symlinked repo location to bind-mounted path"
+                );
+            } else {
+                // Create an empty directory — will be populated during sync.
+                fs::create_dir_all(&location).await.with_context(|| {
+                    format!("Failed to create repo directory {location}")
+                })?;
+                info!(
+                    repo = %name,
+                    location = %location,
+                    "Created empty repo directory (will sync)"
+                );
             }
-            match location {
-                Some(loc) if !Path::new(loc.trim()).exists() => {
-                    info!(
-                        section = name,
-                        location = %loc,
-                        "Filtering repos.conf section — location does not exist"
-                    );
-                }
-                _ => {
-                    // No location or location exists — keep.
-                    for line in lines {
-                        out.push_str(line);
-                        out.push('\n');
-                    }
-                }
-            }
-        };
+        }
+    }
+    Ok(())
+}
+
+/// Parse an INI-style repos.conf file and return `(section_name, location)`
+/// pairs.  The `[DEFAULT]` section and sections without a `location` key
+/// are skipped.
+pub(crate) fn parse_repo_sections(content: &str) -> Vec<(String, String)> {
+    let mut repos = Vec::new();
+    let mut current_name = String::new();
+    let mut current_location: Option<String> = None;
+
+    let flush = |name: &str, location: Option<String>, out: &mut Vec<(String, String)>| {
+        if !name.is_empty()
+            && !name.eq_ignore_ascii_case("DEFAULT")
+            && let Some(loc) = location
+        {
+            out.push((name.to_string(), loc));
+        }
+    };
 
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            // New section — flush previous one.
-            flush(&mut output, &section_name, &section_lines, &section_location);
-            section_name = trimmed[1..trimmed.len() - 1].to_string();
-            section_lines = vec![line];
-            section_location = None;
-        } else {
-            section_lines.push(line);
-            if let Some((key, value)) = trimmed.split_once('=') {
-                if key.trim().eq_ignore_ascii_case("location") {
-                    section_location = Some(value.trim().to_string());
-                }
+            flush(&current_name, current_location.take(), &mut repos);
+            current_name = trimmed[1..trimmed.len() - 1].to_string();
+        } else if let Some((key, value)) = trimmed.split_once('=') {
+            if key.trim().eq_ignore_ascii_case("location") {
+                current_location = Some(value.trim().to_string());
             }
         }
     }
-    // Flush the last section.
-    flush(&mut output, &section_name, &section_lines, &section_location);
+    flush(&current_name, current_location, &mut repos);
 
-    output
+    repos
 }
 
 /// Ensure a directory exists (convert file to directory if needed).
@@ -652,44 +667,59 @@ mod tests {
     }
 
     #[test]
-    fn filter_repos_conf_keeps_default_and_existing() {
-        // DEFAULT and sections without location are always kept.
-        let input = "[DEFAULT]\nmain-repo = gentoo\n\n[gentoo]\nlocation = /\nsync-type = rsync\n";
-        let result = filter_repos_conf_sections(input);
-        assert!(result.contains("[DEFAULT]"), "DEFAULT section must be kept");
-        assert!(
-            result.contains("[gentoo]"),
-            "Section with existing location must be kept"
-        );
-    }
-
-    #[test]
-    fn filter_repos_conf_drops_missing_location() {
-        let input = "[missing-overlay]\nlocation = /nonexistent/path/to/overlay\nsync-type = git\n";
-        let result = filter_repos_conf_sections(input);
-        assert!(
-            !result.contains("[missing-overlay]"),
-            "Section with non-existent location must be dropped"
-        );
-    }
-
-    #[test]
-    fn filter_repos_conf_mixed() {
+    fn parse_repo_sections_extracts_names_and_locations() {
         let input = "\
 [DEFAULT]
 main-repo = gentoo
 
 [gentoo]
-location = /
+location = /var/db/repos/gentoo
 sync-type = rsync
 
-[broken-overlay]
-location = /var/lib/layman/does-not-exist
+[custom-overlay]
+location = /var/lib/layman/custom
+sync-type = git
+sync-uri = https://example.com/overlay.git
+";
+        let repos = parse_repo_sections(input);
+        assert_eq!(repos.len(), 2);
+        assert_eq!(
+            repos[0],
+            ("gentoo".to_string(), "/var/db/repos/gentoo".to_string())
+        );
+        assert_eq!(
+            repos[1],
+            (
+                "custom-overlay".to_string(),
+                "/var/lib/layman/custom".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn parse_repo_sections_skips_default_and_no_location() {
+        let input = "\
+[DEFAULT]
+main-repo = gentoo
+
+[no-location]
 sync-type = git
 ";
-        let result = filter_repos_conf_sections(input);
-        assert!(result.contains("[DEFAULT]"));
-        assert!(result.contains("[gentoo]"));
-        assert!(!result.contains("[broken-overlay]"));
+        let repos = parse_repo_sections(input);
+        assert!(
+            repos.is_empty(),
+            "DEFAULT and sections without location should be skipped"
+        );
+    }
+
+    #[test]
+    fn parse_repo_sections_single_section() {
+        let input = "[myrepo]\nlocation = /var/db/repos/myrepo\n";
+        let repos = parse_repo_sections(input);
+        assert_eq!(repos.len(), 1);
+        assert_eq!(
+            repos[0],
+            ("myrepo".to_string(), "/var/db/repos/myrepo".to_string())
+        );
     }
 }
