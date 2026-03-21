@@ -216,10 +216,18 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
     // We use Docker attach (not logs) so that we get both an output stream
     // AND a stdin writer.  This lets interactive emerge prompts (--ask,
     // USE flag changes, etc.) flow through to the connected client.
-    let log_tx = tx.clone();
     let log_container_id = container_id.clone();
     let log_state = state.clone();
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<WorkerEvent>(64);
+
+    // Get the raw output broadcast sender for binary PTY relay.
+    let raw_tx = state
+        .raw_output_txs
+        .read()
+        .await
+        .get(&id)
+        .cloned()
+        .expect("raw_output_tx must exist — created alongside progress channel");
 
     // Create the stdin channel so the WebSocket handler can forward input.
     let mut stdin_rx = state.create_stdin_channel(id).await;
@@ -258,91 +266,102 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
         });
 
         let mut current_package: Option<(String, Instant)> = None;
+        let mut line_buf = Vec::with_capacity(8192);
 
         while let Some(result) = output.next().await {
             match result {
                 Ok(log_output) => {
-                    let raw = log_output.to_string();
-                    let trimmed = raw.trim().to_string();
+                    // Send raw bytes to connected clients for direct PTY relay.
+                    let raw_bytes: Vec<u8> = log_output.into_bytes().to_vec();
+                    let _ = raw_tx.send(raw_bytes.clone());
 
-                    // Check for structured events emitted by the worker.
-                    if let Some(json_str) = trimmed.strip_prefix("REMERGE_EVENT:")
-                        && let Ok(event) = serde_json::from_str::<WorkerEvent>(json_str)
-                    {
-                        let _ = event_tx.send(event).await;
-                        continue;
+                    // Accumulate bytes for line-based event detection.
+                    line_buf.extend_from_slice(&raw_bytes);
+
+                    // Cap buffer to prevent unbounded growth.
+                    const MAX_LINE_BUF: usize = 64 * 1024;
+                    if line_buf.len() > MAX_LINE_BUF {
+                        line_buf.drain(..line_buf.len() - MAX_LINE_BUF);
                     }
 
-                    // Parse emerge output patterns (using trimmed text).
-                    if let Some(caps) = re_emerging.captures(&trimmed) {
-                        if let Some(atom) = caps.get(1) {
-                            current_package = Some((atom.as_str().to_string(), Instant::now()));
+                    // Process complete lines for structured event detection.
+                    while let Some(newline_pos) = line_buf.iter().position(|&b| b == b'\n') {
+                        let line = String::from_utf8_lossy(&line_buf[..newline_pos])
+                            .trim_end_matches('\r')
+                            .to_string();
+                        line_buf.drain(..=newline_pos);
+
+                        // Check for structured events emitted by the worker.
+                        if let Some(json_str) = line.strip_prefix("REMERGE_EVENT:")
+                            && let Ok(event) = serde_json::from_str::<WorkerEvent>(json_str)
+                        {
+                            let _ = event_tx.send(event).await;
+                            continue;
                         }
-                    } else if let Some(caps) = re_completed.captures(&trimmed) {
-                        if let Some(atom_match) = caps.get(1) {
-                            let atom = atom_match.as_str().to_string();
-                            let duration = current_package
+
+                        // Parse emerge output patterns.
+                        if let Some(caps) = re_emerging.captures(&line) {
+                            if let Some(atom) = caps.get(1) {
+                                current_package = Some((atom.as_str().to_string(), Instant::now()));
+                            }
+                        } else if let Some(caps) = re_completed.captures(&line) {
+                            if let Some(atom_match) = caps.get(1) {
+                                let atom = atom_match.as_str().to_string();
+                                let duration = current_package
+                                    .as_ref()
+                                    .filter(|(pkg, _)| *pkg == atom)
+                                    .map(|(_, start)| start.elapsed().as_secs())
+                                    .unwrap_or(0);
+                                let _ = event_tx
+                                    .send(WorkerEvent::PackageBuilt {
+                                        atom: atom.clone(),
+                                        duration_secs: duration,
+                                    })
+                                    .await;
+                                current_package = None;
+                            }
+                        } else if let Some(caps) = re_error.captures(&line) {
+                            if let Some(atom_match) = caps.get(1) {
+                                let _ = event_tx
+                                    .send(WorkerEvent::PackageFailed {
+                                        atom: atom_match.as_str().to_string(),
+                                        reason: line.clone(),
+                                    })
+                                    .await;
+                            }
+                        } else if let Some(caps) = re_missing_dep.captures(&line) {
+                            if let Some(dep) = caps.get(1) {
+                                let _ = event_tx
+                                    .send(WorkerEvent::PackageFailed {
+                                        atom: dep.as_str().to_string(),
+                                        reason: format!("Missing dependency: {line}"),
+                                    })
+                                    .await;
+                            }
+                        } else if re_use_conflict.is_match(&line) {
+                            let atom = current_package
                                 .as_ref()
-                                .filter(|(pkg, _)| *pkg == atom)
-                                .map(|(_, start)| start.elapsed().as_secs())
-                                .unwrap_or(0);
-                            let _ = event_tx
-                                .send(WorkerEvent::PackageBuilt {
-                                    atom: atom.clone(),
-                                    duration_secs: duration,
-                                })
-                                .await;
-                            current_package = None;
-                        }
-                    } else if let Some(caps) = re_error.captures(&trimmed) {
-                        if let Some(atom_match) = caps.get(1) {
+                                .map(|(a, _)| a.clone())
+                                .unwrap_or_else(|| "unknown".into());
                             let _ = event_tx
                                 .send(WorkerEvent::PackageFailed {
-                                    atom: atom_match.as_str().to_string(),
-                                    reason: trimmed.clone(),
+                                    atom,
+                                    reason: format!("USE flag conflict: {line}"),
                                 })
                                 .await;
-                        }
-                    } else if let Some(caps) = re_missing_dep.captures(&trimmed) {
-                        if let Some(dep) = caps.get(1) {
+                        } else if re_fetch_fail.is_match(&line) {
+                            let atom = current_package
+                                .as_ref()
+                                .map(|(a, _)| a.clone())
+                                .unwrap_or_else(|| "unknown".into());
                             let _ = event_tx
                                 .send(WorkerEvent::PackageFailed {
-                                    atom: dep.as_str().to_string(),
-                                    reason: format!("Missing dependency: {}", trimmed),
+                                    atom,
+                                    reason: format!("Fetch failure: {line}"),
                                 })
                                 .await;
                         }
-                    } else if re_use_conflict.is_match(&trimmed) {
-                        let atom = current_package
-                            .as_ref()
-                            .map(|(a, _)| a.clone())
-                            .unwrap_or_else(|| "unknown".into());
-                        let _ = event_tx
-                            .send(WorkerEvent::PackageFailed {
-                                atom,
-                                reason: format!("USE flag conflict: {}", trimmed),
-                            })
-                            .await;
-                    } else if re_fetch_fail.is_match(&trimmed) {
-                        let atom = current_package
-                            .as_ref()
-                            .map(|(a, _)| a.clone())
-                            .unwrap_or_else(|| "unknown".into());
-                        let _ = event_tx
-                            .send(WorkerEvent::PackageFailed {
-                                atom,
-                                reason: format!("Fetch failure: {}", trimmed),
-                            })
-                            .await;
                     }
-
-                    // Forward the raw output (preserving \r\n and partial
-                    // lines) so prompts render correctly on the client.
-                    let _ = log_tx.send(BuildProgress {
-                        workorder_id: id,
-                        event: BuildEvent::Log { line: raw },
-                        timestamp: Utc::now(),
-                    });
                 }
                 Err(e) => {
                     warn!("Attach stream error: {e}");

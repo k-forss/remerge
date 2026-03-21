@@ -36,6 +36,10 @@ pub struct AppState {
     /// Per-workorder broadcast channels for progress streaming.
     pub progress_txs: RwLock<HashMap<WorkorderId, broadcast::Sender<BuildProgress>>>,
 
+    /// Per-workorder broadcast channels for raw PTY output (binary bytes).
+    /// Sent as WS Binary frames — this is the primary output channel.
+    pub raw_output_txs: RwLock<HashMap<WorkorderId, broadcast::Sender<Vec<u8>>>>,
+
     /// Per-workorder stdin channels for forwarding client input to the
     /// worker container (supports interactive emerge, `--ask`, etc.).
     pub stdin_txs: RwLock<HashMap<WorkorderId, mpsc::Sender<Vec<u8>>>>,
@@ -89,6 +93,7 @@ impl AppState {
             workorders: RwLock::new(HashMap::new()),
             results: RwLock::new(persisted_results),
             progress_txs: RwLock::new(HashMap::new()),
+            raw_output_txs: RwLock::new(HashMap::new()),
             stdin_txs: RwLock::new(HashMap::new()),
             worker_semaphore: Arc::new(Semaphore::new(max_workers)),
             container_ids: RwLock::new(HashMap::new()),
@@ -106,6 +111,11 @@ impl AppState {
     ) -> broadcast::Sender<BuildProgress> {
         let (tx, _) = broadcast::channel(256);
         self.progress_txs.write().await.insert(id, tx.clone());
+
+        // Also create the raw output channel.
+        let (raw_tx, _) = broadcast::channel(512);
+        self.raw_output_txs.write().await.insert(id, raw_tx);
+
         tx
     }
 
@@ -115,6 +125,18 @@ impl AppState {
         id: &WorkorderId,
     ) -> Option<broadcast::Receiver<BuildProgress>> {
         self.progress_txs
+            .read()
+            .await
+            .get(id)
+            .map(|tx| tx.subscribe())
+    }
+
+    /// Subscribe to the raw PTY output channel for a workorder.
+    pub async fn subscribe_raw_output(
+        &self,
+        id: &WorkorderId,
+    ) -> Option<broadcast::Receiver<Vec<u8>>> {
+        self.raw_output_txs
             .read()
             .await
             .get(id)
@@ -138,5 +160,6 @@ impl AppState {
     /// Remove the stdin channel when a workorder finishes.
     pub async fn remove_stdin_channel(&self, id: &WorkorderId) {
         self.stdin_txs.write().await.remove(id);
+        self.raw_output_txs.write().await.remove(id);
     }
 }
