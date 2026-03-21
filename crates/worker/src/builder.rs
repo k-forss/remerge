@@ -41,7 +41,7 @@ pub async fn build_packages(workorder: &Workorder, emerge_cmd: &str) -> Result<(
     for arg in &workorder.emerge_args {
         match arg.as_str() {
             // Skip arguments we already set or that don't make sense in the worker.
-            "--ask" | "-a" | "--pretend" | "-p" | "--getbinpkg" | "-g" |
+            "--pretend" | "-p" | "--getbinpkg" | "-g" |
             // Dangerous flags that must never run in the worker.
             "--depclean" | "--unmerge" | "-C" | "--deselect" |
             "--sync" | "--info" | "--search" | "-s" | "--searchdesc" | "-S" |
@@ -57,6 +57,7 @@ pub async fn build_packages(workorder: &Workorder, emerge_cmd: &str) -> Result<(
 
     let mut child = Command::new(emerge_cmd)
         .args(&args)
+        .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

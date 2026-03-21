@@ -3,10 +3,11 @@
 use anyhow::{Context, Result};
 use bollard::{
     Docker,
+    container::AttachContainerResults,
     models::{ContainerCreateBody, HostConfig},
     query_parameters::{
-        BuildImageOptions, CreateContainerOptions, LogsOptions, RemoveContainerOptions,
-        StartContainerOptions,
+        AttachContainerOptionsBuilder, BuildImageOptions, CreateContainerOptions,
+        RemoveContainerOptions, StartContainerOptions,
     },
 };
 use futures::StreamExt;
@@ -77,8 +78,12 @@ impl DockerManager {
             .replace('.', "_");
 
         format!(
-            "{}:{}-{}-gcc{}",
-            self.image_prefix, chost_slug, profile_slug, gcc_short
+            "{}:{}-{}-gcc{}-v{}",
+            self.image_prefix,
+            chost_slug,
+            profile_slug,
+            gcc_short,
+            env!("CARGO_PKG_VERSION"),
         )
     }
 
@@ -104,22 +109,25 @@ impl DockerManager {
         header.set_cksum();
         ar.append(&header, dockerfile_bytes)?;
 
-        // If a worker binary path is configured, include it in the build context.
-        if let Some(ref binary_path) = self.worker_binary {
-            match std::fs::read(binary_path) {
-                Ok(binary_data) => {
-                    let mut bin_header = tar::Header::new_gnu();
-                    bin_header.set_path("remerge-worker")?;
-                    bin_header.set_size(binary_data.len() as u64);
-                    bin_header.set_mode(0o755);
-                    bin_header.set_cksum();
-                    ar.append(&bin_header, &binary_data[..])?;
-                    info!("Included worker binary in Docker build context");
-                }
-                Err(e) => {
-                    tracing::warn!(path = %binary_path, "Failed to read worker binary: {e} — image will use pre-installed binary");
-                }
-            }
+        // Include the worker binary in the build context.  Without it the
+        // image's ENTRYPOINT cannot start and every container will fail.
+        let binary_path = self.worker_binary.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "No worker binary configured or discovered.  Set `worker_binary` \
+                 in server.toml or install the remerge-worker package alongside \
+                 the server."
+            )
+        })?;
+        let binary_data = std::fs::read(binary_path)
+            .with_context(|| format!("Failed to read worker binary at {binary_path}"))?;
+        {
+            let mut bin_header = tar::Header::new_gnu();
+            bin_header.set_path("remerge-worker")?;
+            bin_header.set_size(binary_data.len() as u64);
+            bin_header.set_mode(0o755);
+            bin_header.set_cksum();
+            ar.append(&bin_header, &binary_data[..])?;
+            info!(path = %binary_path, "Included worker binary in Docker build context");
         }
 
         let tar_bytes = ar.into_inner()?;
@@ -196,11 +204,7 @@ RUN echo 'CHOST="{chost}"' >> /etc/portage/make.conf && \
             String::new()
         };
 
-        let binary_install = if self.worker_binary.is_some() {
-            "# Install remerge-worker binary from build context.\nCOPY remerge-worker /usr/local/bin/remerge-worker\nRUN chmod +x /usr/local/bin/remerge-worker"
-        } else {
-            "# Worker binary must be pre-installed in the image or mounted at runtime."
-        };
+        let binary_install = "# Install remerge-worker binary from build context.\nCOPY remerge-worker /usr/local/bin/remerge-worker\nRUN chmod +x /usr/local/bin/remerge-worker";
 
         format!(
             r#"FROM {base_image}
@@ -276,6 +280,13 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
             image: Some(image_tag.to_string()),
             env: Some(env),
             host_config: Some(host_config),
+            // Allocate a PTY and keep stdin open so emerge can run
+            // interactively (e.g. `--ask` prompts) through the attach stream.
+            tty: Some(true),
+            open_stdin: Some(true),
+            attach_stdin: Some(true),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
             ..Default::default()
         };
 
@@ -315,22 +326,24 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
         Ok(resp.id)
     }
 
-    /// Stream logs from a running container.
-    pub fn stream_logs(
-        &self,
-        container_id: &str,
-    ) -> impl futures::Stream<Item = Result<String, bollard::errors::Error>> + '_ {
+    /// Attach to a running container for bidirectional I/O.
+    ///
+    /// Returns an [`AttachContainerResults`] whose `output` stream yields
+    /// log lines and whose `input` sink accepts bytes forwarded to the
+    /// container's stdin.  This is the backbone of interactive emerge
+    /// support (`--ask`, USE prompts, etc.).
+    pub async fn attach_container(&self, container_id: &str) -> Result<AttachContainerResults> {
+        let options = AttachContainerOptionsBuilder::default()
+            .stdin(true)
+            .stdout(true)
+            .stderr(true)
+            .stream(true)
+            .build();
+
         self.docker
-            .logs(
-                container_id,
-                Some(LogsOptions {
-                    follow: true,
-                    stdout: true,
-                    stderr: true,
-                    ..Default::default()
-                }),
-            )
-            .map(|r| r.map(|o| o.to_string()))
+            .attach_container(container_id, Some(options))
+            .await
+            .context("Failed to attach to worker container")
     }
 
     /// Wait for a container to finish and return exit code.

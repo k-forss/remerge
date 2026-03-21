@@ -1,7 +1,7 @@
 //! HTTP + WebSocket client for communicating with the remerge server.
 
 use anyhow::{Context, Result};
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use remerge_types::{
     api::{SubmitWorkorderRequest, SubmitWorkorderResponse},
     client::{ClientId, ClientRole},
@@ -71,6 +71,10 @@ impl RemergeClient {
 
     /// Connect to the progress WebSocket and stream events to stdout.
     ///
+    /// The connection is bidirectional: build output is printed to stdout,
+    /// and local stdin is forwarded to the worker container so interactive
+    /// emerge features (`--ask`, USE prompts, etc.) work transparently.
+    ///
     /// Returns the final [`WorkorderResult`] when the build completes.
     pub async fn stream_progress(&self, ws_url: &str) -> Result<WorkorderResult> {
         use tokio_tungstenite::connect_async;
@@ -79,11 +83,48 @@ impl RemergeClient {
             .await
             .context("Failed to connect to progress WebSocket")?;
 
-        let (_, mut read) = ws.split();
+        let (mut ws_write, mut ws_read) = ws.split();
 
         let mut final_result: Option<WorkorderResult> = None;
 
-        while let Some(msg) = read.next().await {
+        // Spawn a task that reads from terminal stdin and sends to the
+        // server via the WebSocket.  This enables interactive emerge
+        // prompts like --ask to work through the worker container.
+        let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+
+        // Stdin reader task — runs on a blocking thread since stdin I/O
+        // blocks.  Only active while the WebSocket connection is alive.
+        let stdin_handle = tokio::spawn(async move {
+            use tokio::io::AsyncBufReadExt;
+            let stdin = tokio::io::stdin();
+            let mut reader = tokio::io::BufReader::new(stdin);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => break, // EOF
+                    Ok(_) => {
+                        if stdin_tx.send(line.as_bytes().to_vec()).await.is_err() {
+                            break; // Channel closed — build finished.
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // Forward stdin data to the WebSocket.
+        let ws_stdin_handle = tokio::spawn(async move {
+            while let Some(data) = stdin_rx.recv().await {
+                let msg = tokio_tungstenite::tungstenite::Message::Binary(data.into());
+                if ws_write.send(msg).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Read build progress events from the WebSocket.
+        while let Some(msg) = ws_read.next().await {
             let msg = msg.context("WebSocket error")?;
             match msg {
                 tokio_tungstenite::tungstenite::Message::Text(text) => {
@@ -102,6 +143,10 @@ impl RemergeClient {
                 _ => {}
             }
         }
+
+        // Clean up stdin tasks.
+        stdin_handle.abort();
+        ws_stdin_handle.abort();
 
         final_result.context("Build finished but no result was received")
     }
