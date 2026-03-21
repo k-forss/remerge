@@ -124,6 +124,11 @@ pub async fn build_packages(workorder: &Workorder, emerge_cmd: &str) -> Result<(
         let mut line_buf = Vec::with_capacity(8192);
         let mut read_buf = [0u8; 4096];
         let mut current_package: Option<(String, Instant)> = None;
+        // Track whether the last byte written to stdout ended on a newline,
+        // so we can ensure REMERGE_EVENT lines always start on a fresh line.
+        // Starts `true` because we haven't written anything yet (BOF = fresh line).
+        #[allow(unused_assignments)]
+        let mut last_was_newline = true;
 
         loop {
             let n = match stdout.read(&mut read_buf).await {
@@ -134,9 +139,17 @@ pub async fn build_packages(workorder: &Workorder, emerge_cmd: &str) -> Result<(
             // Forward raw bytes to container stdout immediately.
             let _ = stdout_writer.write_all(&read_buf[..n]).await;
             let _ = stdout_writer.flush().await;
+            last_was_newline = read_buf[n - 1] == b'\n';
 
             // Accumulate for line-based event parsing.
             line_buf.extend_from_slice(&read_buf[..n]);
+
+            // Cap buffer to prevent unbounded growth from long lines
+            // (e.g. progress bars using \r without \n).
+            const MAX_LINE_BUF: usize = 64 * 1024;
+            if line_buf.len() > MAX_LINE_BUF {
+                line_buf.drain(..line_buf.len() - MAX_LINE_BUF);
+            }
 
             // Process complete lines from the buffer.
             while let Some(newline_pos) = line_buf.iter().position(|&b| b == b'\n') {
@@ -144,6 +157,14 @@ pub async fn build_packages(workorder: &Workorder, emerge_cmd: &str) -> Result<(
                     .trim_end_matches('\r')
                     .to_string();
                 line_buf.drain(..=newline_pos);
+
+                // Helper: emit a structured event on a guaranteed fresh line.
+                let mut emit_event = |json: serde_json::Value| {
+                    let prefix = if last_was_newline { "" } else { "\n" };
+                    let msg = format!("{prefix}REMERGE_EVENT:{json}\n");
+                    let _ = std::io::Write::write_all(&mut std::io::stdout(), msg.as_bytes());
+                    last_was_newline = true;
+                };
 
                 // Parse for structured events.
                 if let Some(caps) = re_emerging.captures(&line) {
@@ -159,62 +180,46 @@ pub async fn build_packages(workorder: &Workorder, emerge_cmd: &str) -> Result<(
                             .map(|(_, start)| start.elapsed().as_secs())
                             .unwrap_or(0);
 
-                        // Emit structured event for the server to parse.
-                        println!(
-                            "REMERGE_EVENT:{}",
-                            serde_json::json!({
-                                "type": "package_built",
-                                "atom": atom,
-                                "duration_secs": duration,
-                            })
-                        );
+                        emit_event(serde_json::json!({
+                            "type": "package_built",
+                            "atom": atom,
+                            "duration_secs": duration,
+                        }));
                         current_package = None;
                     }
                 } else if let Some(caps) = re_error.captures(&line) {
                     if let Some(atom_match) = caps.get(1) {
                         let atom = atom_match.as_str().to_string();
-                        println!(
-                            "REMERGE_EVENT:{}",
-                            serde_json::json!({
-                                "type": "package_failed",
-                                "atom": atom,
-                                "reason": line.trim(),
-                                "failure_kind": "build_error",
-                            })
-                        );
+                        emit_event(serde_json::json!({
+                            "type": "package_failed",
+                            "atom": atom,
+                            "reason": line.trim(),
+                            "failure_kind": "build_error",
+                        }));
                     }
                 } else if let Some(caps) = re_missing_dep.captures(&line) {
                     if let Some(dep) = caps.get(1) {
-                        println!(
-                            "REMERGE_EVENT:{}",
-                            serde_json::json!({
-                                "type": "package_failed",
-                                "atom": dep.as_str(),
-                                "reason": line.trim(),
-                                "failure_kind": "missing_dependency",
-                            })
-                        );
+                        emit_event(serde_json::json!({
+                            "type": "package_failed",
+                            "atom": dep.as_str(),
+                            "reason": line.trim(),
+                            "failure_kind": "missing_dependency",
+                        }));
                     }
                 } else if re_use_conflict.is_match(&line) {
-                    println!(
-                        "REMERGE_EVENT:{}",
-                        serde_json::json!({
-                            "type": "package_failed",
-                            "atom": current_package.as_ref().map(|(a, _)| a.as_str()).unwrap_or("unknown"),
-                            "reason": line.trim(),
-                            "failure_kind": "use_conflict",
-                        })
-                    );
+                    emit_event(serde_json::json!({
+                        "type": "package_failed",
+                        "atom": current_package.as_ref().map(|(a, _)| a.as_str()).unwrap_or("unknown"),
+                        "reason": line.trim(),
+                        "failure_kind": "use_conflict",
+                    }));
                 } else if re_fetch_fail.is_match(&line) {
-                    println!(
-                        "REMERGE_EVENT:{}",
-                        serde_json::json!({
-                            "type": "package_failed",
-                            "atom": current_package.as_ref().map(|(a, _)| a.as_str()).unwrap_or("unknown"),
-                            "reason": line.trim(),
-                            "failure_kind": "fetch_failure",
-                        })
-                    );
+                    emit_event(serde_json::json!({
+                        "type": "package_failed",
+                        "atom": current_package.as_ref().map(|(a, _)| a.as_str()).unwrap_or("unknown"),
+                        "reason": line.trim(),
+                        "failure_kind": "fetch_failure",
+                    }));
                 }
             }
         }

@@ -347,11 +347,11 @@ impl PortageReader {
                     if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
                         let fname = entry.file_name();
                         let fname_str = fname.to_string_lossy();
-                        if !fname_str.starts_with('.') {
-                            if let Ok(content) = fs::read_to_string(entry.path()) {
-                                debug!(file = %fname_str, "Read env file");
-                                files.insert(fname_str.into_owned(), content);
-                            }
+                        if !fname_str.starts_with('.')
+                            && let Ok(content) = fs::read_to_string(entry.path())
+                        {
+                            debug!(file = %fname_str, "Read env file");
+                            files.insert(fname_str.into_owned(), content);
                         }
                     }
                 }
@@ -381,11 +381,11 @@ impl PortageReader {
                     if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
                         let fname = entry.file_name();
                         let fname_str = fname.to_string_lossy();
-                        if !fname_str.starts_with('.') {
-                            if let Ok(content) = fs::read_to_string(entry.path()) {
-                                debug!(file = %fname_str, "Read repos.conf file");
-                                files.insert(fname_str.into_owned(), content);
-                            }
+                        if !fname_str.starts_with('.')
+                            && let Ok(content) = fs::read_to_string(entry.path())
+                        {
+                            debug!(file = %fname_str, "Read repos.conf file");
+                            files.insert(fname_str.into_owned(), content);
                         }
                     }
                 }

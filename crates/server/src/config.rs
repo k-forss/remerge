@@ -228,6 +228,19 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
+    /// Validate configuration values and log warnings for problems.
+    pub fn validate(&mut self) {
+        if let Some(ref path) = self.repos_dir {
+            if !path.exists() {
+                tracing::warn!(path = %path.display(), "repos_dir does not exist — ignoring");
+                self.repos_dir = None;
+            } else if !path.is_dir() {
+                tracing::warn!(path = %path.display(), "repos_dir is not a directory — ignoring");
+                self.repos_dir = None;
+            }
+        }
+    }
+
     /// Load configuration from a TOML file, then apply environment variable
     /// overrides (`REMERGE_*`).
     pub fn load(path: &str) -> Result<Self> {
@@ -329,6 +342,8 @@ impl ServerConfig {
         {
             config.binpkg_disk_warn_bytes = n;
         }
+
+        config.validate();
 
         Ok(config)
     }

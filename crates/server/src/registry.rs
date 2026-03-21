@@ -215,6 +215,8 @@ fn hash_json<T: serde::Serialize>(value: &T) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use remerge_types::portage::MakeConf;
     use uuid::Uuid;

@@ -326,6 +326,19 @@ async fn write_package_env(config: &PortageConfig) -> Result<()> {
     let content: String = config
         .package_env
         .iter()
+        .filter(|e| {
+            let valid = !e.env_file.trim().is_empty()
+                && !e.env_file.contains('/')
+                && !e.env_file.contains("..");
+            if !valid {
+                tracing::warn!(
+                    atom = %e.atom,
+                    env_file = %e.env_file,
+                    "Skipping package.env entry with invalid env_file"
+                );
+            }
+            valid
+        })
         .map(|e| format!("{} {}\n", e.atom, e.env_file))
         .collect();
 
@@ -346,14 +359,12 @@ async fn write_env_files(config: &PortageConfig) -> Result<()> {
         return Ok(());
     }
 
-    fs::create_dir_all("/etc/portage/env")
-        .await
-        .context("Failed to create /etc/portage/env")?;
+    ensure_dir("/etc/portage/env").await?;
 
     for (filename, content) in &config.env_files {
-        // Sanitise filename — reject path traversal.
-        if filename.contains('/') || filename.contains("..") {
-            tracing::warn!(filename, "Skipping env file with suspicious path");
+        // Sanitise filename — reject empty, blank, and path-traversal.
+        if filename.trim().is_empty() || filename.contains('/') || filename.contains("..") {
+            tracing::warn!(filename, "Skipping env file with invalid filename");
             continue;
         }
         let path = format!("/etc/portage/env/{filename}");
@@ -383,8 +394,8 @@ async fn write_repos_conf(config: &PortageConfig) -> Result<()> {
     ensure_dir("/etc/portage/repos.conf").await?;
 
     for (filename, content) in &config.repos_conf {
-        if filename.contains('/') || filename.contains("..") {
-            tracing::warn!(filename, "Skipping repos.conf file with suspicious path");
+        if filename.trim().is_empty() || filename.contains('/') || filename.contains("..") {
+            tracing::warn!(filename, "Skipping repos.conf file with invalid filename");
             continue;
         }
         let path = format!("/etc/portage/repos.conf/{filename}");
