@@ -107,3 +107,33 @@ jobs:
             --prerelease \
             --latest=false \
             *.tar.gz *-SHA256SUMS.txt
+
+      - name: Generate overlay Manifest
+        run: |
+          python3 -c "
+          import hashlib, pathlib
+
+          manifest_dir = pathlib.Path('overlay/app-portage/remerge-bin')
+          lines = []
+          for tarball in sorted(pathlib.Path('.').glob('remerge-nightly-*-linux.tar.gz')):
+              data = tarball.read_bytes()
+              b2 = hashlib.blake2b(data).hexdigest()
+              s5 = hashlib.sha512(data).hexdigest()
+              lines.append(f'DIST {tarball.name} {len(data)} BLAKE2B {b2} SHA512 {s5}')
+          (manifest_dir / 'Manifest').write_text('\n'.join(lines) + '\n')
+          print(f'Wrote {len(lines)} entries to Manifest')
+          "
+
+      - name: Commit Manifest update
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add overlay/app-portage/remerge-bin/Manifest
+          if git diff --cached --quiet; then
+            echo "::notice::Manifest unchanged"
+          else
+            git commit -m "chore: update remerge-bin nightly Manifest [skip ci]"
+            git push origin main
+          fi

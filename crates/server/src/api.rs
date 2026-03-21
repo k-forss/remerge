@@ -428,15 +428,16 @@ async fn ws_progress(
         .await
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    let stdin_tx = state.get_stdin_tx(&id).await;
+    let ws_state = state.clone();
 
-    Ok(ws.on_upgrade(move |socket| handle_ws(socket, rx, stdin_tx)))
+    Ok(ws.on_upgrade(move |socket| handle_ws(socket, rx, ws_state, id)))
 }
 
 async fn handle_ws(
     socket: ws::WebSocket,
     mut rx: tokio::sync::broadcast::Receiver<BuildProgress>,
-    stdin_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    state: SharedState,
+    workorder_id: uuid::Uuid,
 ) {
     let (mut ws_write, mut ws_read) = socket.split();
 
@@ -465,22 +466,31 @@ async fn handle_ws(
     });
 
     // Task 2: Read client messages (stdin data) and forward to the container.
+    //
+    // The stdin channel is created by the queue processor when it attaches
+    // to the container, which may happen *after* the WebSocket connects.
+    // We look up the sender dynamically on each message to handle this race.
     let recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = ws_read.next().await {
-            match msg {
-                ws::Message::Text(text) => {
-                    if let Some(ref tx) = stdin_tx {
-                        // Send the text as raw bytes to the container's stdin.
-                        let _ = tx.send(text.as_bytes().to_vec()).await;
-                    }
-                }
-                ws::Message::Binary(data) => {
-                    if let Some(ref tx) = stdin_tx {
-                        let _ = tx.send(data.to_vec()).await;
-                    }
-                }
+            let data = match msg {
+                ws::Message::Text(text) => text.as_bytes().to_vec(),
+                ws::Message::Binary(data) => data.to_vec(),
                 ws::Message::Close(_) => break,
-                _ => {}
+                _ => continue,
+            };
+
+            // Retry lookup — the channel may not exist yet during provisioning.
+            let mut sent = false;
+            for _ in 0..50 {
+                if let Some(tx) = state.get_stdin_tx(&workorder_id).await {
+                    let _ = tx.send(data).await;
+                    sent = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            if !sent {
+                warn!(id = ?workorder_id, "Dropped stdin data — no stdin channel available");
             }
         }
     });
