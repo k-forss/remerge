@@ -367,30 +367,34 @@ jobs:
 
       # Signed commits use GITHUB_TOKEN and do not trigger pull_request
       # events, so required status checks never appear on the auto-created PR.
-      # The push-triggered CI already ran on this commit. Mirror its results
-      # as commit statuses so the ruleset's required_status_checks are satisfied.
+      # The push-triggered CI ran on $GITHUB_SHA (the commit that started this
+      # workflow). The signed-commit step created a new commit on top, but no
+      # CI runs on it (GITHUB_TOKEN pushes don't trigger workflows). Mirror
+      # the CI results from $GITHUB_SHA as commit statuses on the prepare
+      # commit so the ruleset's required_status_checks are satisfied.
       - name: Report CI status on prepare commit
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Resolve the HEAD commit on the remote (may differ from checkout if
-          # the signed-commit step created a new commit).
+          # The prepare commit (PR head) — may differ from $GITHUB_SHA.
           HEAD_SHA=$(git ls-remote origin "$GITHUB_REF_NAME" | awk '{print $1}')
-          echo "::notice::Reporting status on ${HEAD_SHA:0:8}"
+          # The commit that triggered this workflow — where push CI ran.
+          CI_SHA="$GITHUB_SHA"
+          echo "::notice::Sourcing CI from ${CI_SHA:0:8}, reporting on ${HEAD_SHA:0:8}"
 
-          # Wait for the push-triggered CI to finish (up to 10 min).
+          # Wait for the push-triggered CI on $GITHUB_SHA to finish (up to 10 min).
           for i in $(seq 1 60); do
-            STATUS=$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/check-runs?check_name=Test" \
+            STATUS=$(gh api "repos/$GITHUB_REPOSITORY/commits/$CI_SHA/check-runs?check_name=Test" \
               --jq '.check_runs[0].status // "missing"')
             if [ "$STATUS" = "completed" ]; then break; fi
-            echo "Waiting for CI… ($i/60)"
+            echo "Waiting for CI on ${CI_SHA:0:8}… ($i/60)"
             sleep 10
           done
 
-          # Read results and post commit statuses.
+          # Read results from the CI commit and post statuses on the prepare commit.
           for CHECK in "Check & Lint" "Test"; do
             ENCODED=$(python3 -c "import urllib.parse as u; print(u.quote('$CHECK'))")
-            RESULT=$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/check-runs?check_name=$ENCODED" \
+            RESULT=$(gh api "repos/$GITHUB_REPOSITORY/commits/$CI_SHA/check-runs?check_name=$ENCODED" \
               --jq '.check_runs[0] | {conclusion, url: .html_url}')
             CONCLUSION=$(echo "$RESULT" | jq -r '.conclusion')
             URL=$(echo "$RESULT" | jq -r '.url')
