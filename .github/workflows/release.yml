@@ -1,9 +1,15 @@
 # Build multi-architecture release binaries and create a GitHub Release.
 #
-# Release pipeline (three sequential workflows):
+# Release pipeline (three sequential workflows, wired via workflow_dispatch):
 #   1. release.yml (this)  — build, package, checksums, SLSA attestation, create release
 #   2. virustotal.yml      — scan assets, append VT analysis links to release body
 #   3. sign-release.yml    — PGP-sign all artifacts + final release body as "seal"
+#
+# Why workflow_dispatch instead of event triggers?
+# Tags are created via the GitHub API (GITHUB_TOKEN) and releases are published
+# with softprops/action-gh-release (also GITHUB_TOKEN).  GITHUB_TOKEN-triggered
+# actions don't fire push/release events, so we dispatch downstream workflows
+# explicitly.
 #
 # Build matrix:
 #   CLI:    amd64, arm64, arm, riscv64, ppc64
@@ -24,6 +30,7 @@ permissions:
   contents: write
   id-token: write
   attestations: write
+  actions: write       # dispatch virustotal.yml
 
 env:
   CARGO_TERM_COLOR: always
@@ -162,3 +169,12 @@ jobs:
           files: |
             *.tar.gz
             *-SHA256SUMS.txt
+
+      - name: Dispatch VirusTotal scan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          gh workflow run virustotal.yml \
+            --ref "$TAG" \
+            -f tag="$TAG"
