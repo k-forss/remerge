@@ -81,8 +81,14 @@ jobs:
             --json body -q '.body' > /tmp/release-body.md
 
           # Idempotent: remove any previously-appended VT section
-          python3 -c "body = open('/tmp/release-body.md').read(); marker = '\n<!-- vt-start -->'; idx = body.find(marker); import sys; \
-if idx >= 0: body = body[:idx]; open('/tmp/release-body.md', 'w').write(body)"
+          python3 << 'PYEOF'
+          body = open('/tmp/release-body.md').read()
+          marker = '\n<!-- vt-start -->'
+          idx = body.find(marker)
+          if idx >= 0:
+              body = body[:idx]
+              open('/tmp/release-body.md', 'w').write(body)
+          PYEOF
 
           cat /tmp/vt-section.md >> /tmp/release-body.md
 

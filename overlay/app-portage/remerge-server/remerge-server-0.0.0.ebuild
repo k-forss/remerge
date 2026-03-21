@@ -309,7 +309,6 @@ RDEPEND="
 	app-containers/docker
 	!app-portage/remerge-server-bin
 "
-BDEPEND="virtual/rust"
 
 QA_FLAGS_IGNORED="usr/bin/remerge-server"
 
