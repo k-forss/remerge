@@ -232,6 +232,8 @@ mod tests {
             package_env: Vec::new(),
             env_files: BTreeMap::new(),
             repos_conf: BTreeMap::new(),
+            patches: BTreeMap::new(),
+            profile_overlay: BTreeMap::new(),
             profile: "default/linux/amd64/23.0".into(),
             world: Vec::new(),
         }

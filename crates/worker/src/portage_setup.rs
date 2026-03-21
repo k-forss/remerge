@@ -35,6 +35,9 @@ pub async fn apply_config(
     write_package_env(config).await?;
     write_env_files(config).await?;
     write_repos_conf(config).await?;
+    set_profile(config).await?;
+    write_profile_overlay(config).await?;
+    write_patches(config).await?;
     info!("Portage configuration applied");
     Ok(())
 }
@@ -426,8 +429,15 @@ async fn write_repos_conf(config: &PortageConfig) -> Result<()> {
 /// to the bind-mount path.  For repos not present in the bind-mount, an
 /// empty directory is created so `emerge --sync` / `emaint sync` can
 /// populate it.
+///
+/// When repos are bind-mounted read-only (`REMERGE_SKIP_SYNC=1`) and an
+/// overlay's location is under `/var/db/repos/` but not present in the
+/// mount, the overlay is remapped to a writable path under
+/// `/var/tmp/remerge-repos/` and the repos.conf entry is updated.
 async fn ensure_repo_locations(config: &PortageConfig) -> Result<()> {
-    for (_filename, content) in &config.repos_conf {
+    let repos_mounted_ro = std::env::var("REMERGE_SKIP_SYNC").is_ok();
+
+    for (filename, content) in &config.repos_conf {
         for (name, location) in parse_repo_sections(content) {
             let loc = Path::new(&location);
             if loc.exists() {
@@ -438,15 +448,12 @@ async fn ensure_repo_locations(config: &PortageConfig) -> Result<()> {
             let bind_path = Path::new("/var/db/repos").join(&name);
             if bind_path.is_dir() {
                 if let Some(parent) = loc.parent() {
-                    fs::create_dir_all(parent).await.with_context(|| {
-                        format!("Failed to create parent dir for {location}")
-                    })?;
+                    fs::create_dir_all(parent)
+                        .await
+                        .with_context(|| format!("Failed to create parent dir for {location}"))?;
                 }
                 tokio::fs::symlink(&bind_path, loc).await.with_context(|| {
-                    format!(
-                        "Failed to symlink {location} → {}",
-                        bind_path.display()
-                    )
+                    format!("Failed to symlink {location} → {}", bind_path.display())
                 })?;
                 info!(
                     repo = %name,
@@ -454,11 +461,28 @@ async fn ensure_repo_locations(config: &PortageConfig) -> Result<()> {
                     bind_path = %bind_path.display(),
                     "Symlinked repo location to bind-mounted path"
                 );
+                continue;
+            }
+
+            // Repo not in bind-mount.  If the location is under the
+            // read-only mount, remap to a writable alternative path.
+            if repos_mounted_ro && location.starts_with("/var/db/repos/") {
+                let alt = format!("/var/tmp/remerge-repos/{name}");
+                fs::create_dir_all(&alt)
+                    .await
+                    .with_context(|| format!("Failed to create writable repo dir {alt}"))?;
+                rewrite_repo_location(filename, &location, &alt).await?;
+                info!(
+                    repo = %name,
+                    original = %location,
+                    remapped = %alt,
+                    "Remapped overlay to writable path (bind-mount is read-only)"
+                );
             } else {
                 // Create an empty directory — will be populated during sync.
-                fs::create_dir_all(&location).await.with_context(|| {
-                    format!("Failed to create repo directory {location}")
-                })?;
+                fs::create_dir_all(&location)
+                    .await
+                    .with_context(|| format!("Failed to create repo directory {location}"))?;
                 info!(
                     repo = %name,
                     location = %location,
@@ -467,6 +491,174 @@ async fn ensure_repo_locations(config: &PortageConfig) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// Rewrite a single `location` value inside a repos.conf file.
+///
+/// Only the line whose value exactly matches `old_loc` is changed, so
+/// multi-section files are handled correctly.
+async fn rewrite_repo_location(filename: &str, old_loc: &str, new_loc: &str) -> Result<()> {
+    let path = format!("/etc/portage/repos.conf/{filename}");
+    let content = fs::read_to_string(&path)
+        .await
+        .with_context(|| format!("Failed to read {path} for location rewrite"))?;
+
+    let mut output = String::with_capacity(content.len());
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some((key, value)) = trimmed.split_once('=') {
+            if key.trim().eq_ignore_ascii_case("location") && value.trim() == old_loc {
+                output.push_str(&format!("location = {new_loc}\n"));
+                continue;
+            }
+        }
+        output.push_str(line);
+        output.push('\n');
+    }
+
+    fs::write(&path, &output)
+        .await
+        .with_context(|| format!("Failed to rewrite {path}"))?;
+
+    Ok(())
+}
+
+/// Write the local profile overlay to `/etc/portage/profile/`.
+///
+/// This directory overrides profile-level settings (USE masks/forces,
+/// package.provided, package.mask at profile level, etc.) without
+/// requiring a custom profile.  Files here are layered on top of the
+/// selected profile by portage.
+async fn write_profile_overlay(config: &PortageConfig) -> Result<()> {
+    if config.profile_overlay.is_empty() {
+        return Ok(());
+    }
+
+    for (relative_path, content) in &config.profile_overlay {
+        // Validate path components — reject traversal and absolute paths.
+        if relative_path.contains("..") || relative_path.starts_with('/') {
+            tracing::warn!(
+                path = %relative_path,
+                "Skipping profile overlay file with invalid path"
+            );
+            continue;
+        }
+
+        let full_path = format!("/etc/portage/profile/{relative_path}");
+        if let Some(parent) = Path::new(&full_path).parent() {
+            fs::create_dir_all(parent).await.with_context(|| {
+                format!("Failed to create parent dir for profile overlay {full_path}")
+            })?;
+        }
+        fs::write(&full_path, content)
+            .await
+            .with_context(|| format!("Failed to write profile overlay {full_path}"))?;
+    }
+
+    info!(
+        count = config.profile_overlay.len(),
+        "Wrote /etc/portage/profile/ overlay files"
+    );
+    Ok(())
+}
+
+/// Set the portage profile symlink (`/etc/portage/make.profile`).
+///
+/// Scans configured repository locations for the profile directory and
+/// creates a symlink pointing to it.  This ensures the worker container
+/// uses the same profile as the client — affecting USE masks/forces,
+/// package masks, system set, and default variable values.
+async fn set_profile(config: &PortageConfig) -> Result<()> {
+    let profile = &config.profile;
+    if profile.is_empty() || profile == "unknown" {
+        info!("No profile specified — using container default");
+        return Ok(());
+    }
+
+    // Collect all repo locations from repos.conf.
+    let repo_locations: Vec<String> = config
+        .repos_conf
+        .values()
+        .flat_map(|content| parse_repo_sections(content))
+        .map(|(_, location)| location)
+        .collect();
+
+    // Search for the profile in all configured repos.
+    let target = repo_locations
+        .iter()
+        .map(|loc| format!("{loc}/profiles/{profile}"))
+        .find(|p| Path::new(p).is_dir());
+
+    // Fall back to the default gentoo repo location.
+    let target = target.unwrap_or_else(|| format!("/var/db/repos/gentoo/profiles/{profile}"));
+
+    if !Path::new(&target).is_dir() {
+        tracing::warn!(
+            profile = %profile,
+            target = %target,
+            "Profile directory not found in any repo — keeping container default"
+        );
+        return Ok(());
+    }
+
+    let link = Path::new("/etc/portage/make.profile");
+
+    // Remove existing symlink or file.
+    if link.symlink_metadata().is_ok() {
+        if link.is_dir() && !link.is_symlink() {
+            tracing::warn!("make.profile is a real directory — not replacing");
+            return Ok(());
+        }
+        fs::remove_file(link).await.ok();
+    }
+
+    tokio::fs::symlink(&target, link)
+        .await
+        .with_context(|| format!("Failed to symlink make.profile → {target}"))?;
+
+    info!(
+        profile = %profile,
+        target = %target,
+        "Set portage profile symlink"
+    );
+    Ok(())
+}
+
+/// Write user patches to `/etc/portage/patches/`.
+///
+/// These are applied by portage during `src_prepare()` (the user-patch
+/// mechanism).  Without them, the worker would build unpatched binaries.
+async fn write_patches(config: &PortageConfig) -> Result<()> {
+    if config.patches.is_empty() {
+        return Ok(());
+    }
+
+    for (relative_path, content) in &config.patches {
+        // Validate path components — reject traversal and absolute paths.
+        if relative_path.contains("..") || relative_path.starts_with('/') {
+            tracing::warn!(
+                path = %relative_path,
+                "Skipping patch with invalid path"
+            );
+            continue;
+        }
+
+        let full_path = format!("/etc/portage/patches/{relative_path}");
+        if let Some(parent) = Path::new(&full_path).parent() {
+            fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("Failed to create parent dir for patch {full_path}"))?;
+        }
+        fs::write(&full_path, content)
+            .await
+            .with_context(|| format!("Failed to write patch {full_path}"))?;
+    }
+
+    info!(
+        count = config.patches.len(),
+        "Wrote /etc/portage/patches/ files"
+    );
     Ok(())
 }
 

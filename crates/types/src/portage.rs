@@ -54,6 +54,30 @@ pub struct PortageConfig {
     #[serde(default)]
     pub repos_conf: BTreeMap<String, String>,
 
+    /// User patches from `/etc/portage/patches/`.
+    ///
+    /// Maps relative path (e.g. `dev-libs/openssl/fix.patch`) to file
+    /// content.  These are applied during `src_prepare()` via portage's
+    /// user-patch mechanism and affect the resulting binary packages.
+    #[serde(default)]
+    pub patches: BTreeMap<String, String>,
+
+    /// Local profile overlay from `/etc/portage/profile/`.
+    ///
+    /// Maps relative path (e.g. `package.provided`, `use.mask`,
+    /// `package.use.force`) to file content.  This directory lets users
+    /// override profile-level settings without creating a custom profile.
+    /// Files here take precedence over the selected profile's own files.
+    ///
+    /// Common files:
+    /// - `package.provided` — mark packages as provided by the system
+    /// - `use.mask` / `use.force` — override profile USE masks/forces
+    /// - `package.mask` — profile-level package masks
+    /// - `packages` — override system set entries
+    /// - `make.defaults` — set variable defaults at profile level
+    #[serde(default)]
+    pub profile_overlay: BTreeMap<String, String>,
+
     /// The active portage profile path (e.g. `default/linux/amd64/23.0`).
     pub profile: String,
 

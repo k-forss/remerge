@@ -46,6 +46,8 @@ impl PortageReader {
         let package_env = self.read_package_env()?;
         let env_files = self.read_env_files()?;
         let repos_conf = self.read_repos_conf()?;
+        let patches = self.read_patches()?;
+        let profile_overlay = self.read_profile_overlay()?;
         let profile = self.read_profile()?;
         let world = self.read_world()?;
 
@@ -59,6 +61,8 @@ impl PortageReader {
             package_env,
             env_files,
             repos_conf,
+            patches,
+            profile_overlay,
             profile,
             world,
         })
@@ -171,8 +175,7 @@ impl PortageReader {
         // won't know which LLVM slot, Python targets, etc. to use.
         let use_expand_keys: Vec<String> = match Self::portageq_envvar("USE_EXPAND") {
             Ok(expand_str) => {
-                let keys: Vec<String> =
-                    expand_str.split_whitespace().map(String::from).collect();
+                let keys: Vec<String> = expand_str.split_whitespace().map(String::from).collect();
                 info!(
                     count = keys.len(),
                     "Discovered USE_EXPAND variables via portageq"
@@ -433,6 +436,112 @@ impl PortageReader {
         Ok(files)
     }
 
+    /// Read user patches from `/etc/portage/patches/`.
+    ///
+    /// Returns a map of relative path → file content.  The directory
+    /// structure mirrors portage's user-patch layout:
+    ///
+    /// ```text
+    /// /etc/portage/patches/
+    ///   dev-libs/openssl/
+    ///     fix-cve.patch
+    ///   sys-apps/systemd/
+    ///     no-telemetry.patch
+    /// ```
+    fn read_patches(&self) -> Result<BTreeMap<String, String>> {
+        let path = self.root.join("etc/portage/patches");
+        let mut patches = BTreeMap::new();
+
+        if !path.is_dir() {
+            debug!("No /etc/portage/patches/ directory — skipping");
+            return Ok(patches);
+        }
+
+        Self::read_patches_recursive(&path, &path, &mut patches);
+
+        if !patches.is_empty() {
+            info!(count = patches.len(), "Read user patches");
+        }
+        Ok(patches)
+    }
+
+    /// Recursively collect patch files under a directory.
+    fn read_patches_recursive(
+        base: &std::path::Path,
+        dir: &std::path::Path,
+        out: &mut BTreeMap<String, String>,
+    ) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                Self::read_patches_recursive(base, &path, out);
+            } else if path.is_file() {
+                let relative = path
+                    .strip_prefix(base)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                if let Ok(content) = fs::read_to_string(&path) {
+                    debug!(patch = %relative, "Read user patch");
+                    out.insert(relative, content);
+                }
+            }
+        }
+    }
+
+    /// Read the local profile overlay from `/etc/portage/profile/`.
+    ///
+    /// This directory overrides profile-level settings without creating a
+    /// custom profile.  Common files include `package.provided`,
+    /// `use.mask`, `use.force`, `package.mask`, `packages`, and
+    /// `make.defaults`.
+    fn read_profile_overlay(&self) -> Result<BTreeMap<String, String>> {
+        let path = self.root.join("etc/portage/profile");
+        let mut files = BTreeMap::new();
+
+        if !path.is_dir() {
+            debug!("No /etc/portage/profile/ directory — skipping");
+            return Ok(files);
+        }
+
+        Self::read_dir_recursive(&path, &path, &mut files);
+
+        if !files.is_empty() {
+            info!(count = files.len(), "Read profile overlay files");
+        }
+        Ok(files)
+    }
+
+    /// Recursively collect files under a directory, storing them with
+    /// paths relative to `base`.
+    fn read_dir_recursive(
+        base: &std::path::Path,
+        dir: &std::path::Path,
+        out: &mut BTreeMap<String, String>,
+    ) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                Self::read_dir_recursive(base, &path, out);
+            } else if path.is_file() {
+                let relative = path
+                    .strip_prefix(base)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                if let Ok(content) = fs::read_to_string(&path) {
+                    out.insert(relative, content);
+                }
+            }
+        }
+    }
+
     /// Generic reader for `/etc/portage/<name>` which may be a file or directory.
     fn read_package_entries<T>(
         &self,
@@ -626,27 +735,35 @@ impl PortageReader {
 
     /// Check if a portage package atom is installed locally.
     ///
-    /// Checks `/var/db/pkg/<category>/<name>*/` to determine if the package
-    /// is installed.  This is a rough heuristic — it does not evaluate version
-    /// constraints, only whether *some* version of the package is present.
+    /// Evaluates the version constraint from the atom against installed
+    /// package versions in `/var/db/pkg/<category>/<name>-<version>/`.
     ///
-    /// Package sets (`@world`, `@system`) are never considered "installed"
-    /// for this check — they always pass through.
+    /// Supported atom forms:
+    /// - `category/package` — any version installed
+    /// - `=category/package-version` — exact version (with revision)
+    /// - `>=category/package-version` — version or newer
+    /// - `<=category/package-version` — version or older
+    /// - `>category/package-version` — strictly newer
+    /// - `<category/package-version` — strictly older
+    /// - `~category/package-version` — same version, any revision
+    /// - `=category/package-version*` — version glob
+    ///
+    /// Package sets (`@world`, `@system`) are never considered "installed".
     pub fn is_installed(&self, atom: &str) -> bool {
         // Sets are never "installed" in the traditional sense.
         if atom.starts_with('@') {
             return false;
         }
 
-        // Strip version operator prefix.
-        let stripped = atom.trim_start_matches(|c: char| ">=<~!".contains(c));
+        // Parse the operator and strip it.
+        let (op, stripped) = parse_atom_operator(atom);
 
         let Some((category, name_maybe_version)) = stripped.split_once('/') else {
             return false;
         };
 
-        // Extract just the package name (strip version).
-        let pkg_name = split_name_version(name_maybe_version).0;
+        // Extract the package name and the constraint version.
+        let (pkg_name, constraint_version) = split_name_version(name_maybe_version);
 
         let pkg_dir = self.root.join("var/db/pkg").join(category);
         let Ok(entries) = std::fs::read_dir(&pkg_dir) else {
@@ -656,9 +773,65 @@ impl PortageReader {
         for entry in entries.flatten() {
             let fname = entry.file_name();
             let fname_str = fname.to_string_lossy();
-            let installed_name = split_name_version(&fname_str).0;
-            if installed_name == pkg_name {
+            let (installed_name, installed_version) = split_name_version(&fname_str);
+            if installed_name != pkg_name {
+                continue;
+            }
+
+            // If no operator, any installed version satisfies.
+            let Some(constraint_ver) = constraint_version else {
                 return true;
+            };
+            let Some(installed_ver) = installed_version else {
+                continue;
+            };
+
+            match op {
+                AtomOp::None => return true,
+                AtomOp::Eq => {
+                    if installed_ver == constraint_ver {
+                        return true;
+                    }
+                }
+                AtomOp::EqGlob => {
+                    // =cat/pkg-1.2* matches 1.2, 1.2.3, 1.2.3-r1, etc.
+                    let prefix = constraint_ver.trim_end_matches('*');
+                    if installed_ver.starts_with(prefix) {
+                        return true;
+                    }
+                }
+                AtomOp::Tilde => {
+                    // ~cat/pkg-1.2.3 matches any revision of 1.2.3
+                    let (constraint_base, _) = split_revision(constraint_ver);
+                    let (installed_base, _) = split_revision(installed_ver);
+                    if installed_base == constraint_base {
+                        return true;
+                    }
+                }
+                AtomOp::Ge => {
+                    if compare_versions(installed_ver, constraint_ver) != std::cmp::Ordering::Less {
+                        return true;
+                    }
+                }
+                AtomOp::Le => {
+                    if compare_versions(installed_ver, constraint_ver)
+                        != std::cmp::Ordering::Greater
+                    {
+                        return true;
+                    }
+                }
+                AtomOp::Gt => {
+                    if compare_versions(installed_ver, constraint_ver)
+                        == std::cmp::Ordering::Greater
+                    {
+                        return true;
+                    }
+                }
+                AtomOp::Lt => {
+                    if compare_versions(installed_ver, constraint_ver) == std::cmp::Ordering::Less {
+                        return true;
+                    }
+                }
             }
         }
 
@@ -934,6 +1107,162 @@ fn split_name_version(s: &str) -> (&str, Option<&str>) {
     (s, None)
 }
 
+/// Version comparison operator parsed from a portage atom.
+#[derive(Debug, PartialEq, Eq)]
+enum AtomOp {
+    /// No operator — bare `category/package`.
+    None,
+    /// `=` — exact version match.
+    Eq,
+    /// `=....*` — version glob.
+    EqGlob,
+    /// `~` — same version, any revision.
+    Tilde,
+    /// `>=` — greater than or equal.
+    Ge,
+    /// `<=` — less than or equal.
+    Le,
+    /// `>` — strictly greater.
+    Gt,
+    /// `<` — strictly less.
+    Lt,
+}
+
+/// Parse the version operator prefix from a portage atom.
+///
+/// Returns `(operator, remaining_atom)`.  For `=cat/pkg-1.2*` atoms the
+/// glob star is left in the version and the operator is `EqGlob`.
+fn parse_atom_operator(atom: &str) -> (AtomOp, &str) {
+    if let Some(rest) = atom.strip_prefix(">=") {
+        (AtomOp::Ge, rest)
+    } else if let Some(rest) = atom.strip_prefix("<=") {
+        (AtomOp::Le, rest)
+    } else if let Some(rest) = atom.strip_prefix('=') {
+        // Check for glob: =cat/pkg-1.2*
+        if rest.ends_with('*') {
+            (AtomOp::EqGlob, rest)
+        } else {
+            (AtomOp::Eq, rest)
+        }
+    } else if let Some(rest) = atom.strip_prefix('~') {
+        (AtomOp::Tilde, rest)
+    } else if let Some(rest) = atom.strip_prefix('>') {
+        (AtomOp::Gt, rest)
+    } else if let Some(rest) = atom.strip_prefix('<') {
+        (AtomOp::Lt, rest)
+    } else {
+        (AtomOp::None, atom)
+    }
+}
+
+/// Split a version string into (base_version, revision).
+///
+/// e.g. `3.1.4-r1` → `("3.1.4", Some("r1"))`
+///       `3.1.4`   → `("3.1.4", None)`
+fn split_revision(version: &str) -> (&str, Option<&str>) {
+    // Revision is always the last `-rN` suffix.
+    if let Some(pos) = version.rfind("-r") {
+        let after = &version[pos + 2..];
+        if !after.is_empty() && after.chars().all(|c| c.is_ascii_digit()) {
+            return (&version[..pos], Some(&version[pos + 1..]));
+        }
+    }
+    (version, None)
+}
+
+/// Compare two portage version strings per PMS rules.
+///
+/// Handles:
+/// - Numeric component comparison (`1.9` < `1.10`)
+/// - Suffix ordering (`_alpha` < `_beta` < `_pre` < `_rc` < (none) < `_p`)
+/// - Revision comparison (`-r0` < `-r1`)
+///
+/// This is a simplified but correct implementation for the common cases.
+fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let (a_base, a_rev) = split_revision(a);
+    let (b_base, b_rev) = split_revision(b);
+
+    // Split base version into components on `.` and `_`.
+    let a_parts: Vec<&str> = a_base.split(|c| c == '.' || c == '_').collect();
+    let b_parts: Vec<&str> = b_base.split(|c| c == '.' || c == '_').collect();
+
+    let suffix_order = |s: &str| -> i32 {
+        match s {
+            "alpha" => -4,
+            "beta" => -3,
+            "pre" => -2,
+            "rc" => -1,
+            "p" => 1,
+            _ => 0,
+        }
+    };
+
+    let max_len = a_parts.len().max(b_parts.len());
+    for i in 0..max_len {
+        let pa = a_parts.get(i).copied().unwrap_or("");
+        let pb = b_parts.get(i).copied().unwrap_or("");
+
+        // Try numeric comparison first.
+        match (pa.parse::<u64>(), pb.parse::<u64>()) {
+            (Ok(na), Ok(nb)) => {
+                let cmp = na.cmp(&nb);
+                if cmp != Ordering::Equal {
+                    return cmp;
+                }
+            }
+            // One is a suffix like "alpha", "beta", "pre", "rc", "p".
+            (Ok(_), Err(_)) => {
+                // Numeric vs suffix: the numeric part comes first in
+                // the version.  If we reach a suffix component on one
+                // side and a number on the other, the suffix side is
+                // "shorter" in the numeric part — but PMS says a present
+                // numeric part beats a missing one.
+                let sb = suffix_order(pb);
+                if sb != 0 {
+                    return 0i32.cmp(&sb); // no-suffix vs suffix
+                }
+                return Ordering::Greater; // has more components
+            }
+            (Err(_), Ok(_)) => {
+                let sa = suffix_order(pa);
+                if sa != 0 {
+                    return sa.cmp(&0i32);
+                }
+                return Ordering::Less;
+            }
+            (Err(_), Err(_)) => {
+                // Both are suffix strings.
+                let sa = suffix_order(pa);
+                let sb = suffix_order(pb);
+                if sa != 0 || sb != 0 {
+                    let cmp = sa.cmp(&sb);
+                    if cmp != Ordering::Equal {
+                        return cmp;
+                    }
+                } else {
+                    let cmp = pa.cmp(pb);
+                    if cmp != Ordering::Equal {
+                        return cmp;
+                    }
+                }
+            }
+        }
+    }
+
+    // Base versions are equal — compare revisions.
+    let ra = a_rev
+        .and_then(|r| r.strip_prefix('r'))
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+    let rb = b_rev
+        .and_then(|r| r.strip_prefix('r'))
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+    ra.cmp(&rb)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -989,5 +1318,91 @@ VIDEO_CARDS="amdgpu radeonsi"
     #[test]
     fn split_name_version_numeric_name() {
         assert_eq!(split_name_version("lib3ds-1.2"), ("lib3ds", Some("1.2")));
+    }
+
+    // ── Version comparison tests ─────────────────────────────────
+
+    #[test]
+    fn compare_versions_basic() {
+        use std::cmp::Ordering;
+        assert_eq!(compare_versions("1.0", "1.0"), Ordering::Equal);
+        assert_eq!(compare_versions("1.0", "2.0"), Ordering::Less);
+        assert_eq!(compare_versions("2.0", "1.0"), Ordering::Greater);
+    }
+
+    #[test]
+    fn compare_versions_numeric_not_lexicographic() {
+        use std::cmp::Ordering;
+        // 1.10 > 1.9 numerically, but < lexicographically.
+        assert_eq!(compare_versions("1.10", "1.9"), Ordering::Greater);
+        assert_eq!(compare_versions("1.2", "1.10"), Ordering::Less);
+    }
+
+    #[test]
+    fn compare_versions_different_depth() {
+        use std::cmp::Ordering;
+        assert_eq!(compare_versions("1.2.3", "1.2"), Ordering::Greater);
+        assert_eq!(compare_versions("1.2", "1.2.1"), Ordering::Less);
+    }
+
+    #[test]
+    fn compare_versions_revisions() {
+        use std::cmp::Ordering;
+        assert_eq!(compare_versions("3.1.4-r1", "3.1.4"), Ordering::Greater);
+        assert_eq!(compare_versions("3.1.4-r1", "3.1.4-r2"), Ordering::Less);
+        assert_eq!(compare_versions("3.1.4-r1", "3.1.4-r1"), Ordering::Equal);
+    }
+
+    #[test]
+    fn compare_versions_suffixes() {
+        use std::cmp::Ordering;
+        assert_eq!(compare_versions("1.0_alpha", "1.0_beta"), Ordering::Less);
+        assert_eq!(compare_versions("1.0_beta", "1.0_pre"), Ordering::Less);
+        assert_eq!(compare_versions("1.0_pre", "1.0_rc"), Ordering::Less);
+        assert_eq!(compare_versions("1.0_rc", "1.0"), Ordering::Less);
+        assert_eq!(compare_versions("1.0", "1.0_p"), Ordering::Less);
+    }
+
+    #[test]
+    fn split_revision_works() {
+        assert_eq!(split_revision("3.1.4-r1"), ("3.1.4", Some("r1")));
+        assert_eq!(split_revision("3.1.4"), ("3.1.4", None));
+        assert_eq!(split_revision("3.1.4-r0"), ("3.1.4", Some("r0")));
+    }
+
+    #[test]
+    fn parse_atom_operator_works() {
+        assert_eq!(
+            parse_atom_operator("dev-libs/foo"),
+            (AtomOp::None, "dev-libs/foo")
+        );
+        assert_eq!(
+            parse_atom_operator("=dev-libs/foo-1.0"),
+            (AtomOp::Eq, "dev-libs/foo-1.0")
+        );
+        assert_eq!(
+            parse_atom_operator(">=dev-libs/foo-1.0"),
+            (AtomOp::Ge, "dev-libs/foo-1.0")
+        );
+        assert_eq!(
+            parse_atom_operator("<=dev-libs/foo-1.0"),
+            (AtomOp::Le, "dev-libs/foo-1.0")
+        );
+        assert_eq!(
+            parse_atom_operator(">dev-libs/foo-1.0"),
+            (AtomOp::Gt, "dev-libs/foo-1.0")
+        );
+        assert_eq!(
+            parse_atom_operator("<dev-libs/foo-1.0"),
+            (AtomOp::Lt, "dev-libs/foo-1.0")
+        );
+        assert_eq!(
+            parse_atom_operator("~dev-libs/foo-1.0"),
+            (AtomOp::Tilde, "dev-libs/foo-1.0")
+        );
+        assert_eq!(
+            parse_atom_operator("=dev-libs/foo-1.0*"),
+            (AtomOp::EqGlob, "dev-libs/foo-1.0*")
+        );
     }
 }

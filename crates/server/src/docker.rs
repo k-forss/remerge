@@ -284,10 +284,6 @@ RUN emerge --oneshot --quiet dev-vcs/git || true
 # Create binpkg output directory.
 RUN mkdir -p {binpkg_mount}
 
-# Default FEATURES for binary package creation.
-RUN echo 'FEATURES="buildpkg noclean"' >> /etc/portage/make.conf && \
-    echo 'PKGDIR="{binpkg_mount}"' >> /etc/portage/make.conf
-
 WORKDIR /root
 
 # The entrypoint will be the remerge-worker binary.
