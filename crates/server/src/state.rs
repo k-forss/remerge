@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
-use tokio::sync::{RwLock, Semaphore, broadcast};
+use tokio::sync::{RwLock, Semaphore, broadcast, mpsc};
 
 use remerge_types::workorder::{BuildProgress, Workorder, WorkorderId, WorkorderResult};
 
@@ -35,6 +35,10 @@ pub struct AppState {
 
     /// Per-workorder broadcast channels for progress streaming.
     pub progress_txs: RwLock<HashMap<WorkorderId, broadcast::Sender<BuildProgress>>>,
+
+    /// Per-workorder stdin channels for forwarding client input to the
+    /// worker container (supports interactive emerge, `--ask`, etc.).
+    pub stdin_txs: RwLock<HashMap<WorkorderId, mpsc::Sender<Vec<u8>>>>,
 
     /// Semaphore to limit concurrent worker containers to `max_workers`.
     pub worker_semaphore: Arc<Semaphore>,
@@ -85,6 +89,7 @@ impl AppState {
             workorders: RwLock::new(HashMap::new()),
             results: RwLock::new(persisted_results),
             progress_txs: RwLock::new(HashMap::new()),
+            stdin_txs: RwLock::new(HashMap::new()),
             worker_semaphore: Arc::new(Semaphore::new(max_workers)),
             container_ids: RwLock::new(HashMap::new()),
             image_last_used: RwLock::new(HashMap::new()),
@@ -114,5 +119,24 @@ impl AppState {
             .await
             .get(id)
             .map(|tx| tx.subscribe())
+    }
+
+    /// Create an mpsc channel for forwarding stdin data to a workorder's
+    /// worker container.  Returns the receiver; the sender is stored in
+    /// `stdin_txs` so WebSocket handlers can write to it.
+    pub async fn create_stdin_channel(&self, id: WorkorderId) -> mpsc::Receiver<Vec<u8>> {
+        let (tx, rx) = mpsc::channel(64);
+        self.stdin_txs.write().await.insert(id, tx);
+        rx
+    }
+
+    /// Get the stdin sender for an existing workorder (used by the WS handler).
+    pub async fn get_stdin_tx(&self, id: &WorkorderId) -> Option<mpsc::Sender<Vec<u8>>> {
+        self.stdin_txs.read().await.get(id).cloned()
+    }
+
+    /// Remove the stdin channel when a workorder finishes.
+    pub async fn remove_stdin_channel(&self, id: &WorkorderId) {
+        self.stdin_txs.write().await.remove(id);
     }
 }

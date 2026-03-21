@@ -13,6 +13,8 @@ use axum::{
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use futures::StreamExt;
+
 use remerge_types::validation::validate_atom;
 use remerge_types::{api::*, workorder::*};
 
@@ -411,6 +413,11 @@ async fn metrics(State(state): State<SharedState>) -> impl IntoResponse {
 // ─── WebSocket ──────────────────────────────────────────────────────
 
 /// WebSocket endpoint that streams [`BuildProgress`] events.
+///
+/// The connection is bidirectional:
+/// - **Server → Client:** Build progress events (log lines, status changes, etc.)
+/// - **Client → Server:** Stdin data forwarded to the worker container for
+///   interactive emerge support (`--ask`, USE prompts, etc.)
 async fn ws_progress(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -421,29 +428,66 @@ async fn ws_progress(
         .await
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    Ok(ws.on_upgrade(move |socket| handle_ws(socket, rx)))
+    let stdin_tx = state.get_stdin_tx(&id).await;
+
+    Ok(ws.on_upgrade(move |socket| handle_ws(socket, rx, stdin_tx)))
 }
 
 async fn handle_ws(
-    mut socket: ws::WebSocket,
+    socket: ws::WebSocket,
     mut rx: tokio::sync::broadcast::Receiver<BuildProgress>,
+    stdin_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
 ) {
-    while let Ok(progress) = rx.recv().await {
-        let text = match serde_json::to_string(&progress) {
-            Ok(t) => t,
-            Err(e) => {
-                error!("Failed to serialise progress: {e}");
-                continue;
-            }
-        };
-        if socket.send(ws::Message::Text(text.into())).await.is_err() {
-            break; // Client disconnected.
-        }
+    let (mut ws_write, mut ws_read) = socket.split();
 
-        // If the build is finished, close the socket.
-        if matches!(progress.event, BuildEvent::Finished { .. }) {
-            let _ = socket.send(ws::Message::Close(None)).await;
-            break;
+    // Task 1: Forward build progress events to the client.
+    let send_task = tokio::spawn(async move {
+        while let Ok(progress) = rx.recv().await {
+            let text = match serde_json::to_string(&progress) {
+                Ok(t) => t,
+                Err(e) => {
+                    error!("Failed to serialise progress: {e}");
+                    continue;
+                }
+            };
+
+            use futures::SinkExt;
+            if ws_write.send(ws::Message::Text(text.into())).await.is_err() {
+                break; // Client disconnected.
+            }
+
+            // If the build is finished, close the socket.
+            if matches!(progress.event, BuildEvent::Finished { .. }) {
+                let _ = ws_write.send(ws::Message::Close(None)).await;
+                break;
+            }
         }
+    });
+
+    // Task 2: Read client messages (stdin data) and forward to the container.
+    let recv_task = tokio::spawn(async move {
+        while let Some(Ok(msg)) = ws_read.next().await {
+            match msg {
+                ws::Message::Text(text) => {
+                    if let Some(ref tx) = stdin_tx {
+                        // Send the text as raw bytes to the container's stdin.
+                        let _ = tx.send(text.as_bytes().to_vec()).await;
+                    }
+                }
+                ws::Message::Binary(data) => {
+                    if let Some(ref tx) = stdin_tx {
+                        let _ = tx.send(data.to_vec()).await;
+                    }
+                }
+                ws::Message::Close(_) => break,
+                _ => {}
+            }
+        }
+    });
+
+    // Wait for either task to finish, then abort the other.
+    tokio::select! {
+        _ = send_task => {},
+        _ = recv_task => {},
     }
 }

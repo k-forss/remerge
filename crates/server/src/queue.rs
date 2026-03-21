@@ -10,6 +10,7 @@ use std::time::Instant;
 use chrono::Utc;
 use futures::StreamExt;
 use regex::Regex;
+use tokio::io::AsyncWriteExt;
 
 use tracing::{error, info, warn};
 
@@ -210,11 +211,18 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
         .await
         .insert(id, container_id.clone());
 
-    // ── 3. Stream logs and parse structured events ──────────────────
+    // ── 3. Attach to container for bidirectional I/O ─────────────────
+    //
+    // We use Docker attach (not logs) so that we get both an output stream
+    // AND a stdin writer.  This lets interactive emerge prompts (--ask,
+    // USE flag changes, etc.) flow through to the connected client.
     let log_tx = tx.clone();
     let log_container_id = container_id.clone();
     let log_state = state.clone();
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<WorkerEvent>(64);
+
+    // Create the stdin channel so the WebSocket handler can forward input.
+    let mut stdin_rx = state.create_stdin_channel(id).await;
 
     let log_handle = tokio::spawn(async move {
         let re_emerging = Regex::new(r">>> Emerging \(\d+ of \d+\) (.+)::").unwrap();
@@ -227,12 +235,34 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
         let re_use_conflict = Regex::new(r"The following USE changes are necessary").unwrap();
         let re_fetch_fail = Regex::new(r"(?:Couldn't download|!!! Fetch failed)").unwrap();
 
-        let mut logs = log_state.docker.stream_logs(&log_container_id);
+        // Attach to the container to get bidirectional streams.
+        let attach_result = log_state.docker.attach_container(&log_container_id).await;
+        let (mut output, mut input) = match attach_result {
+            Ok(result) => (result.output, result.input),
+            Err(e) => {
+                error!("Failed to attach to container: {e:#}");
+                return;
+            }
+        };
+
+        // Spawn a task that forwards stdin from the WebSocket → container.
+        let stdin_handle = tokio::spawn(async move {
+            while let Some(data) = stdin_rx.recv().await {
+                if input.write_all(&data).await.is_err() {
+                    break;
+                }
+                if input.flush().await.is_err() {
+                    break;
+                }
+            }
+        });
+
         let mut current_package: Option<(String, Instant)> = None;
 
-        while let Some(result) = logs.next().await {
+        while let Some(result) = output.next().await {
             match result {
-                Ok(line) => {
+                Ok(log_output) => {
+                    let line = log_output.to_string();
                     let trimmed = line.trim_end().to_string();
 
                     // Check for structured events emitted by the worker.
@@ -314,11 +344,14 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
                     });
                 }
                 Err(e) => {
-                    warn!("Log stream error: {e}");
+                    warn!("Attach stream error: {e}");
                     break;
                 }
             }
         }
+
+        // Output stream ended — abort the stdin forwarder.
+        stdin_handle.abort();
     });
 
     // ── 4. Wait for container to finish ─────────────────────────────
@@ -499,6 +532,7 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
 
     // ── 7. Cleanup ──────────────────────────────────────────────────
     state.container_ids.write().await.remove(&id);
+    state.remove_stdin_channel(&id).await;
     state
         .clients
         .clear_active_workorder(&workorder.client_id)

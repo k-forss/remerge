@@ -3,10 +3,11 @@
 use anyhow::{Context, Result};
 use bollard::{
     Docker,
+    container::AttachContainerResults,
     models::{ContainerCreateBody, HostConfig},
     query_parameters::{
-        BuildImageOptions, CreateContainerOptions, LogsOptions, RemoveContainerOptions,
-        StartContainerOptions,
+        AttachContainerOptionsBuilder, BuildImageOptions, CreateContainerOptions,
+        RemoveContainerOptions, StartContainerOptions,
     },
 };
 use futures::StreamExt;
@@ -279,6 +280,13 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
             image: Some(image_tag.to_string()),
             env: Some(env),
             host_config: Some(host_config),
+            // Allocate a PTY and keep stdin open so emerge can run
+            // interactively (e.g. `--ask` prompts) through the attach stream.
+            tty: Some(true),
+            open_stdin: Some(true),
+            attach_stdin: Some(true),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
             ..Default::default()
         };
 
@@ -318,22 +326,24 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
         Ok(resp.id)
     }
 
-    /// Stream logs from a running container.
-    pub fn stream_logs(
-        &self,
-        container_id: &str,
-    ) -> impl futures::Stream<Item = Result<String, bollard::errors::Error>> + '_ {
+    /// Attach to a running container for bidirectional I/O.
+    ///
+    /// Returns an [`AttachContainerResults`] whose `output` stream yields
+    /// log lines and whose `input` sink accepts bytes forwarded to the
+    /// container's stdin.  This is the backbone of interactive emerge
+    /// support (`--ask`, USE prompts, etc.).
+    pub async fn attach_container(&self, container_id: &str) -> Result<AttachContainerResults> {
+        let options = AttachContainerOptionsBuilder::default()
+            .stdin(true)
+            .stdout(true)
+            .stderr(true)
+            .stream(true)
+            .build();
+
         self.docker
-            .logs(
-                container_id,
-                Some(LogsOptions {
-                    follow: true,
-                    stdout: true,
-                    stderr: true,
-                    ..Default::default()
-                }),
-            )
-            .map(|r| r.map(|o| o.to_string()))
+            .attach_container(container_id, Some(options))
+            .await
+            .context("Failed to attach to worker container")
     }
 
     /// Wait for a container to finish and return exit code.
