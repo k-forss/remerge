@@ -19,57 +19,42 @@ before the first release.
 
 ## Quick start
 
-### Option 1: eselect-repository (recommended)
+### Option 1: repos.conf with git sparse checkout (recommended)
 
-If you have `app-eselect/eselect-repository` installed:
+The overlay lives in the `overlay/` subdirectory of the repo, so a
+standard `sync-type = git` won't work directly.  Clone with a sparse
+checkout and point portage at the `overlay/` directory:
 
 ```sh
-# Add the overlay
-eselect repository add remerge git https://github.com/k-forss/remerge.git
+# Clone with sparse checkout (only the overlay directory)
+git clone --depth 1 --filter=blob:none --sparse \
+  https://github.com/k-forss/remerge.git /var/db/repos/remerge-src
+cd /var/db/repos/remerge-src && git sparse-checkout set overlay
 
-# Sync
-emerge --sync remerge
-
-# Install the CLI (build from source — always available)
-emerge app-portage/remerge
-
-# Or install a pre-built binary (requires a published release)
-emerge app-portage/remerge-bin
-```
-
-### Option 2: repos.conf (manual)
-
-Create `/etc/portage/repos.conf/remerge.conf`:
-
-```ini
+# Register the overlay subdirectory
+cat > /etc/portage/repos.conf/remerge.conf <<'EOF'
 [remerge]
-location = /var/db/repos/remerge
-sync-type = git
-sync-uri = https://github.com/k-forss/remerge.git
-sync-depth = 1
-auto-sync = yes
-```
-
-Then sync and install:
-
-```sh
-emerge --sync remerge
-emerge app-portage/remerge
-```
-
-### Option 3: Local overlay
-
-```sh
-# Clone into your repos directory
-git clone https://github.com/k-forss/remerge.git /var/db/repos/remerge
-
-# Register it
-cat > /etc/portage/repos.conf/remerge.conf <<EOF
-[remerge]
-location = /var/db/repos/remerge
+location = /var/db/repos/remerge-src/overlay
+auto-sync = no
 EOF
 
 # Install
+emerge app-portage/remerge
+```
+
+To update: `cd /var/db/repos/remerge-src && git pull`
+
+### Option 2: Local clone
+
+If you already have the repo cloned (e.g. for development):
+
+```sh
+cat > /etc/portage/repos.conf/remerge.conf <<'EOF'
+[remerge]
+location = /path/to/remerge/overlay
+auto-sync = no
+EOF
+
 emerge app-portage/remerge
 ```
 
