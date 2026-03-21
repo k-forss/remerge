@@ -92,18 +92,30 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Remove previous nightly release + tag so assets are fresh
+          # Delete the existing nightly release and its tag so we start fresh.
           gh release delete nightly --yes --cleanup-tag 2>/dev/null || true
+          # Also force-delete the tag in case cleanup-tag didn't remove it
+          # (e.g. the release was already gone but the tag lingered).
+          git tag -d nightly 2>/dev/null || true
+          git push origin :refs/tags/nightly 2>/dev/null || true
 
-          gh release create nightly \
-            --title "Nightly (latest main)" \
-            --notes "Rolling nightly build from the \`main\` branch.
+          # Write release notes to a file to avoid shell quoting issues.
+          cat > /tmp/nightly-notes.md <<EOF
+          Rolling nightly build from the \`main\` branch.
 
           **Last updated:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')
           **Commit:** [${{ github.sha }}](https://github.com/${{ github.repository }}/commit/${{ github.sha }})
 
           These builds are for use with the \`remerge-bin-9999\` live ebuild.
-          They are automatically replaced on each push to \`main\`." \
+          They are automatically replaced on each push to \`main\`.
+          EOF
+
+          ls -la *.tar.gz *-SHA256SUMS.txt
+
+          gh release create nightly \
+            --target "${{ github.sha }}" \
+            --title "Nightly (latest main)" \
+            --notes-file /tmp/nightly-notes.md \
             --prerelease \
             --latest=false \
             *.tar.gz *-SHA256SUMS.txt
