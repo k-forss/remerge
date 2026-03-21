@@ -309,7 +309,6 @@ RDEPEND="
 	!app-portage/remerge-bin
 	sys-apps/portage
 "
-BDEPEND="virtual/rust"
 
 QA_FLAGS_IGNORED="usr/bin/remerge"
 

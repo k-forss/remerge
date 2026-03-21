@@ -75,12 +75,21 @@ sudo install -m 0755 remerge-server /usr/local/bin/remerge-server
 
 ### Via Gentoo overlay
 
-The repository includes a full Gentoo overlay with source and binary ebuilds:
+The repository includes a full Gentoo overlay in the `overlay/` directory
+with source and binary ebuilds:
 
 ```bash
-# Using eselect-repository:
-eselect repository add remerge git https://github.com/k-forss/remerge.git
-emaint sync -r remerge
+# Clone with sparse checkout (only the overlay directory)
+git clone --depth 1 --filter=blob:none --sparse \
+  https://github.com/k-forss/remerge.git /var/db/repos/remerge-src
+cd /var/db/repos/remerge-src && git sparse-checkout set overlay
+
+# Register the overlay subdirectory
+cat > /etc/portage/repos.conf/remerge.conf <<'EOF'
+[remerge]
+location = /var/db/repos/remerge-src/overlay
+auto-sync = no
+EOF
 
 # Build from source (live/9999 ebuild — always available):
 emerge app-portage/remerge
@@ -91,6 +100,8 @@ emerge app-portage/remerge-bin
 # Install server with OpenRC/systemd service files:
 emerge app-portage/remerge-server
 ```
+
+To update: `cd /var/db/repos/remerge-src && git pull`
 
 See [`overlay/README.md`](overlay/README.md) for full overlay setup,
 alternative installation methods, and signature verification details.
