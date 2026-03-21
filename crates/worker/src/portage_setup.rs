@@ -557,6 +557,10 @@ async fn rewrite_repo_location(filename: &str, old_loc: &str, new_loc: &str) -> 
 /// requiring a custom profile.  Files here are layered on top of the
 /// selected profile by portage.
 async fn write_profile_overlay(config: &PortageConfig) -> Result<()> {
+    write_profile_overlay_inner(Path::new("/etc/portage/profile"), config).await
+}
+
+async fn write_profile_overlay_inner(base: &Path, config: &PortageConfig) -> Result<()> {
     if config.profile_overlay.is_empty() {
         return Ok(());
     }
@@ -576,20 +580,21 @@ async fn write_profile_overlay(config: &PortageConfig) -> Result<()> {
             continue;
         }
 
-        let full_path = format!("/etc/portage/profile/{relative_path}");
-        if let Some(parent) = Path::new(&full_path).parent() {
+        let full_path = base.join(relative_path);
+        if let Some(parent) = full_path.parent() {
             fs::create_dir_all(parent).await.with_context(|| {
-                format!("Failed to create parent dir for profile overlay {full_path}")
+                format!("Failed to create parent dir for profile overlay {}", full_path.display())
             })?;
         }
         fs::write(&full_path, content)
             .await
-            .with_context(|| format!("Failed to write profile overlay {full_path}"))?;
+            .with_context(|| format!("Failed to write profile overlay {}", full_path.display()))?;
     }
 
     info!(
         count = config.profile_overlay.len(),
-        "Wrote /etc/portage/profile/ overlay files"
+        "Wrote {} profile overlay files",
+        base.display()
     );
     Ok(())
 }
@@ -601,19 +606,55 @@ async fn write_profile_overlay(config: &PortageConfig) -> Result<()> {
 /// uses the same profile as the client — affecting USE masks/forces,
 /// package masks, system set, and default variable values.
 async fn set_profile(config: &PortageConfig) -> Result<()> {
-    let profile = &config.profile;
+    // Collect repo locations from the on-disk repos.conf, which may have been
+    // rewritten by ensure_repo_locations() (e.g. remapping /var/db/repos/…
+    // to /var/tmp/remerge-repos/…).  If reading fails, fall back to the
+    // in-memory configuration from the workorder.
+    let mut repo_locations: Vec<String> = Vec::new();
+
+    if let Ok(mut dir) = fs::read_dir("/etc/portage/repos.conf").await {
+        while let Ok(Some(entry)) = dir.next_entry().await {
+            let path = entry.path();
+            if path.is_file() {
+                if let Ok(content) = fs::read_to_string(&path).await {
+                    repo_locations.extend(
+                        parse_repo_sections(&content)
+                            .into_iter()
+                            .map(|(_, location)| location),
+                    );
+                }
+            }
+        }
+    }
+
+    // Fall back to the workorder's original repos.conf contents if we
+    // could not read any locations from the on-disk files.
+    if repo_locations.is_empty() {
+        repo_locations = config
+            .repos_conf
+            .values()
+            .flat_map(|content| parse_repo_sections(content))
+            .map(|(_, location)| location)
+            .collect();
+    }
+
+    set_profile_inner(
+        &config.profile,
+        &repo_locations,
+        Path::new("/etc/portage/make.profile"),
+    )
+    .await
+}
+
+async fn set_profile_inner(
+    profile: &str,
+    repo_locations: &[String],
+    link_path: &Path,
+) -> Result<()> {
     if profile.is_empty() || profile == "unknown" {
         info!("No profile specified — using container default");
         return Ok(());
     }
-
-    // Collect all repo locations from repos.conf.
-    let repo_locations: Vec<String> = config
-        .repos_conf
-        .values()
-        .flat_map(|content| parse_repo_sections(content))
-        .map(|(_, location)| location)
-        .collect();
 
     // Search for the profile in all configured repos.
     let target = repo_locations
@@ -622,7 +663,8 @@ async fn set_profile(config: &PortageConfig) -> Result<()> {
         .find(|p| Path::new(p).is_dir());
 
     // Fall back to the default gentoo repo location.
-    let target = target.unwrap_or_else(|| format!("/var/db/repos/gentoo/profiles/{profile}"));
+    let target =
+        target.unwrap_or_else(|| format!("/var/db/repos/gentoo/profiles/{profile}"));
 
     if !Path::new(&target).is_dir() {
         tracing::warn!(
@@ -633,20 +675,18 @@ async fn set_profile(config: &PortageConfig) -> Result<()> {
         return Ok(());
     }
 
-    let link = Path::new("/etc/portage/make.profile");
-
     // Remove existing symlink or file.
-    if link.symlink_metadata().is_ok() {
-        if link.is_dir() && !link.is_symlink() {
+    if link_path.symlink_metadata().is_ok() {
+        if link_path.is_dir() && !link_path.is_symlink() {
             tracing::warn!("make.profile is a real directory — not replacing");
             return Ok(());
         }
-        fs::remove_file(link).await.ok();
+        fs::remove_file(link_path).await.ok();
     }
 
-    tokio::fs::symlink(&target, link)
+    tokio::fs::symlink(&target, link_path)
         .await
-        .with_context(|| format!("Failed to symlink make.profile → {target}"))?;
+        .with_context(|| format!("Failed to symlink {} → {target}", link_path.display()))?;
 
     info!(
         profile = %profile,
@@ -661,6 +701,10 @@ async fn set_profile(config: &PortageConfig) -> Result<()> {
 /// These are applied by portage during `src_prepare()` (the user-patch
 /// mechanism).  Without them, the worker would build unpatched binaries.
 async fn write_patches(config: &PortageConfig) -> Result<()> {
+    write_patches_inner(Path::new("/etc/portage/patches"), config).await
+}
+
+async fn write_patches_inner(base: &Path, config: &PortageConfig) -> Result<()> {
     if config.patches.is_empty() {
         return Ok(());
     }
@@ -680,20 +724,21 @@ async fn write_patches(config: &PortageConfig) -> Result<()> {
             continue;
         }
 
-        let full_path = format!("/etc/portage/patches/{relative_path}");
-        if let Some(parent) = Path::new(&full_path).parent() {
+        let full_path = base.join(relative_path);
+        if let Some(parent) = full_path.parent() {
             fs::create_dir_all(parent)
                 .await
-                .with_context(|| format!("Failed to create parent dir for patch {full_path}"))?;
+                .with_context(|| format!("Failed to create parent dir for patch {}", full_path.display()))?;
         }
         fs::write(&full_path, content)
             .await
-            .with_context(|| format!("Failed to write patch {full_path}"))?;
+            .with_context(|| format!("Failed to write patch {}", full_path.display()))?;
     }
 
     info!(
         count = config.patches.len(),
-        "Wrote /etc/portage/patches/ files"
+        "Wrote {} patch files",
+        base.display()
     );
     Ok(())
 }
@@ -812,7 +857,7 @@ fn build_makeopts_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use remerge_types::portage::MakeConf;
+    use remerge_types::portage::{MakeConf, PortageConfig};
 
     #[test]
     fn build_makeopts_no_env() {
@@ -949,5 +994,213 @@ sync-type = git
             repos[0],
             ("myrepo".to_string(), "/var/db/repos/myrepo".to_string())
         );
+    }
+
+    // ── write_profile_overlay_inner ──────────────────────────────────────────
+
+    /// Build a minimal PortageConfig with only `profile_overlay` populated.
+    fn config_with_profile_overlay(
+        files: impl IntoIterator<Item = (&'static str, &'static str)>,
+    ) -> PortageConfig {
+        PortageConfig {
+            make_conf: MakeConf::default(),
+            package_use: vec![],
+            package_accept_keywords: vec![],
+            package_license: vec![],
+            package_mask: vec![],
+            package_unmask: vec![],
+            package_env: vec![],
+            env_files: Default::default(),
+            repos_conf: Default::default(),
+            patches: Default::default(),
+            profile_overlay: files
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            profile: String::new(),
+            world: vec![],
+        }
+    }
+
+    /// Build a minimal PortageConfig with only `patches` populated.
+    fn config_with_patches(
+        files: impl IntoIterator<Item = (&'static str, &'static str)>,
+    ) -> PortageConfig {
+        PortageConfig {
+            make_conf: MakeConf::default(),
+            package_use: vec![],
+            package_accept_keywords: vec![],
+            package_license: vec![],
+            package_mask: vec![],
+            package_unmask: vec![],
+            package_env: vec![],
+            env_files: Default::default(),
+            repos_conf: Default::default(),
+            patches: files
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            profile_overlay: Default::default(),
+            profile: String::new(),
+            world: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_overlay_rejects_path_traversal() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = config_with_profile_overlay([
+            ("../escape.conf", "evil"),
+            ("/absolute.conf", "evil"),
+            ("valid/file.conf", "ok"),
+        ]);
+
+        write_profile_overlay_inner(tmp.path(), &config)
+            .await
+            .expect("should succeed skipping bad paths");
+
+        // Traversal paths must not be created.
+        assert!(
+            !tmp.path().join("../escape.conf").exists(),
+            "traversal path must not be written"
+        );
+        assert!(
+            !tmp.path().join("absolute.conf").exists(),
+            "absolute path must not be written"
+        );
+        // The valid file must be written.
+        assert!(
+            tmp.path().join("valid/file.conf").exists(),
+            "valid relative path must be written"
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_overlay_writes_correct_relative_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = config_with_profile_overlay([
+            ("package.provided", "dev-libs/foo-1.0\n"),
+            ("use.mask", "# no masks\n"),
+            ("sub/dir/file", "content\n"),
+        ]);
+
+        write_profile_overlay_inner(tmp.path(), &config)
+            .await
+            .expect("write should succeed");
+
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("package.provided")).unwrap(),
+            "dev-libs/foo-1.0\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("use.mask")).unwrap(),
+            "# no masks\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("sub/dir/file")).unwrap(),
+            "content\n"
+        );
+    }
+
+    // ── write_patches_inner ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn patches_rejects_path_traversal() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = config_with_patches([
+            ("../evil.patch", "evil"),
+            ("/root.patch", "evil"),
+            ("dev-libs/openssl/fix.patch", "--- a\n+++ b\n"),
+        ]);
+
+        write_patches_inner(tmp.path(), &config)
+            .await
+            .expect("should succeed skipping bad paths");
+
+        assert!(
+            !tmp.path().join("../evil.patch").exists(),
+            "traversal path must not be written"
+        );
+        assert!(
+            !tmp.path().join("root.patch").exists(),
+            "absolute path must not be written"
+        );
+        assert!(
+            tmp.path().join("dev-libs/openssl/fix.patch").exists(),
+            "valid relative path must be written"
+        );
+    }
+
+    #[tokio::test]
+    async fn patches_writes_correct_relative_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let patch_content = "--- a/file.c\n+++ b/file.c\n@@ -1 +1 @@\n-old\n+new\n";
+        let config =
+            config_with_patches([("dev-libs/openssl/fix.patch", patch_content)]);
+
+        write_patches_inner(tmp.path(), &config)
+            .await
+            .expect("write should succeed");
+
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("dev-libs/openssl/fix.patch")).unwrap(),
+            patch_content,
+        );
+    }
+
+    // ── set_profile_inner ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn set_profile_creates_correct_symlink() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("myrepo");
+        let profile_dir = repo.join("profiles/default/linux/amd64/23.0");
+        std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+
+        let link = tmp.path().join("make.profile");
+        let locations = vec![repo.to_string_lossy().into_owned()];
+
+        set_profile_inner("default/linux/amd64/23.0", &locations, &link)
+            .await
+            .expect("set_profile_inner should succeed");
+
+        assert!(link.is_symlink(), "make.profile must be a symlink");
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            profile_dir,
+            "symlink must point at the profile directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_profile_skips_when_profile_not_found() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let link = tmp.path().join("make.profile");
+        // No repos have the requested profile.
+        let locations: Vec<String> = vec!["/nonexistent/repo".to_string()];
+
+        set_profile_inner("default/linux/amd64/23.0", &locations, &link)
+            .await
+            .expect("should return Ok even when profile is missing");
+
+        assert!(
+            !link.exists(),
+            "symlink must not be created when profile dir is absent"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_profile_skips_empty_or_unknown_profile() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let link = tmp.path().join("make.profile");
+
+        set_profile_inner("", &[], &link)
+            .await
+            .expect("empty profile should return Ok");
+        set_profile_inner("unknown", &[], &link)
+            .await
+            .expect("unknown profile should return Ok");
+
+        assert!(!link.exists(), "no symlink should be created");
     }
 }

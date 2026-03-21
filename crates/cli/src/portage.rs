@@ -1192,15 +1192,45 @@ fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
     let a_parts: Vec<&str> = a_base.split(['.', '_']).collect();
     let b_parts: Vec<&str> = b_base.split(['.', '_']).collect();
 
-    let suffix_order = |s: &str| -> i32 {
-        match s {
-            "alpha" => -4,
-            "beta" => -3,
-            "pre" => -2,
-            "rc" => -1,
-            "p" => 1,
-            _ => 0,
+    /// Map a PMS suffix kind (e.g. "alpha", "rc", "p") with an optional
+    /// numeric component to a single integer ordering key.
+    ///
+    /// `base` encodes the kind precedence (alpha < beta < pre < rc < none < p),
+    /// and the numeric part refines the order within the same kind:
+    /// e.g. alpha0 < alpha1 < alpha2, p1 < p2, etc.
+    fn suffix_kind_with_number(s: &str, prefix: &str, base: i32) -> Option<i32> {
+        if !s.starts_with(prefix) {
+            return None;
         }
+        let rest = &s[prefix.len()..];
+        // SCALE must be large enough that numeric differences do not cause
+        // ranges for different bases to overlap.
+        const SCALE: i32 = 10_000;
+        if rest.is_empty() {
+            // No numeric part — treat as kind0.
+            return Some(base * SCALE);
+        }
+        // Only a PMS suffix with number if the remainder is all digits.
+        if !rest.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let num: i32 = match rest.parse() {
+            Ok(n) => n,
+            Err(_) => return None,
+        };
+        Some(base * SCALE + num)
+    }
+
+    let suffix_order = |s: &str| -> i32 {
+        // PMS suffix ordering (kind, then numeric): _alpha < _beta < _pre < _rc
+        // < (no suffix) < _p.  Unnumbered forms like "_alpha" are treated as
+        // "_alpha0"; numbered forms like "_alpha1" increment within the kind.
+        suffix_kind_with_number(s, "alpha", -4)
+            .or_else(|| suffix_kind_with_number(s, "beta", -3))
+            .or_else(|| suffix_kind_with_number(s, "pre", -2))
+            .or_else(|| suffix_kind_with_number(s, "rc", -1))
+            .or_else(|| suffix_kind_with_number(s, "p", 1))
+            .unwrap_or(0)
     };
 
     /// Split a version component into its numeric prefix and optional
@@ -1391,6 +1421,25 @@ VIDEO_CARDS="amdgpu radeonsi"
         assert_eq!(compare_versions("1.0_pre", "1.0_rc"), Ordering::Less);
         assert_eq!(compare_versions("1.0_rc", "1.0"), Ordering::Less);
         assert_eq!(compare_versions("1.0", "1.0_p"), Ordering::Less);
+    }
+
+    #[test]
+    fn compare_versions_numeric_suffixes() {
+        use std::cmp::Ordering;
+        // Unnumbered suffix is treated as number 0:
+        // _alpha == _alpha0 < _alpha1 < _alpha2 < _beta
+        assert_eq!(compare_versions("1.0_alpha", "1.0_alpha0"), Ordering::Equal);
+        assert_eq!(compare_versions("1.0_alpha", "1.0_alpha1"), Ordering::Less);
+        assert_eq!(compare_versions("1.0_alpha1", "1.0_alpha2"), Ordering::Less);
+        assert_eq!(compare_versions("1.0_alpha2", "1.0_beta"), Ordering::Less);
+        // _rc1 < _rc2 < release < _p1 < _p2
+        assert_eq!(compare_versions("1.0_rc1", "1.0_rc2"), Ordering::Less);
+        assert_eq!(compare_versions("1.0_rc2", "1.0"), Ordering::Less);
+        assert_eq!(compare_versions("1.0_p1", "1.0_p2"), Ordering::Less);
+        assert_eq!(compare_versions("1.0", "1.0_p1"), Ordering::Less);
+        // Date-style _p suffix (common for gentoo-kernel-bin etc.)
+        assert_eq!(compare_versions("1.0_p20230101", "1.0_p20240101"), Ordering::Less);
+        assert_eq!(compare_versions("1.0_p20240101", "1.0_p20240101"), Ordering::Equal);
     }
 
     #[test]
