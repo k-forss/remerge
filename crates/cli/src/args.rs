@@ -258,12 +258,14 @@ impl Cli {
 
     /// Extract package atoms from emerge arguments.
     ///
-    /// Anything that doesn't start with `-` and looks like a portage atom
-    /// (contains `/` or is a set like `@world`) is treated as an atom.
+    /// Anything that doesn't start with `-` is treated as a potential atom.
+    /// This covers qualified (`www-client/firefox`), unqualified (`firefox`),
+    /// versioned (`=www-client/firefox-128.0`), and set (`@world`) forms.
+    /// Emerge itself will reject truly invalid atoms.
     fn extract_atoms(&self) -> Vec<String> {
         self.emerge_args
             .iter()
-            .filter(|a| !a.starts_with('-') && (a.contains('/') || a.starts_with('@')))
+            .filter(|a| !a.starts_with('-'))
             .cloned()
             .collect()
     }
