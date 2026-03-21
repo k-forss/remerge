@@ -124,9 +124,9 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
 
     let image_tag = state.docker.image_tag(&workorder.system_id);
 
-    // Build image if it doesn't exist.
-    if !state.docker.image_exists(&image_tag).await {
-        info!(%image_tag, "Worker image not found — building");
+    // Build image if it doesn't exist or the worker binary has changed.
+    if state.docker.image_needs_rebuild(&image_tag).await {
+        info!(%image_tag, "Worker image needs (re)building");
         if let Err(e) = state
             .docker
             .build_worker_image(&workorder.system_id, &image_tag)
@@ -232,7 +232,7 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
     // Create the stdin channel so the WebSocket handler can forward input.
     let mut stdin_rx = state.create_stdin_channel(id).await;
 
-    let log_handle = tokio::spawn(async move {
+    let mut log_handle = tokio::spawn(async move {
         let re_emerging = Regex::new(r">>> Emerging \(\d+ of \d+\) (.+)::").unwrap();
         let re_completed = Regex::new(r">>> Completed \(\d+ of \d+\) (.+)::").unwrap();
         let re_error = Regex::new(r"\* ERROR: (.+)::(\S+) failed").unwrap();
@@ -385,11 +385,17 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
     // Give the log stream a moment to flush final lines, then abort if
     // it hasn't finished.  This avoids losing the last few log lines.
     tokio::select! {
-        _ = log_handle => {},
-        _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
-            warn!("Log stream did not finish within 2 s — aborting");
+        _ = &mut log_handle => {},
+        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+            warn!("Log stream did not finish within 5 s — aborting");
+            log_handle.abort();
         }
     }
+
+    // Close the raw PTY channel *before* sending Finished so the WS
+    // handler transitions to text-only mode and is guaranteed to pick
+    // up the Finished event on the progress channel.
+    state.raw_output_txs.write().await.remove(&id);
 
     info!(?id, exit_code, "Worker container finished");
 
@@ -513,6 +519,10 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
             .map(|p| p.atom.clone())
             .collect();
 
+        // Store result before broadcasting Finished so the client's
+        // REST fetch (triggered by the Finished event) always finds it.
+        state.results.write().await.insert(id, result);
+
         let _ = tx.send(BuildProgress {
             workorder_id: id,
             event: BuildEvent::Finished {
@@ -522,7 +532,6 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
             timestamp: Utc::now(),
         });
 
-        state.results.write().await.insert(id, result);
         state
             .metrics
             .workorders_completed
@@ -575,6 +584,10 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
             .map(|p| p.atom.clone())
             .collect();
 
+        // Store result before broadcasting Finished so the client's
+        // REST fetch (triggered by the Finished event) always finds it.
+        state.results.write().await.insert(id, result);
+
         let _ = tx.send(BuildProgress {
             workorder_id: id,
             event: BuildEvent::Finished {
@@ -583,8 +596,6 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
             },
             timestamp: Utc::now(),
         });
-
-        state.results.write().await.insert(id, result);
 
         state
             .metrics
