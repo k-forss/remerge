@@ -291,10 +291,25 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
             .await
             .context("Failed to create worker container")?;
 
-        self.docker
+        if let Err(e) = self
+            .docker
             .start_container(&resp.id, None::<StartContainerOptions>)
             .await
-            .context("Failed to start worker container")?;
+        {
+            // Container was created but failed to start — remove it so the
+            // name is freed for future attempts.
+            let _ = self
+                .docker
+                .remove_container(
+                    &resp.id,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            return Err(e).context("Failed to start worker container");
+        }
 
         info!(id = %resp.id, "Worker container started");
         Ok(resp.id)
