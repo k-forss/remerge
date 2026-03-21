@@ -21,6 +21,7 @@ permissions:
   actions: write
   contents: write
   pull-requests: write
+  statuses: write
 
 jobs:
   prepare:
@@ -364,10 +365,41 @@ jobs:
             echo "::notice::Created PR for v${VERSION}"
           fi
 
-      # Signed commits use GITHUB_TOKEN and do not trigger push/pull_request
-      # events, so CI never runs on the prepare commit. Dispatch it explicitly
-      # so the required status checks appear on the PR.
-      - name: Trigger CI on prepare commit
+      # Signed commits use GITHUB_TOKEN and do not trigger pull_request
+      # events, so required status checks never appear on the auto-created PR.
+      # The push-triggered CI already ran on this commit. Mirror its results
+      # as commit statuses so the ruleset's required_status_checks are satisfied.
+      - name: Report CI status on prepare commit
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh workflow run ci.yml --ref "$GITHUB_REF_NAME"
+        run: |
+          # Resolve the HEAD commit on the remote (may differ from checkout if
+          # the signed-commit step created a new commit).
+          HEAD_SHA=$(git ls-remote origin "$GITHUB_REF_NAME" | awk '{print $1}')
+          echo "::notice::Reporting status on ${HEAD_SHA:0:8}"
+
+          # Wait for the push-triggered CI to finish (up to 10 min).
+          for i in $(seq 1 60); do
+            STATUS=$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/check-runs?check_name=Test" \
+              --jq '.check_runs[0].status // "missing"')
+            if [ "$STATUS" = "completed" ]; then break; fi
+            echo "Waiting for CI… ($i/60)"
+            sleep 10
+          done
+
+          # Read results and post commit statuses.
+          for CHECK in "Check & Lint" "Test"; do
+            ENCODED=$(python3 -c "import urllib.parse as u; print(u.quote('$CHECK'))")
+            RESULT=$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/check-runs?check_name=$ENCODED" \
+              --jq '.check_runs[0] | {conclusion, url: .html_url}')
+            CONCLUSION=$(echo "$RESULT" | jq -r '.conclusion')
+            URL=$(echo "$RESULT" | jq -r '.url')
+            STATE=$([ "$CONCLUSION" = "success" ] && echo "success" || echo "failure")
+            gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+              -f state="$STATE" \
+              -f context="$CHECK" \
+              -f description="$CONCLUSION (from push CI)" \
+              -f target_url="$URL" --silent
+            echo "::notice::$CHECK → $STATE"
+          done
+
