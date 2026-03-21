@@ -510,14 +510,57 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
         })
         .await;
 
+        // Store a result even on failure so the client's REST fetch
+        // returns something useful instead of "no result".
+        let result = WorkorderResult {
+            workorder_id: id,
+            built_packages: built_atoms
+                .iter()
+                .map(|atom| BuiltPackage {
+                    atom: atom.clone(),
+                    binpkg_path: format!("{atom}.gpkg.tar"),
+                    sha256: String::new(),
+                    size: 0,
+                })
+                .collect(),
+            failed_packages: if failed_atoms.is_empty() {
+                // No structured failure events — report all atoms as failed.
+                workorder
+                    .atoms
+                    .iter()
+                    .map(|atom| FailedPackage {
+                        atom: atom.clone(),
+                        reason: reason.clone(),
+                        build_log: None,
+                    })
+                    .collect()
+            } else {
+                failed_atoms
+            },
+            binhost_uri: state.config.binhost_url.clone(),
+        };
+
+        let built_list: Vec<String> = result
+            .built_packages
+            .iter()
+            .map(|p| p.atom.clone())
+            .collect();
+        let failed_list: Vec<String> = result
+            .failed_packages
+            .iter()
+            .map(|p| p.atom.clone())
+            .collect();
+
         let _ = tx.send(BuildProgress {
             workorder_id: id,
             event: BuildEvent::Finished {
-                built: Vec::new(),
-                failed: workorder.atoms.clone(),
+                built: built_list,
+                failed: failed_list,
             },
             timestamp: Utc::now(),
         });
+
+        state.results.write().await.insert(id, result);
 
         state
             .metrics

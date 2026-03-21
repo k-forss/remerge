@@ -120,6 +120,15 @@ impl PortageReader {
             Ok(resolved_use) => {
                 let flags: Vec<String> =
                     resolved_use.split_whitespace().map(String::from).collect();
+
+                // `portageq envvar USE` returns the *fully expanded* USE
+                // string, which includes USE_EXPAND flags like `abi_x86_32`,
+                // `python_targets_python3_12`, etc.  These must be stripped
+                // because they're sent separately as USE_EXPAND variables
+                // and would conflict if duplicated in the USE line (causing
+                // slot conflicts with ABI_X86, PYTHON_TARGETS, etc.).
+                let flags = Self::strip_use_expand_flags(flags);
+
                 info!(
                     count = flags.len(),
                     "Resolved USE flags via portageq (includes profile defaults)"
@@ -146,7 +155,10 @@ impl PortageReader {
         };
 
         // ── Collect USE_EXPAND variables ─────────────────────────────
+        // Use portageq to resolve these too, so profile defaults (e.g.
+        // PYTHON_TARGETS from eselect) are captured.
         let use_expand_keys = [
+            "ABI_X86",
             "VIDEO_CARDS",
             "INPUT_DEVICES",
             "L10N",
@@ -158,7 +170,17 @@ impl PortageReader {
         ];
         let mut use_expand = BTreeMap::new();
         for key in &use_expand_keys {
-            let vals = split_flags(key);
+            // Try portageq first for fully-resolved values, fall back to make.conf.
+            let vals = match Self::portageq_envvar(key) {
+                Ok(resolved) => {
+                    let v: Vec<String> = resolved.split_whitespace().map(String::from).collect();
+                    if !v.is_empty() {
+                        debug!(key, ?v, "USE_EXPAND resolved via portageq");
+                    }
+                    v
+                }
+                Err(_) => split_flags(key),
+            };
             if !vals.is_empty() {
                 use_expand.insert((*key).to_string(), vals);
             }
@@ -673,6 +695,69 @@ impl PortageReader {
             .context("portageq output is not valid UTF-8")?
             .trim()
             .to_string())
+    }
+
+    /// Strip USE_EXPAND flags from a resolved USE flag list.
+    ///
+    /// `portageq envvar USE` returns every flag including expanded forms like
+    /// `abi_x86_32`, `python_targets_python3_12`, `video_cards_amdgpu`, etc.
+    /// These must be removed because the corresponding USE_EXPAND variables
+    /// (`ABI_X86`, `PYTHON_TARGETS`, `VIDEO_CARDS`) are sent separately.
+    /// Keeping them in USE would cause slot conflicts in the worker container
+    /// (e.g. forcing ABI_X86="32 64" on a non-multilib container).
+    ///
+    /// We query `portageq envvar USE_EXPAND` for the authoritative list of
+    /// USE_EXPAND variable names, then filter any flag matching their
+    /// lowercased prefix.
+    fn strip_use_expand_flags(flags: Vec<String>) -> Vec<String> {
+        // Get the list of USE_EXPAND variables from portage.
+        let prefixes: Vec<String> = match Self::portageq_envvar("USE_EXPAND") {
+            Ok(expand_str) => expand_str
+                .split_whitespace()
+                .map(|var| format!("{}_", var.to_ascii_lowercase()))
+                .collect(),
+            Err(e) => {
+                // Fall back to a hardcoded list of common USE_EXPAND vars.
+                warn!(%e, "Could not query USE_EXPAND — using hardcoded fallback");
+                [
+                    "ABI_X86",
+                    "ABI_MIPS",
+                    "ABI_S390",
+                    "CPU_FLAGS_X86",
+                    "CPU_FLAGS_ARM",
+                    "PYTHON_TARGETS",
+                    "PYTHON_SINGLE_TARGET",
+                    "RUBY_TARGETS",
+                    "LUA_TARGETS",
+                    "LUA_SINGLE_TARGET",
+                    "VIDEO_CARDS",
+                    "INPUT_DEVICES",
+                    "L10N",
+                ]
+                .iter()
+                .map(|var| format!("{}_", var.to_ascii_lowercase()))
+                .collect()
+            }
+        };
+
+        let before = flags.len();
+        let filtered: Vec<String> = flags
+            .into_iter()
+            .filter(|flag| {
+                !prefixes
+                    .iter()
+                    .any(|prefix| flag.starts_with(prefix.as_str()))
+            })
+            .collect();
+        let stripped = before - filtered.len();
+        if stripped > 0 {
+            debug!(
+                stripped,
+                remaining = filtered.len(),
+                "Stripped USE_EXPAND flags from resolved USE"
+            );
+        }
+        filtered
     }
 }
 
