@@ -18,6 +18,7 @@ on:
     branches: ["rc-*"]
 
 permissions:
+  actions: write
   contents: write
   pull-requests: write
 
@@ -325,7 +326,18 @@ jobs:
             echo "::notice::Created $SRV_BIN"
           fi
 
+      - name: Check if prepare commit already exists
+        id: check-existing
+        run: |
+          git fetch origin "$GITHUB_REF_NAME"
+          HEAD_MSG=$(git log -1 --format="%s" "origin/$GITHUB_REF_NAME")
+          if [[ "$HEAD_MSG" == "release: prepare"* ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Prepare commit already exists on remote, skipping commit"
+          fi
+
       - name: Commit and push (signed)
+        if: steps.check-existing.outputs.skip != 'true'
         uses: ryancyq/github-signed-commit@v1
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -351,3 +363,11 @@ jobs:
               --head "$GITHUB_REF_NAME"
             echo "::notice::Created PR for v${VERSION}"
           fi
+
+      # Signed commits use GITHUB_TOKEN and do not trigger push/pull_request
+      # events, so CI never runs on the prepare commit. Dispatch it explicitly
+      # so the required status checks appear on the PR.
+      - name: Trigger CI on prepare commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run ci.yml --ref "$GITHUB_REF_NAME"
