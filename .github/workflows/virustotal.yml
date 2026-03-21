@@ -1,13 +1,22 @@
-# Scan all release assets with VirusTotal after a release is published.
+# Scan all release assets with VirusTotal.
 #
-# Results are appended to the GitHub Release body as analysis links.
+# Dispatched by the Release workflow after publishing the GitHub Release.
+# Results are appended to the release body as analysis links.
 # Requires a VT_API_KEY repository secret (free tier works fine).
+#
+# Why workflow_dispatch instead of `release: published`?
+# The GitHub Release is created with GITHUB_TOKEN (via softprops/action-gh-release),
+# and GITHUB_TOKEN-triggered events don't fire subsequent workflow events.  The
+# Release workflow dispatches this one explicitly after the release is published.
 
 name: VirusTotal Scan
 
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to scan (e.g. v0.1.0)"
+        required: true
 
 permissions:
   contents: write   # needed to update release body
@@ -17,14 +26,66 @@ jobs:
     name: Scan release assets
     runs-on: ubuntu-latest
     steps:
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p assets
+          gh release download "${{ inputs.tag }}" \
+            -R "${{ github.repository }}" \
+            -D assets \
+            --pattern '*.tar.gz' \
+            --pattern '*SHA256SUMS*'
+          echo "::group::Downloaded assets"
+          ls -la assets/
+          echo "::endgroup::"
+
       - name: VirusTotal Scan
         uses: crazy-max/ghaction-virustotal@v5
+        id: vt
         with:
           vt_api_key: ${{ secrets.VT_API_KEY }}
-          update_release_body: true
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          request_rate: 4  # free-tier rate limit
+          request_rate: 4
           files: |
-            .tar.gz$
-            SHA256SUMS
-            .asc$
+            assets/*
+
+      - name: Append VT results to release body
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VT_ANALYSIS: ${{ steps.vt.outputs.analysis }}
+        run: |
+          TAG="${{ inputs.tag }}"
+
+          # Build VT results table (stable marker used for idempotent re-runs)
+          {
+            echo ""
+            echo "<!-- vt-start -->"
+            echo "---"
+            echo ""
+            echo "### 🛡️ VirusTotal Analysis"
+            echo ""
+            echo "| File | VirusTotal Analysis |"
+            echo "| ---- | ---- |"
+            while IFS= read -r line; do
+              [[ -z "$line" ]] && continue
+              file="${line%%=*}"
+              url="${line#*=}"
+              name=$(basename "$file")
+              echo "| \`${name}\` | [View Analysis](${url}) |"
+            done <<< "$VT_ANALYSIS"
+          } > /tmp/vt-section.md
+
+          # Fetch existing body, strip any previous VT section, then append
+          gh release view "$TAG" \
+            -R "${{ github.repository }}" \
+            --json body -q '.body' > /tmp/release-body.md
+
+          # Idempotent: remove any previously-appended VT section
+          python3 -c "body = open('/tmp/release-body.md').read(); marker = '\n<!-- vt-start -->'; idx = body.find(marker); import sys; \
+if idx >= 0: body = body[:idx]; open('/tmp/release-body.md', 'w').write(body)"
+
+          cat /tmp/vt-section.md >> /tmp/release-body.md
+
+          gh release edit "$TAG" \
+            -R "${{ github.repository }}" \
+            --notes-file /tmp/release-body.md

@@ -66,3 +66,10 @@ jobs:
           gh workflow run release.yml \
             --ref "v${{ steps.version.outputs.version }}" \
             -f tag="v${{ steps.version.outputs.version }}"
+
+      - name: Dispatch Docker build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run docker.yml \
+            --ref "v${{ steps.version.outputs.version }}"
