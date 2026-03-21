@@ -36,6 +36,20 @@ pub async fn process_queue(state: Arc<AppState>) {
         };
 
         if let Some(workorder) = next {
+            // Mark as Provisioning *before* spawning so the queue loop
+            // never picks up the same workorder on the next iteration.
+            {
+                let mut workorders = state.workorders.write().await;
+                if let Some(w) = workorders.get_mut(&workorder.id) {
+                    if w.status != WorkorderStatus::Pending {
+                        // Another task already claimed it — skip.
+                        continue;
+                    }
+                    w.status = WorkorderStatus::Provisioning;
+                    w.updated_at = chrono::Utc::now();
+                }
+            }
+
             // Acquire a semaphore permit before starting the container.
             let permit = state.worker_semaphore.clone().acquire_owned().await;
             match permit {
@@ -122,11 +136,23 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
                 reason: reason.clone(),
             })
             .await;
+            let _ = tx.send(BuildProgress {
+                workorder_id: id,
+                event: BuildEvent::Finished {
+                    built: Vec::new(),
+                    failed: workorder.atoms.clone(),
+                },
+                timestamp: Utc::now(),
+            });
             state.metrics.builds_active.fetch_sub(1, Ordering::Relaxed);
             state
                 .metrics
                 .workorders_failed
                 .fetch_add(1, Ordering::Relaxed);
+            state
+                .clients
+                .clear_active_workorder(&workorder.client_id)
+                .await;
             return Err(e);
         }
     }
@@ -156,11 +182,23 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
                 reason: reason.clone(),
             })
             .await;
+            let _ = tx.send(BuildProgress {
+                workorder_id: id,
+                event: BuildEvent::Finished {
+                    built: Vec::new(),
+                    failed: workorder.atoms.clone(),
+                },
+                timestamp: Utc::now(),
+            });
             state.metrics.builds_active.fetch_sub(1, Ordering::Relaxed);
             state
                 .metrics
                 .workorders_failed
                 .fetch_add(1, Ordering::Relaxed);
+            state
+                .clients
+                .clear_active_workorder(&workorder.client_id)
+                .await;
             return Err(e);
         }
     };
