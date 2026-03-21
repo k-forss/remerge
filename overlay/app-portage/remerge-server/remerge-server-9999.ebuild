@@ -20,7 +20,7 @@ RDEPEND="
 	!app-portage/remerge-server-bin
 "
 
-QA_FLAGS_IGNORED="usr/bin/remerge-server"
+QA_FLAGS_IGNORED="usr/bin/remerge-server usr/bin/remerge-worker"
 
 src_unpack() {
 	git-r3_src_unpack
@@ -32,7 +32,7 @@ src_configure() {
 }
 
 src_compile() {
-	cargo_src_compile --package remerge-server
+	cargo_src_compile --package remerge-server --package remerge-worker
 }
 
 src_test() {
@@ -41,6 +41,7 @@ src_test() {
 
 src_install() {
 	cargo_src_install --path crates/server
+	cargo_src_install --path crates/worker
 
 	# Configuration
 	insinto /etc/remerge

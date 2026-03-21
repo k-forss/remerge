@@ -75,15 +75,19 @@ jobs:
             arch: ppc64
             cross: true
           # Server — amd64 + arm64 only
+          # Each server build also compiles remerge-worker so the server
+          # can inject it into Docker images at runtime.
           - name: remerge-server-amd64
             target: x86_64-unknown-linux-gnu
             binary: remerge-server
+            extra_binary: remerge-worker
             package: remerge-server
             arch: amd64
             cross: false
           - name: remerge-server-arm64
             target: aarch64-unknown-linux-gnu
             binary: remerge-server
+            extra_binary: remerge-worker
             package: remerge-server
             arch: arm64
             cross: true
@@ -111,10 +115,23 @@ jobs:
             cargo build --release --target ${{ matrix.target }} --bin ${{ matrix.binary }}
           fi
 
+      - name: Build worker binary
+        if: matrix.extra_binary
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} --bin ${{ matrix.extra_binary }}
+          else
+            cargo build --release --target ${{ matrix.target }} --bin ${{ matrix.extra_binary }}
+          fi
+
       - name: Package
         run: |
+          EXTRA=""
+          if [ -n "${{ matrix.extra_binary }}" ]; then
+            EXTRA="${{ matrix.extra_binary }}"
+          fi
           tar czf ${{ matrix.binary }}-${{ github.ref_name }}-${{ matrix.arch }}-linux.tar.gz \
-            -C target/${{ matrix.target }}/release ${{ matrix.binary }}
+            -C target/${{ matrix.target }}/release ${{ matrix.binary }} $EXTRA
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7

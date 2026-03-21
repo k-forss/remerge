@@ -281,13 +281,14 @@ jobs:
 
           VERIFY_SIG_OPENPGP_KEY_PATH="/usr/share/openpgp-keys/remerge.asc"
 
-          QA_PREBUILT="usr/bin/remerge-server"
+          QA_PREBUILT="usr/bin/remerge-server usr/bin/remerge-worker"
 
           S="${WORKDIR}"
 
           src_install() {
           	exeinto /usr/bin
           	doexe remerge-server
+          	doexe remerge-worker
 
           	insinto /etc/remerge
           	newins - server.toml <<-EOF
