@@ -600,7 +600,7 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
 
     // ── 7. Cleanup ──────────────────────────────────────────────────
     state.container_ids.write().await.remove(&id);
-    state.remove_stdin_channel(&id).await;
+    state.remove_workorder_channels(&id).await;
     state
         .clients
         .clear_active_workorder(&workorder.client_id)

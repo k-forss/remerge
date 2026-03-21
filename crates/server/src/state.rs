@@ -160,10 +160,12 @@ impl AppState {
         self.stdin_txs.read().await.get(id).cloned()
     }
 
-    /// Remove the stdin channel when a workorder finishes.
-    pub async fn remove_stdin_channel(&self, id: &WorkorderId) {
-        self.stdin_txs.write().await.remove(id);
-        self.raw_output_txs.write().await.remove(id);
+    /// Remove all per-workorder channels (progress, raw output, stdin) when a
+    /// workorder finishes.  Progress is removed first to preserve the invariant
+    /// that a visible progress channel implies a live raw output channel.
+    pub async fn remove_workorder_channels(&self, id: &WorkorderId) {
         self.progress_txs.write().await.remove(id);
+        self.raw_output_txs.write().await.remove(id);
+        self.stdin_txs.write().await.remove(id);
     }
 }
