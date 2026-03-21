@@ -1,8 +1,10 @@
-# Create a release tag when an RC branch is merged to main.
+# Create a release tag and trigger the release pipeline when an RC
+# branch is merged to main.
 #
 # This workflow runs when a pull request from an `rc-*` branch is merged
-# into `main`.  It extracts the version from the branch name and creates
-# an annotated tag `v<version>`, which triggers the Release workflow.
+# into `main`.  It extracts the version from the branch name, creates
+# a signed annotated tag `v<version>` via the GitHub API, and dispatches
+# the Release workflow to build binaries and publish a GitHub Release.
 
 name: Tag Release
 
@@ -13,6 +15,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   tag:
@@ -55,3 +58,11 @@ jobs:
             -f sha="${TAG_SHA}"
 
           echo "::notice::Created signed tag v${VERSION} at ${COMMIT_SHA}"
+
+      - name: Dispatch release workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run release.yml \
+            --ref "v${{ steps.version.outputs.version }}" \
+            -f tag="v${{ steps.version.outputs.version }}"
