@@ -428,12 +428,10 @@ async fn ws_progress(
         .await
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    // Raw PTY output channel — the raw channel is inserted before the progress
-    // channel in create_progress_channel, so it is guaranteed to exist here.
-    let raw_rx = state
-        .subscribe_raw_output(&id)
-        .await
-        .ok_or(StatusCode::NOT_FOUND)?;
+    // Raw PTY output channel — may be absent if the workorder has already
+    // finished streaming (the sender was removed before this connection
+    // arrived).  In that case the WS handler starts in text-only mode.
+    let raw_rx = state.subscribe_raw_output(&id).await;
 
     let ws_state = state.clone();
 
@@ -443,7 +441,7 @@ async fn ws_progress(
 async fn handle_ws(
     socket: ws::WebSocket,
     mut rx: tokio::sync::broadcast::Receiver<BuildProgress>,
-    mut raw_rx: tokio::sync::broadcast::Receiver<bytes::Bytes>,
+    raw_rx: Option<tokio::sync::broadcast::Receiver<bytes::Bytes>>,
     state: SharedState,
     workorder_id: uuid::Uuid,
 ) {
@@ -457,7 +455,10 @@ async fn handle_ws(
         use futures::SinkExt;
         use tokio::sync::broadcast::error::RecvError;
 
-        let mut raw_done = false;
+        // Start in text-only mode if the raw channel is already gone
+        // (workorder finished streaming before this WS connection arrived).
+        let mut raw_done = raw_rx.is_none();
+        let mut raw_rx = raw_rx;
 
         loop {
             if raw_done {
@@ -489,9 +490,11 @@ async fn handle_ws(
                     Err(RecvError::Closed) => break,
                 }
             } else {
+                // raw_done is false only when raw_rx is Some — unwrap is safe.
+                let raw_recv = raw_rx.as_mut().unwrap();
                 tokio::select! {
                     biased; // prefer raw output — highest throughput path
-                    result = raw_rx.recv() => {
+                    result = raw_recv.recv() => {
                         match result {
                             Ok(bytes) => {
                                 if ws_write.send(ws::Message::Binary(bytes)).await.is_err() {
