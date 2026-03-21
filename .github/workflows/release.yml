@@ -178,3 +178,59 @@ jobs:
           gh workflow run virustotal.yml \
             --ref "$TAG" \
             -f tag="$TAG"
+
+  # ── Generate overlay Manifest files ───────────────────────────────
+  manifests:
+    name: Generate overlay manifests
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Generate Manifest files
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          python3 scripts/generate-manifests.py "$VERSION"
+
+      - name: Create manifest PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          BRANCH="chore/manifests-v${VERSION}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add overlay/
+
+          if git diff --cached --quiet; then
+            echo "::notice::No manifest changes needed"
+            exit 0
+          fi
+
+          git commit -m "chore: generate overlay Manifest files for v${VERSION}"
+          git push origin "$BRANCH"
+
+          cat > /tmp/pr-body.md << 'EOF'
+          Auto-generated Manifest files for the overlay ebuilds.
+
+          These are required by portage to verify distfile integrity
+          when installing from the overlay.
+
+          > **Note:** If PGP signing hasn't completed yet, `.asc`
+          > entries may be missing.  Users enabling `verify-sig` can
+          > regenerate locally with `ebuild <path> manifest`.
+          EOF
+
+          gh pr create \
+            --title "chore: overlay Manifest files for v${VERSION}" \
+            --body-file /tmp/pr-body.md \
+            --base main
