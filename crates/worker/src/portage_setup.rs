@@ -593,7 +593,7 @@ async fn write_profile_overlay_inner(base: &Path, config: &PortageConfig) -> Res
 
     info!(
         count = config.profile_overlay.len(),
-        "Wrote {} profile overlay files",
+        "Wrote profile overlay files into {}",
         base.display()
     );
     Ok(())
@@ -737,7 +737,7 @@ async fn write_patches_inner(base: &Path, config: &PortageConfig) -> Result<()> 
 
     info!(
         count = config.patches.len(),
-        "Wrote {} patch files",
+        "Wrote patch files to {}",
         base.display()
     );
     Ok(())

@@ -1192,36 +1192,36 @@ fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
     let a_parts: Vec<&str> = a_base.split(['.', '_']).collect();
     let b_parts: Vec<&str> = b_base.split(['.', '_']).collect();
 
-    /// Map a PMS suffix kind (e.g. "alpha", "rc", "p") with an optional
-    /// numeric component to a single integer ordering key.
+    /// Identify a PMS suffix kind (e.g. "alpha", "rc", "p") with an optional
+    /// numeric component, returning a `(kind_order, numeric_part)` tuple that
+    /// can be compared directly.
     ///
-    /// `base` encodes the kind precedence (alpha < beta < pre < rc < none < p),
-    /// and the numeric part refines the order within the same kind:
-    /// e.g. alpha0 < alpha1 < alpha2, p1 < p2, etc.
-    fn suffix_kind_with_number(s: &str, prefix: &str, base: i32) -> Option<i32> {
+    /// `kind_order` encodes precedence (alpha < beta < pre < rc < none < p),
+    /// and `numeric_part` refines the order within the same kind:
+    /// e.g. alpha0 < alpha1 < alpha2, p1 < p2, p20230101 < p20240101.
+    fn suffix_kind_with_number(s: &str, prefix: &str, kind: i32) -> Option<(i32, u64)> {
         if !s.starts_with(prefix) {
             return None;
         }
         let rest = &s[prefix.len()..];
-        // SCALE must be large enough that numeric differences do not cause
-        // ranges for different bases to overlap.
-        const SCALE: i32 = 10_000;
         if rest.is_empty() {
-            // No numeric part — treat as kind0.
-            return Some(base * SCALE);
+            // Unnumbered suffix — treat as kind0.
+            return Some((kind, 0));
         }
-        // Only a PMS suffix with number if the remainder is all digits.
+        // Only a PMS suffix with a number if the remainder is all digits.
         if !rest.chars().all(|c| c.is_ascii_digit()) {
             return None;
         }
-        let num: i32 = match rest.parse() {
+        let num: u64 = match rest.parse() {
             Ok(n) => n,
             Err(_) => return None,
         };
-        Some(base * SCALE + num)
+        Some((kind, num))
     }
 
-    let suffix_order = |s: &str| -> i32 {
+    // Returns `Some((kind_order, numeric_part))` for PMS suffixes, or
+    // `None` for a plain version component that is not a suffix keyword.
+    let suffix_order = |s: &str| -> Option<(i32, u64)> {
         // PMS suffix ordering (kind, then numeric): _alpha < _beta < _pre < _rc
         // < (no suffix) < _p.  Unnumbered forms like "_alpha" are treated as
         // "_alpha0"; numbered forms like "_alpha1" increment within the kind.
@@ -1230,7 +1230,6 @@ fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
             .or_else(|| suffix_kind_with_number(s, "pre", -2))
             .or_else(|| suffix_kind_with_number(s, "rc", -1))
             .or_else(|| suffix_kind_with_number(s, "p", 1))
-            .unwrap_or(0)
     };
 
     /// Split a version component into its numeric prefix and optional
@@ -1258,21 +1257,29 @@ fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
         let sa = suffix_order(pa);
         let sb = suffix_order(pb);
 
-        if sa != 0 || sb != 0 {
-            // At least one side is a suffix keyword.
-            if sa != 0 && sb != 0 {
-                let cmp = sa.cmp(&sb);
+        match (sa, sb) {
+            (Some(a_key), Some(b_key)) => {
+                // Both are PMS suffix components — compare as tuples.
+                let cmp = a_key.cmp(&b_key);
                 if cmp != Ordering::Equal {
                     return cmp;
                 }
                 continue;
             }
-            // One is a suffix, the other is not — the suffix side
-            // modifies the preceding version component.
-            if sa != 0 {
-                return sa.cmp(&0i32);
+            (Some(a_key), None) => {
+                // `pa` is a suffix, `pb` is a plain component: the suffix
+                // modifies the preceding numeric part.  Negative kind_order
+                // means the suffix makes the version smaller than the plain
+                // component (e.g. `1.0_rc` < `1.0`); positive means larger
+                // (e.g. `1.0_p` > `1.0`).
+                return a_key.0.cmp(&0i32);
             }
-            return 0i32.cmp(&sb);
+            (None, Some(b_key)) => {
+                return 0i32.cmp(&b_key.0);
+            }
+            (None, None) => {
+                // Neither is a suffix — fall through to numeric/letter comparison.
+            }
         }
 
         // Split each component into numeric + optional trailing letter.
