@@ -243,6 +243,10 @@ impl Cli {
                     .collect::<Vec<_>>()
                     .join(", ")
             );
+            anyhow::bail!(
+                "Remote build failed: {} package(s) failed",
+                result.failed_packages.len()
+            );
         }
 
         if self.no_local {

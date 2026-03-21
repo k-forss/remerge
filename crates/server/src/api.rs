@@ -10,7 +10,7 @@ use axum::{
     response::IntoResponse,
     routing::{delete, get, post},
 };
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use futures::StreamExt;
@@ -428,52 +428,115 @@ async fn ws_progress(
         .await
         .ok_or(StatusCode::NOT_FOUND)?;
 
+    // Raw PTY output channel — the raw channel is inserted before the progress
+    // channel in create_progress_channel, so it is guaranteed to exist here.
+    let raw_rx = state
+        .subscribe_raw_output(&id)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
+
     let ws_state = state.clone();
 
-    Ok(ws.on_upgrade(move |socket| handle_ws(socket, rx, ws_state, id)))
+    Ok(ws.on_upgrade(move |socket| handle_ws(socket, rx, raw_rx, ws_state, id)))
 }
 
 async fn handle_ws(
     socket: ws::WebSocket,
     mut rx: tokio::sync::broadcast::Receiver<BuildProgress>,
+    mut raw_rx: tokio::sync::broadcast::Receiver<bytes::Bytes>,
     state: SharedState,
     workorder_id: uuid::Uuid,
 ) {
     let (mut ws_write, mut ws_read) = socket.split();
 
-    // Task 1: Forward build progress events to the client.
+    // Task 1: Forward raw PTY output as Binary frames and structured
+    // build events as Text frames.  Binary frames carry the lossless
+    // terminal byte stream; Text frames carry only status / result events
+    // (StatusChanged, PackageBuilt, PackageFailed, Finished).
     let send_task = tokio::spawn(async move {
+        use futures::SinkExt;
+        use tokio::sync::broadcast::error::RecvError;
+
+        let mut raw_done = false;
+
         loop {
-            match rx.recv().await {
-                Ok(progress) => {
-                    let text = match serde_json::to_string(&progress) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            error!("Failed to serialise progress: {e}");
+            if raw_done {
+                // Raw channel closed — only wait for structured events.
+                match rx.recv().await {
+                    Ok(progress) => {
+                        // Log events are superseded by the raw channel.
+                        if matches!(progress.event, BuildEvent::Log { .. }) {
                             continue;
                         }
-                    };
-
-                    use futures::SinkExt;
-                    if ws_write.send(ws::Message::Text(text.into())).await.is_err() {
-                        break; // Client disconnected.
+                        match serde_json::to_string(&progress) {
+                            Ok(text) => {
+                                if ws_write.send(ws::Message::Text(text.into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = ?e, "Failed to serialize build progress to JSON; dropping message");
+                            }
+                        }
+                        if matches!(progress.event, BuildEvent::Finished { .. }) {
+                            let _ = ws_write.send(ws::Message::Close(None)).await;
+                            break;
+                        }
                     }
-
-                    // If the build is finished, close the socket.
-                    if matches!(progress.event, BuildEvent::Finished { .. }) {
-                        let _ = ws_write.send(ws::Message::Close(None)).await;
-                        break;
+                    Err(RecvError::Lagged(n)) => {
+                        warn!(skipped = n, "Progress receiver lagged");
                     }
+                    Err(RecvError::Closed) => break,
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    // The receiver fell behind — some log lines were lost.
-                    // This is expected for large builds; continue to pick up
-                    // new events (especially the final Finished event).
-                    warn!(skipped = n, "WebSocket broadcast receiver lagged");
-                    continue;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    break; // Channel closed — sender dropped.
+            } else {
+                tokio::select! {
+                    biased; // prefer raw output — highest throughput path
+                    result = raw_rx.recv() => {
+                        match result {
+                            Ok(bytes) => {
+                                if ws_write.send(ws::Message::Binary(bytes)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(RecvError::Lagged(n)) => {
+                                warn!(skipped = n, "Raw output receiver lagged");
+                            }
+                            Err(RecvError::Closed) => {
+                                raw_done = true;
+                            }
+                        }
+                    }
+                    result = rx.recv() => {
+                        match result {
+                            Ok(progress) => {
+                                if matches!(progress.event, BuildEvent::Log { .. }) {
+                                    continue;
+                                }
+                                match serde_json::to_string(&progress) {
+                                    Ok(text) => {
+                                        if ws_write
+                                            .send(ws::Message::Text(text.into()))
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(error = ?e, "Failed to serialize build progress to JSON; dropping message");
+                                    }
+                                }
+                                if matches!(progress.event, BuildEvent::Finished { .. }) {
+                                    let _ = ws_write.send(ws::Message::Close(None)).await;
+                                    break;
+                                }
+                            }
+                            Err(RecvError::Lagged(n)) => {
+                                warn!(skipped = n, "Progress receiver lagged");
+                            }
+                            Err(RecvError::Closed) => break,
+                        }
+                    }
                 }
             }
         }

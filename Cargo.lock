@@ -1396,6 +1396,7 @@ dependencies = [
  "anyhow",
  "axum",
  "bollard",
+ "bytes",
  "chrono",
  "clap",
  "futures",
@@ -1439,7 +1440,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "regex",
  "remerge-types",
  "serde",
  "serde_json",

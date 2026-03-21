@@ -71,9 +71,13 @@ impl RemergeClient {
 
     /// Connect to the progress WebSocket and stream events to stdout.
     ///
-    /// The connection is bidirectional: build output is printed to stdout,
-    /// and local stdin is forwarded to the worker container so interactive
-    /// emerge features (`--ask`, USE prompts, etc.) work transparently.
+    /// The connection is bidirectional:
+    /// - **Server → Client (Binary frames):** Raw PTY bytes written directly
+    ///   to stdout — preserves ANSI escapes, colour, progress bars, etc.
+    /// - **Server → Client (Text frames):** Structured build events (status
+    ///   changes, package built/failed, finished).
+    /// - **Client → Server (Binary frames):** Raw stdin bytes forwarded to
+    ///   the worker container for interactive emerge prompts.
     ///
     /// Returns the final [`WorkorderResult`] when the build completes.
     pub async fn stream_progress(&self, ws_url: &str) -> Result<WorkorderResult> {
@@ -125,10 +129,19 @@ impl RemergeClient {
             }
         });
 
-        // Read build progress events from the WebSocket.
+        // Read build output from the WebSocket.
         while let Some(msg) = ws_read.next().await {
             let msg = msg.context("WebSocket error")?;
             match msg {
+                // Binary frames carry raw PTY bytes — write directly to stdout.
+                tokio_tungstenite::tungstenite::Message::Binary(data) => {
+                    use std::io::Write;
+                    let stdout = std::io::stdout();
+                    let mut out = stdout.lock();
+                    let _ = out.write_all(&data);
+                    let _ = out.flush();
+                }
+                // Text frames carry structured JSON events.
                 tokio_tungstenite::tungstenite::Message::Text(text) => {
                     if let Ok(progress) = serde_json::from_str::<BuildProgress>(&text) {
                         Self::print_event(&progress.event);
@@ -156,16 +169,14 @@ impl RemergeClient {
 
     /// Print a build event to the terminal.
     fn print_event(event: &BuildEvent) {
-        use std::io::Write;
         match event {
             BuildEvent::StatusChanged { from: _, to } => {
                 println!(">>> Status: {to:?}");
             }
+            // Log events are delivered as raw binary frames now — this
+            // arm is kept for backward compatibility with older servers.
             BuildEvent::Log { line } => {
-                // Write the raw log output without adding a newline.
-                // The container PTY output already includes \r\n where
-                // appropriate, and prompts intentionally omit it so the
-                // cursor stays on the same line for user input.
+                use std::io::Write;
                 let stdout = std::io::stdout();
                 let mut out = stdout.lock();
                 let _ = out.write_all(line.as_bytes());

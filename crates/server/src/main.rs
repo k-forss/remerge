@@ -198,6 +198,7 @@ async fn run_eviction_task(state: Arc<AppState>) {
         let mut workorders = state.workorders.write().await;
         let mut results = state.results.write().await;
         let mut progress_txs = state.progress_txs.write().await;
+        let mut raw_output_txs = state.raw_output_txs.write().await;
 
         let stale_ids: Vec<_> = workorders
             .iter()
@@ -220,6 +221,7 @@ async fn run_eviction_task(state: Arc<AppState>) {
             workorders.remove(&id);
             results.remove(&id);
             progress_txs.remove(&id);
+            raw_output_txs.remove(&id);
         }
 
         // Enforce max-entry cap: if the workorder count still exceeds the
@@ -256,6 +258,7 @@ async fn run_eviction_task(state: Arc<AppState>) {
                 workorders.remove(&id);
                 results.remove(&id);
                 progress_txs.remove(&id);
+                raw_output_txs.remove(&id);
             }
         }
 
@@ -264,6 +267,7 @@ async fn run_eviction_task(state: Arc<AppState>) {
         drop(workorders);
         drop(results);
         drop(progress_txs);
+        drop(raw_output_txs);
         match state.binpkg_repo.cleanup_old_versions(3).await {
             Ok(removed) if removed > 0 => {
                 info!(removed, "Cleaned up old package versions");

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
+use bytes::Bytes;
 use tokio::sync::{RwLock, Semaphore, broadcast, mpsc};
 
 use remerge_types::workorder::{BuildProgress, Workorder, WorkorderId, WorkorderResult};
@@ -35,6 +36,11 @@ pub struct AppState {
 
     /// Per-workorder broadcast channels for progress streaming.
     pub progress_txs: RwLock<HashMap<WorkorderId, broadcast::Sender<BuildProgress>>>,
+
+    /// Per-workorder broadcast channels for raw PTY output (binary bytes).
+    /// Sent as WS Binary frames — this is the primary output channel.
+    /// Uses `Bytes` (reference-counted) to avoid a full allocation clone per receiver.
+    pub raw_output_txs: RwLock<HashMap<WorkorderId, broadcast::Sender<Bytes>>>,
 
     /// Per-workorder stdin channels for forwarding client input to the
     /// worker container (supports interactive emerge, `--ask`, etc.).
@@ -89,6 +95,7 @@ impl AppState {
             workorders: RwLock::new(HashMap::new()),
             results: RwLock::new(persisted_results),
             progress_txs: RwLock::new(HashMap::new()),
+            raw_output_txs: RwLock::new(HashMap::new()),
             stdin_txs: RwLock::new(HashMap::new()),
             worker_semaphore: Arc::new(Semaphore::new(max_workers)),
             container_ids: RwLock::new(HashMap::new()),
@@ -104,8 +111,14 @@ impl AppState {
         &self,
         id: WorkorderId,
     ) -> broadcast::Sender<BuildProgress> {
+        // Insert raw channel first so that a subscriber who observes the
+        // progress channel is guaranteed to also find the raw channel.
+        let (raw_tx, _) = broadcast::channel(512);
+        self.raw_output_txs.write().await.insert(id, raw_tx);
+
         let (tx, _) = broadcast::channel(256);
         self.progress_txs.write().await.insert(id, tx.clone());
+
         tx
     }
 
@@ -115,6 +128,18 @@ impl AppState {
         id: &WorkorderId,
     ) -> Option<broadcast::Receiver<BuildProgress>> {
         self.progress_txs
+            .read()
+            .await
+            .get(id)
+            .map(|tx| tx.subscribe())
+    }
+
+    /// Subscribe to the raw PTY output channel for a workorder.
+    pub async fn subscribe_raw_output(
+        &self,
+        id: &WorkorderId,
+    ) -> Option<broadcast::Receiver<Bytes>> {
+        self.raw_output_txs
             .read()
             .await
             .get(id)
@@ -135,8 +160,12 @@ impl AppState {
         self.stdin_txs.read().await.get(id).cloned()
     }
 
-    /// Remove the stdin channel when a workorder finishes.
-    pub async fn remove_stdin_channel(&self, id: &WorkorderId) {
+    /// Remove all per-workorder channels (progress, raw output, stdin) when a
+    /// workorder finishes.  Progress is removed first to preserve the invariant
+    /// that a visible progress channel implies a live raw output channel.
+    pub async fn remove_workorder_channels(&self, id: &WorkorderId) {
+        self.progress_txs.write().await.remove(id);
+        self.raw_output_txs.write().await.remove(id);
         self.stdin_txs.write().await.remove(id);
     }
 }
