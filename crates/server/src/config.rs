@@ -289,13 +289,13 @@ impl ServerConfig {
         // Auto-discover the worker binary if not explicitly configured.
         // Look for `remerge-worker` next to the running server binary
         // (e.g. both installed in /usr/bin/).
-        if config.worker_binary.is_none() {
-            if let Ok(exe) = std::env::current_exe() {
-                let sibling = exe.with_file_name("remerge-worker");
-                if sibling.is_file() {
-                    tracing::info!(path = %sibling.display(), "Auto-discovered worker binary");
-                    config.worker_binary = Some(sibling);
-                }
+        if config.worker_binary.is_none()
+            && let Ok(exe) = std::env::current_exe()
+        {
+            let sibling = exe.with_file_name("remerge-worker");
+            if sibling.is_file() {
+                tracing::info!(path = %sibling.display(), "Auto-discovered worker binary");
+                config.worker_binary = Some(sibling);
             }
         }
         if let Ok(v) = std::env::var("REMERGE_MAX_RETAINED_WORKORDERS")
