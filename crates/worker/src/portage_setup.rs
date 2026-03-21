@@ -30,6 +30,11 @@ pub async fn apply_config(
     write_package_use(config).await?;
     write_package_accept_keywords(config).await?;
     write_package_license(config).await?;
+    write_package_mask(config).await?;
+    write_package_unmask(config).await?;
+    write_package_env(config).await?;
+    write_env_files(config).await?;
+    write_repos_conf(config).await?;
     info!("Portage configuration applied");
     Ok(())
 }
@@ -111,6 +116,27 @@ async fn write_make_conf(
                     features.push(feat.into());
                 }
             }
+        }
+
+        // Strip features that are ineffective in ephemeral containers.
+        // ccache: no persistent cache directory mounted.
+        // distcc: no distcc daemon configured in the container.
+        let before = features.len();
+        features.retain(|f| match f.as_str() {
+            "ccache" | "distcc" => {
+                tracing::warn!(
+                    feature = %f,
+                    "Stripping FEATURE — not available in ephemeral worker containers"
+                );
+                false
+            }
+            _ => true,
+        });
+        if features.len() < before {
+            info!(
+                stripped = before - features.len(),
+                "Stripped container-incompatible FEATURES"
+            );
         }
 
         content.push_str(&format!("FEATURES=\"{}\"\n", features.join(" ")));
@@ -240,6 +266,148 @@ async fn write_package_license(config: &PortageConfig) -> Result<()> {
         .context("Failed to write package.license")?;
 
     info!("Wrote /etc/portage/package.license/remerge");
+    Ok(())
+}
+
+/// Write `/etc/portage/package.mask/remerge`.
+async fn write_package_mask(config: &PortageConfig) -> Result<()> {
+    if config.package_mask.is_empty() {
+        return Ok(());
+    }
+
+    ensure_dir("/etc/portage/package.mask").await?;
+
+    let content: String = config
+        .package_mask
+        .iter()
+        .map(|atom| format!("{atom}\n"))
+        .collect();
+
+    fs::write("/etc/portage/package.mask/remerge", &content)
+        .await
+        .context("Failed to write package.mask")?;
+
+    info!("Wrote /etc/portage/package.mask/remerge");
+    Ok(())
+}
+
+/// Write `/etc/portage/package.unmask/remerge`.
+async fn write_package_unmask(config: &PortageConfig) -> Result<()> {
+    if config.package_unmask.is_empty() {
+        return Ok(());
+    }
+
+    ensure_dir("/etc/portage/package.unmask").await?;
+
+    let content: String = config
+        .package_unmask
+        .iter()
+        .map(|atom| format!("{atom}\n"))
+        .collect();
+
+    fs::write("/etc/portage/package.unmask/remerge", &content)
+        .await
+        .context("Failed to write package.unmask")?;
+
+    info!("Wrote /etc/portage/package.unmask/remerge");
+    Ok(())
+}
+
+/// Write `/etc/portage/package.env/remerge`.
+///
+/// Maps atoms to environment override files (which live in `/etc/portage/env/`).
+async fn write_package_env(config: &PortageConfig) -> Result<()> {
+    if config.package_env.is_empty() {
+        return Ok(());
+    }
+
+    ensure_dir("/etc/portage/package.env").await?;
+
+    let content: String = config
+        .package_env
+        .iter()
+        .filter(|e| {
+            let valid = !e.env_file.trim().is_empty()
+                && !e.env_file.contains('/')
+                && !e.env_file.contains("..");
+            if !valid {
+                tracing::warn!(
+                    atom = %e.atom,
+                    env_file = %e.env_file,
+                    "Skipping package.env entry with invalid env_file"
+                );
+            }
+            valid
+        })
+        .map(|e| format!("{} {}\n", e.atom, e.env_file))
+        .collect();
+
+    fs::write("/etc/portage/package.env/remerge", &content)
+        .await
+        .context("Failed to write package.env")?;
+
+    info!("Wrote /etc/portage/package.env/remerge");
+    Ok(())
+}
+
+/// Write environment override files to `/etc/portage/env/`.
+///
+/// These contain per-package variable overrides (e.g. custom CFLAGS,
+/// MAKEOPTS, CMAKE_BUILD_TYPE) referenced by `package.env` entries.
+async fn write_env_files(config: &PortageConfig) -> Result<()> {
+    if config.env_files.is_empty() {
+        return Ok(());
+    }
+
+    ensure_dir("/etc/portage/env").await?;
+
+    for (filename, content) in &config.env_files {
+        // Sanitise filename — reject empty, blank, and path-traversal.
+        if filename.trim().is_empty() || filename.contains('/') || filename.contains("..") {
+            tracing::warn!(filename, "Skipping env file with invalid filename");
+            continue;
+        }
+        let path = format!("/etc/portage/env/{filename}");
+        fs::write(&path, content)
+            .await
+            .with_context(|| format!("Failed to write {path}"))?;
+    }
+
+    info!(
+        count = config.env_files.len(),
+        "Wrote /etc/portage/env/ files"
+    );
+    Ok(())
+}
+
+/// Write portage repository configuration to `/etc/portage/repos.conf/`.
+///
+/// Forwards the client's repos.conf so the worker knows about custom
+/// overlays, sync URIs, and repo priorities.  When the server bind-mounts
+/// its repos directory, the repos are already present — these conf files
+/// just tell portage where to find them.
+async fn write_repos_conf(config: &PortageConfig) -> Result<()> {
+    if config.repos_conf.is_empty() {
+        return Ok(());
+    }
+
+    ensure_dir("/etc/portage/repos.conf").await?;
+
+    for (filename, content) in &config.repos_conf {
+        if filename.trim().is_empty() || filename.contains('/') || filename.contains("..") {
+            tracing::warn!(filename, "Skipping repos.conf file with invalid filename");
+            continue;
+        }
+        let path = format!("/etc/portage/repos.conf/{filename}");
+        fs::write(&path, content)
+            .await
+            .with_context(|| format!("Failed to write {path}"))?;
+    }
+
+    info!(
+        count = config.repos_conf.len(),
+        "Wrote /etc/portage/repos.conf/ files"
+    );
     Ok(())
 }
 

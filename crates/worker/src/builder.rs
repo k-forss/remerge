@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use regex::Regex;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tracing::info;
 
@@ -40,6 +40,11 @@ pub async fn build_packages(workorder: &Workorder, emerge_cmd: &str) -> Result<(
         // slot conflicts instead of rebuilding the mismatched packages.
         "--newuse".to_string(),
         "--update".to_string(),
+        // Auto-apply USE / keyword changes that emerge suggests (e.g.
+        // REQUIRED_USE constraints like `wayland? ( gles2 )`, missing
+        // keywords, etc.) and continue the build without prompting.
+        "--autounmask-write".to_string(),
+        "--autounmask-continue".to_string(),
     ];
 
     // Forward any additional emerge arguments from the workorder,
@@ -49,6 +54,7 @@ pub async fn build_packages(workorder: &Workorder, emerge_cmd: &str) -> Result<(
             // Skip arguments we already set or that don't make sense in the worker.
             "--pretend" | "-p" | "--getbinpkg" | "-g" |
             "--newuse" | "-N" | "--update" | "-u" |
+            "--autounmask-write" | "--autounmask-continue" |
             // Dangerous flags that must never run in the worker.
             "--depclean" | "--unmerge" | "-C" | "--deselect" |
             "--sync" | "--info" | "--search" | "-s" | "--searchdesc" | "-S" |
@@ -60,6 +66,14 @@ pub async fn build_packages(workorder: &Workorder, emerge_cmd: &str) -> Result<(
     // Add the package atoms.
     args.extend(workorder.atoms.iter().cloned());
 
+    // Warn about expensive operations that are technically valid but risky.
+    if args.iter().any(|a| a == "--emptytree" || a == "-e") {
+        tracing::warn!(
+            "--emptytree requested — this will rebuild the entire dependency \
+             tree from scratch and may take many hours"
+        );
+    }
+
     info!(cmd = %emerge_cmd, ?args, "Running emerge");
 
     let mut child = Command::new(emerge_cmd)
@@ -70,19 +84,30 @@ pub async fn build_packages(workorder: &Workorder, emerge_cmd: &str) -> Result<(
         .spawn()
         .with_context(|| format!("Failed to spawn {emerge_cmd}"))?;
 
-    // Spawn stderr streaming.
-    let stderr_handle = child.stderr.take().map(|stderr| {
+    // Spawn stderr streaming — forward raw bytes to preserve formatting.
+    let stderr_handle = child.stderr.take().map(|mut stderr| {
         tokio::spawn(async move {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                eprintln!("{line}");
+            let mut writer = tokio::io::stderr();
+            let mut buf = [0u8; 4096];
+            loop {
+                match stderr.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let _ = writer.write_all(&buf[..n]).await;
+                        let _ = writer.flush().await;
+                    }
+                }
             }
         })
     });
 
     // Read and parse stdout for structured build events.
-    if let Some(stdout) = child.stdout.take() {
+    //
+    // We read raw bytes and forward them to container stdout immediately,
+    // preserving exact formatting (ANSI escape codes, \r\n line endings,
+    // partial lines for progress bars, etc.).  A separate line buffer
+    // accumulates bytes for regex-based event detection.
+    if let Some(mut stdout) = child.stdout.take() {
         let re_emerging = Regex::new(r">>> Emerging \(\d+ of \d+\) (.+)::").expect("valid regex");
         let re_completed = Regex::new(r">>> Completed \(\d+ of \d+\) (.+)::").expect("valid regex");
         let re_error = Regex::new(r"\* ERROR: (.+)::(\S+) failed").expect("valid regex");
@@ -95,84 +120,107 @@ pub async fn build_packages(workorder: &Workorder, emerge_cmd: &str) -> Result<(
         let re_fetch_fail =
             Regex::new(r"(?:Couldn't download|!!! Fetch failed)").expect("valid regex");
 
-        let reader = BufReader::new(stdout);
-        let mut lines = reader.lines();
+        let mut stdout_writer = tokio::io::stdout();
+        let mut line_buf = Vec::with_capacity(8192);
+        let mut read_buf = [0u8; 4096];
         let mut current_package: Option<(String, Instant)> = None;
+        // Track whether the last byte written to stdout ended on a newline,
+        // so we can ensure REMERGE_EVENT lines always start on a fresh line.
+        // Starts `true` because we haven't written anything yet (BOF = fresh line).
+        #[allow(unused_assignments)]
+        let mut last_was_newline = true;
 
-        while let Ok(Some(line)) = lines.next_line().await {
-            // Always print the raw line to container stdout.
-            println!("{line}");
+        loop {
+            let n = match stdout.read(&mut read_buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
 
-            // Parse for structured events.
-            if let Some(caps) = re_emerging.captures(&line) {
-                if let Some(atom) = caps.get(1) {
-                    current_package = Some((atom.as_str().to_string(), Instant::now()));
-                }
-            } else if let Some(caps) = re_completed.captures(&line) {
-                if let Some(atom_match) = caps.get(1) {
-                    let atom = atom_match.as_str().to_string();
-                    let duration = current_package
-                        .as_ref()
-                        .filter(|(pkg, _)| *pkg == atom)
-                        .map(|(_, start)| start.elapsed().as_secs())
-                        .unwrap_or(0);
+            // Forward raw bytes to container stdout immediately.
+            let _ = stdout_writer.write_all(&read_buf[..n]).await;
+            let _ = stdout_writer.flush().await;
+            last_was_newline = read_buf[n - 1] == b'\n';
 
-                    // Emit structured event for the server to parse.
-                    println!(
-                        "REMERGE_EVENT:{}",
-                        serde_json::json!({
+            // Accumulate for line-based event parsing.
+            line_buf.extend_from_slice(&read_buf[..n]);
+
+            // Cap buffer to prevent unbounded growth from long lines
+            // (e.g. progress bars using \r without \n).
+            const MAX_LINE_BUF: usize = 64 * 1024;
+            if line_buf.len() > MAX_LINE_BUF {
+                line_buf.drain(..line_buf.len() - MAX_LINE_BUF);
+            }
+
+            // Process complete lines from the buffer.
+            while let Some(newline_pos) = line_buf.iter().position(|&b| b == b'\n') {
+                let line = String::from_utf8_lossy(&line_buf[..newline_pos])
+                    .trim_end_matches('\r')
+                    .to_string();
+                line_buf.drain(..=newline_pos);
+
+                // Helper: emit a structured event on a guaranteed fresh line.
+                let mut emit_event = |json: serde_json::Value| {
+                    let prefix = if last_was_newline { "" } else { "\n" };
+                    let msg = format!("{prefix}REMERGE_EVENT:{json}\n");
+                    let _ = std::io::Write::write_all(&mut std::io::stdout(), msg.as_bytes());
+                    last_was_newline = true;
+                };
+
+                // Parse for structured events.
+                if let Some(caps) = re_emerging.captures(&line) {
+                    if let Some(atom) = caps.get(1) {
+                        current_package = Some((atom.as_str().to_string(), Instant::now()));
+                    }
+                } else if let Some(caps) = re_completed.captures(&line) {
+                    if let Some(atom_match) = caps.get(1) {
+                        let atom = atom_match.as_str().to_string();
+                        let duration = current_package
+                            .as_ref()
+                            .filter(|(pkg, _)| *pkg == atom)
+                            .map(|(_, start)| start.elapsed().as_secs())
+                            .unwrap_or(0);
+
+                        emit_event(serde_json::json!({
                             "type": "package_built",
                             "atom": atom,
                             "duration_secs": duration,
-                        })
-                    );
-                    current_package = None;
-                }
-            } else if let Some(caps) = re_error.captures(&line) {
-                if let Some(atom_match) = caps.get(1) {
-                    let atom = atom_match.as_str().to_string();
-                    println!(
-                        "REMERGE_EVENT:{}",
-                        serde_json::json!({
+                        }));
+                        current_package = None;
+                    }
+                } else if let Some(caps) = re_error.captures(&line) {
+                    if let Some(atom_match) = caps.get(1) {
+                        let atom = atom_match.as_str().to_string();
+                        emit_event(serde_json::json!({
                             "type": "package_failed",
                             "atom": atom,
                             "reason": line.trim(),
                             "failure_kind": "build_error",
-                        })
-                    );
-                }
-            } else if let Some(caps) = re_missing_dep.captures(&line) {
-                if let Some(dep) = caps.get(1) {
-                    println!(
-                        "REMERGE_EVENT:{}",
-                        serde_json::json!({
+                        }));
+                    }
+                } else if let Some(caps) = re_missing_dep.captures(&line) {
+                    if let Some(dep) = caps.get(1) {
+                        emit_event(serde_json::json!({
                             "type": "package_failed",
                             "atom": dep.as_str(),
                             "reason": line.trim(),
                             "failure_kind": "missing_dependency",
-                        })
-                    );
-                }
-            } else if re_use_conflict.is_match(&line) {
-                println!(
-                    "REMERGE_EVENT:{}",
-                    serde_json::json!({
+                        }));
+                    }
+                } else if re_use_conflict.is_match(&line) {
+                    emit_event(serde_json::json!({
                         "type": "package_failed",
                         "atom": current_package.as_ref().map(|(a, _)| a.as_str()).unwrap_or("unknown"),
                         "reason": line.trim(),
                         "failure_kind": "use_conflict",
-                    })
-                );
-            } else if re_fetch_fail.is_match(&line) {
-                println!(
-                    "REMERGE_EVENT:{}",
-                    serde_json::json!({
+                    }));
+                } else if re_fetch_fail.is_match(&line) {
+                    emit_event(serde_json::json!({
                         "type": "package_failed",
                         "atom": current_package.as_ref().map(|(a, _)| a.as_str()).unwrap_or("unknown"),
                         "reason": line.trim(),
                         "failure_kind": "fetch_failure",
-                    })
-                );
+                    }));
+                }
             }
         }
     }
@@ -196,7 +244,17 @@ pub async fn build_packages(workorder: &Workorder, emerge_cmd: &str) -> Result<(
 }
 
 /// Sync the portage tree.
+///
+/// When `REMERGE_SKIP_SYNC=1` is set (i.e. the server bind-mounted its own
+/// repos directory into the container), syncing is skipped entirely.  This
+/// avoids re-downloading the tree on every build and ensures the worker
+/// uses the exact same ebuild repo as the server.
 async fn sync_portage() -> Result<()> {
+    if std::env::var("REMERGE_SKIP_SYNC").is_ok() {
+        info!("Skipping portage sync (repos are bind-mounted from the server)");
+        return Ok(());
+    }
+
     info!("Syncing portage tree");
 
     let status = Command::new("emerge")

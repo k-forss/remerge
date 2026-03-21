@@ -215,6 +215,8 @@ fn hash_json<T: serde::Serialize>(value: &T) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use remerge_types::portage::MakeConf;
     use uuid::Uuid;
@@ -225,6 +227,11 @@ mod tests {
             package_use: Vec::new(),
             package_accept_keywords: Vec::new(),
             package_license: Vec::new(),
+            package_mask: Vec::new(),
+            package_unmask: Vec::new(),
+            package_env: Vec::new(),
+            env_files: BTreeMap::new(),
+            repos_conf: BTreeMap::new(),
             profile: "default/linux/amd64/23.0".into(),
             world: Vec::new(),
         }

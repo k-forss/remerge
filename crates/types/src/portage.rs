@@ -22,6 +22,38 @@ pub struct PortageConfig {
     /// Per-package license acceptances from `/etc/portage/package.license`.
     pub package_license: Vec<PackageLicenseEntry>,
 
+    /// Masked package atoms from `/etc/portage/package.mask`.
+    ///
+    /// Each entry is a package atom (e.g. `>=dev-libs/foo-2.0`).
+    #[serde(default)]
+    pub package_mask: Vec<String>,
+
+    /// Unmasked package atoms from `/etc/portage/package.unmask`.
+    ///
+    /// Each entry is a package atom that overrides profile or repo masks.
+    #[serde(default)]
+    pub package_unmask: Vec<String>,
+
+    /// Per-package environment overrides from `/etc/portage/package.env`.
+    ///
+    /// Maps atoms to environment file names (files stored in [`env_files`]).
+    #[serde(default)]
+    pub package_env: Vec<PackageEnvEntry>,
+
+    /// Environment override file contents from `/etc/portage/env/`.
+    ///
+    /// Maps filename (e.g. `no-lto.conf`) to the file's full content.
+    /// These are referenced by [`package_env`] entries.
+    #[serde(default)]
+    pub env_files: BTreeMap<String, String>,
+
+    /// Portage repository configuration from `/etc/portage/repos.conf`.
+    ///
+    /// Maps filename (e.g. `gentoo.conf`) to the file's raw INI content.
+    /// Includes custom overlay definitions and sync settings.
+    #[serde(default)]
+    pub repos_conf: BTreeMap<String, String>,
+
     /// The active portage profile path (e.g. `default/linux/amd64/23.0`).
     pub profile: String,
 
@@ -126,6 +158,15 @@ pub struct PackageLicenseEntry {
     pub atom: String,
     /// Licenses, e.g. `linux-fw-redistributable`.
     pub licenses: Vec<String>,
+}
+
+/// A single entry from `/etc/portage/package.env`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageEnvEntry {
+    /// Atom, e.g. `dev-qt/qtwebengine`.
+    pub atom: String,
+    /// Environment file name from `/etc/portage/env/`, e.g. `no-lto.conf`.
+    pub env_file: String,
 }
 
 /// Host system identity — describes the build environment needed.

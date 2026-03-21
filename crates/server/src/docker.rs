@@ -252,6 +252,11 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
         if let Some(ref gpg_home) = self.gpg_home {
             binds.push(format!("{gpg_home}:/var/cache/remerge/gnupg:ro"));
         }
+        // Bind-mount the server's portage repos into the container so the
+        // worker uses the same ebuild tree without needing to sync.
+        if let Some(ref repos_dir) = server_config.repos_dir {
+            binds.push(format!("{}:/var/db/repos:ro", repos_dir.display()));
+        }
 
         let host_config = HostConfig {
             binds: Some(binds),
@@ -264,6 +269,10 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
         }
         if self.gpg_home.is_some() {
             env.push("REMERGE_GPG_HOME=/var/cache/remerge/gnupg".to_string());
+        }
+        // Tell the worker to skip `emerge --sync` when repos are mounted.
+        if server_config.repos_dir.is_some() {
+            env.push("REMERGE_SKIP_SYNC=1".to_string());
         }
 
         // Pass multithreading configuration to the worker.
