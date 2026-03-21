@@ -83,9 +83,12 @@ impl CliConfig {
             let mut config: Self =
                 toml::from_str(&content).with_context(|| format!("Failed to parse {path}"))?;
 
-            // Ensure client_id is populated (might be missing in hand-edited files).
-            if config.client_id.is_nil() {
-                config.client_id = generate_client_id();
+            // Persist client_id if it wasn't in the file (serde default
+            // generates a fresh UUID each time, so we must write it back).
+            if !content.contains("client_id") || config.client_id.is_nil() {
+                if config.client_id.is_nil() {
+                    config.client_id = generate_client_id();
+                }
                 config.save(path)?;
             }
 
@@ -184,5 +187,29 @@ role = "follower"
         assert_eq!(main.client_id, follower.client_id);
         assert_eq!(main.role, ClientRole::Main);
         assert_eq!(follower.role, ClientRole::Follower);
+    }
+
+    #[test]
+    fn load_or_create_persists_client_id() {
+        // Simulate the ebuild-installed config (no client_id).
+        let dir = std::env::temp_dir().join(format!("remerge-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("remerge.conf");
+        let initial = "server = \"http://localhost:7654\"\n";
+        std::fs::write(&path, initial).unwrap();
+
+        let path_str = path.to_str().unwrap();
+        let cfg1 = CliConfig::load_or_create(path_str).unwrap();
+        let cfg2 = CliConfig::load_or_create(path_str).unwrap();
+
+        // The client_id should be persisted and identical across loads.
+        assert_eq!(cfg1.client_id, cfg2.client_id);
+        assert!(!cfg1.client_id.is_nil());
+
+        // The file should now contain client_id.
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("client_id"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
