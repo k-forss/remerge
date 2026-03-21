@@ -28,4 +28,5 @@ tokio-stream = { workspace = true }
 toml = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+libc = "0.2"
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
