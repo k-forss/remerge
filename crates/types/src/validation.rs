@@ -5,6 +5,7 @@
 /// Validate a portage package atom.
 ///
 /// Accepted forms:
+/// - `package` — e.g. `firefox` (unqualified, emerge resolves the category)
 /// - `category/package` — e.g. `dev-libs/openssl`
 /// - `=category/package-version` — e.g. `=dev-libs/openssl-3.1.4`
 /// - `>=category/package-version` — with version operator
@@ -51,28 +52,48 @@ pub fn validate_atom(atom: &str) -> Result<(), AtomValidationError> {
         .or_else(|| atom.strip_prefix("~"))
         .unwrap_or(atom);
 
-    // Must contain exactly one `/` separating category and package.
-    let slash_count = stripped.chars().filter(|&c| c == '/').count();
-    if slash_count != 1 {
+    // Qualified atom: category/package.
+    if let Some((category, package)) = stripped.split_once('/') {
+        // Reject multiple slashes.
+        if package.contains('/') {
+            return Err(AtomValidationError::InvalidFormat(
+                "too many '/' separators".into(),
+            ));
+        }
+
+        if category.is_empty() {
+            return Err(AtomValidationError::InvalidFormat("empty category".into()));
+        }
+        if !category
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(AtomValidationError::InvalidFormat(
+                "invalid category characters".into(),
+            ));
+        }
+
+        if package.is_empty() {
+            return Err(AtomValidationError::InvalidFormat(
+                "empty package name".into(),
+            ));
+        }
+        return validate_package_name(package);
+    }
+
+    // Unqualified atom: bare package name (emerge resolves the category).
+    // Version operators are not valid without a category.
+    if stripped != atom {
         return Err(AtomValidationError::InvalidFormat(
-            "expected exactly one '/' separating category/package".into(),
+            "version operators require a qualified category/package atom".into(),
         ));
     }
 
-    let (category, package) = stripped.split_once('/').unwrap();
+    validate_package_name(stripped)
+}
 
-    if category.is_empty() {
-        return Err(AtomValidationError::InvalidFormat("empty category".into()));
-    }
-    if !category
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err(AtomValidationError::InvalidFormat(
-            "invalid category characters".into(),
-        ));
-    }
-
+/// Validate the package-name portion of an atom.
+fn validate_package_name(package: &str) -> Result<(), AtomValidationError> {
     if package.is_empty() {
         return Err(AtomValidationError::InvalidFormat(
             "empty package name".into(),
@@ -161,8 +182,17 @@ mod tests {
     }
 
     #[test]
-    fn reject_missing_category() {
-        assert!(validate_atom("openssl").is_err());
+    fn valid_unqualified_atom() {
+        assert!(validate_atom("firefox").is_ok());
+        assert!(validate_atom("openssl").is_ok());
+        assert!(validate_atom("gentoo-sources").is_ok());
+    }
+
+    #[test]
+    fn reject_versioned_unqualified_atom() {
+        // Version operators require category/package.
+        assert!(validate_atom("=firefox-128.0").is_err());
+        assert!(validate_atom(">=openssl-3.0").is_err());
     }
 
     #[test]
