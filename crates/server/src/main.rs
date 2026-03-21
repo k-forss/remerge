@@ -55,6 +55,19 @@ async fn main() -> Result<()> {
 
     info!(?config, "Loaded configuration");
 
+    if config.worker_binary.is_none() {
+        warn!(
+            "No worker binary found.  The server will not be able to build \
+             worker images.  Install the remerge-worker package or set \
+             worker_binary in the configuration."
+        );
+    } else {
+        info!(
+            worker_binary = ?config.worker_binary,
+            "Worker binary configured"
+        );
+    }
+
     let state = Arc::new(AppState::new(config).await?);
 
     // Ensure binpkg repository directory exists.

@@ -77,8 +77,12 @@ impl DockerManager {
             .replace('.', "_");
 
         format!(
-            "{}:{}-{}-gcc{}",
-            self.image_prefix, chost_slug, profile_slug, gcc_short
+            "{}:{}-{}-gcc{}-v{}",
+            self.image_prefix,
+            chost_slug,
+            profile_slug,
+            gcc_short,
+            env!("CARGO_PKG_VERSION"),
         )
     }
 
@@ -104,22 +108,25 @@ impl DockerManager {
         header.set_cksum();
         ar.append(&header, dockerfile_bytes)?;
 
-        // If a worker binary path is configured, include it in the build context.
-        if let Some(ref binary_path) = self.worker_binary {
-            match std::fs::read(binary_path) {
-                Ok(binary_data) => {
-                    let mut bin_header = tar::Header::new_gnu();
-                    bin_header.set_path("remerge-worker")?;
-                    bin_header.set_size(binary_data.len() as u64);
-                    bin_header.set_mode(0o755);
-                    bin_header.set_cksum();
-                    ar.append(&bin_header, &binary_data[..])?;
-                    info!("Included worker binary in Docker build context");
-                }
-                Err(e) => {
-                    tracing::warn!(path = %binary_path, "Failed to read worker binary: {e} — image will use pre-installed binary");
-                }
-            }
+        // Include the worker binary in the build context.  Without it the
+        // image's ENTRYPOINT cannot start and every container will fail.
+        let binary_path = self.worker_binary.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "No worker binary configured or discovered.  Set `worker_binary` \
+                 in server.toml or install the remerge-worker package alongside \
+                 the server."
+            )
+        })?;
+        let binary_data = std::fs::read(binary_path)
+            .with_context(|| format!("Failed to read worker binary at {binary_path}"))?;
+        {
+            let mut bin_header = tar::Header::new_gnu();
+            bin_header.set_path("remerge-worker")?;
+            bin_header.set_size(binary_data.len() as u64);
+            bin_header.set_mode(0o755);
+            bin_header.set_cksum();
+            ar.append(&bin_header, &binary_data[..])?;
+            info!(path = %binary_path, "Included worker binary in Docker build context");
         }
 
         let tar_bytes = ar.into_inner()?;
@@ -196,11 +203,7 @@ RUN echo 'CHOST="{chost}"' >> /etc/portage/make.conf && \
             String::new()
         };
 
-        let binary_install = if self.worker_binary.is_some() {
-            "# Install remerge-worker binary from build context.\nCOPY remerge-worker /usr/local/bin/remerge-worker\nRUN chmod +x /usr/local/bin/remerge-worker"
-        } else {
-            "# Worker binary must be pre-installed in the image or mounted at runtime."
-        };
+        let binary_install = "# Install remerge-worker binary from build context.\nCOPY remerge-worker /usr/local/bin/remerge-worker\nRUN chmod +x /usr/local/bin/remerge-worker";
 
         format!(
             r#"FROM {base_image}
