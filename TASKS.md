@@ -273,37 +273,19 @@ mock layer.
 - [x] **3.7** `write_repos_conf` with server `repos_dir` bind-mount remapping
       (locations must be rewritten to `/var/db/repos/<name>`)
 
-      **Audit finding:** UNCHECKED — the `write_repos_conf_inner` function
-      does NOT accept a `repos_dir` parameter and does NOT perform any
-      remapping. The remapping logic lives in `ensure_repo_locations()`
-      (a private function at line ~510 in `portage_setup.rs`) which:
-      - symlinks repo locations to bind-mounted paths under `/var/db/repos/`
-      - remaps overlays to `/var/tmp/remerge-repos/` when `REMERGE_SKIP_SYNC=1`
-      - uses `rewrite_repo_location()` to update `location =` lines in-place
+      **Audit status (verified):** PROPERLY IMPLEMENTED — the remapping
+      logic was extracted into `ensure_repo_locations_inner(config,
+      repos_base, repos_conf_base, remap_base)` (line 577 of
+      `portage_setup.rs`) with 4 tests in `worker_setup_test.rs`:
+      1. `ensure_repo_locations_bind_mount_symlink` — symlink created ✅
+      2. `ensure_repo_locations_remap_when_skip_sync` — REMERGE_SKIP_SYNC
+         triggers remap + location rewrite ✅
+      3. `ensure_repo_locations_create_empty_dir` — empty dir for
+         non-bind-mount repos ✅
+      4. `ensure_repo_locations_rejects_traversal` — path traversal
+         returns error ✅
 
-      The existing `write_repos_conf_creates_files` test only verifies that
-      raw content is written to `repos.conf/<name>` — it does NOT test
-      the remapping/symlinking behavior at all.
-
-      **Implementation notes:**
-      Two approaches:
-      - **Option A (preferred):** Create `ensure_repo_locations_inner(config,
-        repos_base, repos_conf_base)` that operates on parametric paths
-        instead of hardcoded `/var/db/repos` and `/etc/portage/repos.conf/`.
-        Then write tests that create a temp bind-mount dir and verify
-        symlinks and rewrites.
-      - **Option B:** Test inside the GHCR Docker image (task 0.6) where
-        the function can operate on real paths. Gate behind
-        `#[cfg(feature = "e2e")]`.
-      - For Option A, also create `rewrite_repo_location_inner(repos_conf_base,
-        filename, old_loc, new_loc)` since the current function uses
-        hardcoded `/etc/portage/repos.conf/{filename}`.
-      - Test cases:
-        1. Repo in bind-mount → symlink created at `location`
-        2. Repo NOT in bind-mount, `REMERGE_SKIP_SYNC=1` → remapped to
-           writable path and `location =` line rewritten
-        3. Repo NOT in bind-mount, no skip-sync → empty dir created
-        4. Invalid location (traversal) → bail with error
+      Also `rewrite_repo_location_inner` (line 674) was extracted.
 
 - [x] **3.8** `write_repos_conf` without server repos_dir — locations
       preserved as-is
@@ -444,23 +426,26 @@ These tests need a running Docker daemon. Gate behind
         and works correctly. Verify it returns `Ok`.
 
 - [x] **5.2** `image_tag` derivation from `SystemId` — verify format
-- [x] **5.3** `build_worker_image` (deferred: requires Gentoo stage3) — builds an image, verify it exists via
+- [ ] **5.3** `build_worker_image` — builds an image, verify it exists via
       Docker API, verify `remerge.worker.sha256` label
 
+      **Audit status:** NOT IMPLEMENTED — no test exists.
+
       **Implementation notes:**
+      - Build the stage3 image locally first (see `docker/test-stage3.Dockerfile`).
       - `build_worker_image(&self, sys: &SystemIdentity, tag: &str)`
         builds a Docker image using an internal Dockerfile that COPYs
         the worker binary into a Gentoo stage3 base image.
       - Requires `config.worker_binary` to point to a valid ELF binary.
       - For testing: create a dummy binary (e.g., a small shell script
         or a `#!/bin/true`), configure `ServerConfig.worker_binary`.
-      - The base image needs to exist — either pull `gentoo/stage3` or
-        use the GHCR test image from task 0.6.
       - After build, use `bollard` inspect to verify the image exists
         and has the `remerge.worker.sha256` label.
       - Clean up the test image with `remove_image()` in a drop guard.
       - Gate behind `#[cfg(feature = "integration")]`.
       - This test will be slow (~30s) due to Docker image building.
+      - If the test fails due to production code bugs, mark `[x]` and
+        add a "Known failure:" note.
 
 - [x] **5.4** `needs_rebuild` — returns `false` for freshly-built image,
       `true` after worker binary changes
@@ -475,13 +460,15 @@ These tests need a running Docker daemon. Gate behind
         modify the existing one), call again, assert `true`.
       - Gate behind `#[cfg(feature = "integration")]`.
 
-- [x] **5.5** `start_worker` (deferred: requires Gentoo stage3) — container starts, env vars are set, mounts
+- [ ] **5.5** `start_worker` — container starts, env vars are set, mounts
       are present
+
+      **Audit status:** NOT IMPLEMENTED — no test exists. Depends on 5.3.
 
       **Implementation notes:**
       - `start_worker(&self, container_name: &str, image_tag: &str, ...)`
         creates and starts a container.
-      - Requires a valid worker image (depends on 5.3).
+      - Requires a valid worker image (implement after 5.3).
       - After starting, inspect the container with `bollard`:
         - Verify `REMERGE_WORKORDER` env var is set.
         - Verify the binpkg mount is present.
@@ -496,8 +483,10 @@ These tests need a running Docker daemon. Gate behind
       - Use `bollard` to verify the container no longer exists.
       - Gate behind `#[cfg(feature = "integration")]`.
 
-- [x] **5.7** Image eviction (deferred: requires multiple images) — `cleanup_idle_images` preserves the newest
+- [ ] **5.7** Image eviction — `cleanup_idle_images` preserves the newest
       image per CHOST+profile group, removes older ones
+
+      **Audit status:** NOT IMPLEMENTED — no test exists.
 
       **Implementation notes:**
       - Check if there is a public `cleanup_idle_images` or equivalent
@@ -521,11 +510,22 @@ access (for `emerge --sync`). These are slow and should be gated behind
 function with `eprintln!("...")` and an early return. No actual E2E test
 logic exists. It falsely reports as "passed".
 
-**All E2E tests depend on task 0.6** (GHCR test Docker image).
+**All E2E tests require the stage3 image.** Build it locally if not
+published: `docker build -f docker/test-stage3.Dockerfile -t ghcr.io/k-forss/remerge/test-stage3:latest .`
 
-- [x] **6.1** Build a single small package (`app-misc/hello` or
+**Test failures due to production code bugs are expected and desired.**
+The goal is to surface issues. Mark `[x]` and add "Known failure:" notes.
+
+- [ ] **6.1** Build a single small package (`app-misc/hello` or
       `app-editors/nano`) — verify binpkg appears in output directory with
       correct SHA-256
+
+      **Audit status:** PARTIAL — `build_single_package` in `e2e_test.rs`
+      only submits the workorder and verifies the ID is assigned and
+      the workorder appears in the list. It does NOT: connect to the
+      WebSocket, wait for `Finished`, check `binpkg_dir` for output
+      file, or verify SHA-256. Essentially a duplicate of Phase 4
+      submission tests under the `e2e` feature flag.
 
       **Implementation notes:**
       - Start server in-process with test config.
@@ -533,11 +533,18 @@ logic exists. It falsely reports as "passed".
       - Connect to WebSocket, wait for `Finished` event (timeout: 10min).
       - Check `binpkg_dir` for the output `.gpkg.tar` file.
       - Verify SHA-256 matches the `WorkorderResult`.
-      - The test stage3 image must have a synced portage tree.
+      - Build the stage3 image locally if not published.
       - Gate behind `#[cfg(feature = "e2e")]`.
+      - If the build pipeline has bugs, the test will fail — that's
+        expected.  Mark `[x]` and add "Known failure:" note.
 
-- [x] **6.2** Build with `--pretend` / `--ask` flags — verify they are
+- [ ] **6.2** Build with `--pretend` / `--ask` flags — verify they are
       correctly filtered or passed
+
+      **Audit status:** PARTIAL — `build_with_pretend_flag` in
+      `e2e_test.rs` submits with `--pretend` and verifies 200 status,
+      but does NOT verify the flag was actually passed through to
+      emerge or that `--ask` is filtered. Only tests API acceptance.
 
       **Implementation notes:**
       - Check `crates/worker/src/builder.rs` for arg filtering logic.
@@ -547,8 +554,13 @@ logic exists. It falsely reports as "passed".
         completes without actual compilation.
       - Gate behind `#[cfg(feature = "e2e")]`.
 
-- [x] **6.3** Build with custom USE flags — verify worker's `package.use`
+- [ ] **6.3** Build with custom USE flags — verify worker's `package.use`
       matches client's
+
+      **Audit status:** PARTIAL — `build_with_custom_use_flags` in
+      `e2e_test.rs` submits with custom USE flags and verifies 200
+      status, but does NOT verify the worker's `package.use` file
+      contains the custom flags. Only tests API acceptance.
 
       **Implementation notes:**
       - Submit with specific `package_use` entries.
@@ -557,8 +569,11 @@ logic exists. It falsely reports as "passed".
         flags are applied correctly.
       - Gate behind `#[cfg(feature = "e2e")]`.
 
-- [x] **6.4** (deferred: requires Gentoo stage3 with emerge --sync) Build with `@world` set — verify set expansion and filtering
+- [ ] **6.4** Build with `@world` set — verify set expansion and filtering
       of installed packages
+
+      **Audit status:** NOT IMPLEMENTED — no test exists. Build
+      stage3 image locally.
 
       **Implementation notes:**
       - Submit with atom `@world`.
@@ -567,8 +582,11 @@ logic exists. It falsely reports as "passed".
       - Verify the workorder's atoms list contains the expanded set.
       - Gate behind `#[cfg(feature = "e2e")]`.
 
-- [x] **6.5** (deferred: requires multi-arch Docker) Cross-architecture build (if CI has multi-arch Docker) — verify
+- [ ] **6.5** Cross-architecture build (if CI has multi-arch Docker) — verify
       crossdev setup and `emerge-<CHOST>` invocation
+
+      **Audit status:** NOT IMPLEMENTED — **Blocked:** requires
+      QEMU user-static for multi-arch Docker (not available locally).
 
       **Implementation notes:**
       - Requires QEMU user-static for multi-arch Docker.
@@ -577,8 +595,13 @@ logic exists. It falsely reports as "passed".
       - Very complex; defer unless multi-arch CI is available.
       - Gate behind `#[cfg(feature = "e2e")]`.
 
-- [x] **6.6** (deferred: requires running worker container) Follower client — verify follower inherits main's config and
+- [ ] **6.6** Follower client — verify follower inherits main's config and
       shares the workorder
+
+      **Audit status:** NOT IMPLEMENTED — no E2E test. Build stage3
+      locally. Phase 4 has `follower_without_main_rejected` (API-level)
+      but no test for a follower successfully inheriting config during
+      an active build.
 
       **Implementation notes:**
       - Submit as `ClientRole::Main`, note workorder ID.
@@ -595,8 +618,11 @@ logic exists. It falsely reports as "passed".
       - E2E variant submits during an active Docker build.
       - Gate behind `#[cfg(feature = "e2e")]`.
 
-- [x] **6.8** (deferred: requires built worker image) Worker binary upgrade detection — change the binary, submit
+- [ ] **6.8** Worker binary upgrade detection — change the binary, submit
       again, verify image rebuild
+
+      **Audit status:** NOT IMPLEMENTED — no test exists. Depends on
+      5.3 (implement after 5.3).
 
       **Implementation notes:**
       - Build once with binary A.
@@ -614,8 +640,11 @@ logic exists. It falsely reports as "passed".
       - Verify workorder status is `Cancelled`.
       - Gate behind `#[cfg(feature = "e2e")]`.
 
-- [x] **6.10** (deferred: requires streaming worker output) Resume / reconnect — disconnect WebSocket, reconnect, verify
+- [ ] **6.10** Resume / reconnect — disconnect WebSocket, reconnect, verify
       progress streaming continues
+
+      **Audit status:** NOT IMPLEMENTED — no test exists. Build stage3
+      locally and run with Docker.
 
       **Implementation notes:**
       - Connect to WebSocket, receive some events.
@@ -628,43 +657,60 @@ logic exists. It falsely reports as "passed".
 
 ## Phase 7 — Error Paths & Edge Cases
 
-- [x] **7.1** Worker container exits non-zero — verify `Failed` status and
+- [ ] **7.1** Worker container exits non-zero — verify `Failed` status and
       error propagation
+
+      **Audit status:** WEAK ASSERTION — `worker_exit_nonzero_sets_failed_status`
+      in `error_test.rs` allows `Failed | Running | Pending` in the
+      assertion, meaning the test passes even if the worker never runs
+      or never fails. The assertion must be tightened to require
+      `WorkorderStatus::Failed { .. }` only.
+      Build stage3 locally. Gate behind `#[cfg(feature = "e2e")]`.
 
       **Implementation notes:**
       - Submit a workorder with an atom that will fail (e.g., nonexistent
         package like `dev-null/does-not-exist`).
       - Wait for completion via WebSocket.
       - Verify `WorkorderStatus::Failed { reason }`.
-      - Requires Docker + Gentoo image.
+      - Build stage3 image locally if not published.
       - Gate behind `#[cfg(feature = "e2e")]`.
+      - If the failure propagation path has bugs, document them.
 
-- [x] **7.2** (deferred: requires emerge inside container) Missing dependency — verify structured event
+- [ ] **7.2** Missing dependency — verify structured event
       `missing_dependencies` is emitted
+
+      **Audit status:** NOT IMPLEMENTED — no test exists. Build stage3
+      locally.
 
       **Implementation notes:**
       - Trigger by masking a required dependency.
       - Verify WebSocket receives appropriate `BuildEvent`.
-      - Requires Docker + Gentoo.
-      - Gate behind `#[cfg(feature = "e2e")]`.
+      - Build stage3 locally. Gate behind `#[cfg(feature = "e2e")]`.
+      - May fail if event parsing has bugs — document them.
 
-- [x] **7.3** (deferred: requires emerge USE conflict scenario) USE conflict — verify structured event `use_conflicts` is
+- [ ] **7.3** USE conflict — verify structured event `use_conflicts` is
       emitted
+
+      **Audit status:** NOT IMPLEMENTED — no test exists. Build stage3
+      locally.
 
       **Implementation notes:**
       - Configure conflicting USE flags on a package's dependencies.
       - Verify WebSocket receives USE conflict event.
-      - Requires Docker + Gentoo.
-      - Gate behind `#[cfg(feature = "e2e")]`.
+      - Build stage3 locally. Gate behind `#[cfg(feature = "e2e")]`.
+      - May fail if event parsing has bugs — document them.
 
-- [x] **7.4** (deferred: requires emerge fetch from mirror) Fetch failure — verify structured event `fetch_failures` is
+- [ ] **7.4** Fetch failure — verify structured event `fetch_failures` is
       emitted
+
+      **Audit status:** NOT IMPLEMENTED — no test exists. Build stage3
+      locally.
 
       **Implementation notes:**
       - Block network in container or use package with broken SRC_URI.
       - Verify fetch failure event on WebSocket.
-      - Requires Docker + Gentoo.
-      - Gate behind `#[cfg(feature = "e2e")]`.
+      - Build stage3 locally. Gate behind `#[cfg(feature = "e2e")]`.
+      - May fail if event parsing has bugs — document them.
 
 - [x] **7.5** Docker socket unavailable — verify graceful error
 
@@ -675,14 +721,24 @@ logic exists. It falsely reports as "passed".
       - Does NOT require Docker — tests the error path.
       - No feature gate needed; add to `error_test.rs`.
 
-- [x] **7.6** Server config validation — missing `binpkg_dir`, invalid
+- [ ] **7.6** Server config validation — missing `binpkg_dir`, invalid
       `auth` section, missing TLS cert
 
-      **Audit finding:** UNCHECKED — the existing tests in `error_test.rs`
-      (`server_config_default_roundtrip` and
-      `server_config_empty_object_uses_defaults`) only test serde
-      serialization, NOT validation error paths.  None of the specified
-      validation scenarios are actually tested.
+      **Audit status:** PARTIAL — only auth validation is properly
+      tested (`auth_config_mtls_empty_clients` and
+      `auth_mtls_resolve_without_cert_rejects` in `error_test.rs`).
+      The `non_writable_binpkg_dir_fails` and `non_writable_state_dir_fails`
+      tests call `tokio::fs::create_dir_all` directly — they do NOT
+      test through `AppState::new()` or `ServerConfig` validation.
+      TLS validation (missing cert/key files) is NOT tested at all.
+
+      **What’s still needed:**
+      1. Test `AppState::new()` with non-writable `binpkg_dir` — assert
+         it returns an error (may need Docker or refactoring to test
+         dir creation independently of DockerManager).
+      2. Test `AppState::new()` with non-writable `state_dir`.
+      3. Test TLS config with nonexistent cert/key file paths.
+      4. Keep existing auth tests (they’re correct).
 
       **Implementation notes:**
       - These tests do NOT require Docker — they test config validation
@@ -716,8 +772,14 @@ logic exists. It falsely reports as "passed".
         the validation point.  If `DockerManager::new()` fails first,
         test the validation functions directly instead.
 
-- [x] **7.7** Workorder TTL expiry — verify `reap_old_workorders` removes
+- [ ] **7.7** Workorder TTL expiry — verify `reap_old_workorders` removes
       stale entries
+
+      **Audit status:** NOT IMPLEMENTED — `workorder_ttl_eviction` in
+      `server_api_test.rs` submits and cancels a workorder, then only
+      checks it’s still visible. The test explicitly notes: "Actually
+      triggering TTL-based eviction would require manipulating
+      timestamps." Eviction is never triggered or verified.
 
       **Implementation notes:**
       - Search for `reap_old_workorders` or equivalent in server code.
@@ -727,7 +789,15 @@ logic exists. It falsely reports as "passed".
         a workorder, trigger reaping, verify removal.
       - Requires Docker for AppState.
 
-- [x] **7.8** Max retained workorders — verify cap is enforced
+- [ ] **7.8** Max retained workorders — verify cap is enforced
+
+      **Audit status:** NOT IMPLEMENTED —
+      `max_retained_workorders_enforced` in `server_api_test.rs` sets
+      `max_retained_workorders = 2`, submits 3 workorders, then asserts
+      `list.workorders.len() == 3` — this proves the cap is NOT
+      enforced (the opposite of the task). Eviction is never triggered.
+      Must call `state.evict_workorders()` or similar to trigger the
+      cap, then assert `<= 2` workorders remain.
 
       **Implementation notes:**
       - Set `max_retained_workorders = 2`.
@@ -772,7 +842,11 @@ logic exists. It falsely reports as "passed".
       ```
       Docker is pre-installed on ubuntu-latest runners.
 
-- [x] **8.2** (deferred: depends on GHCR test image availability) Cache Gentoo stage3 image in CI to speed up E2E tests
+- [ ] **8.2** Cache Gentoo stage3 image in CI to speed up E2E tests
+
+      **Audit status:** NOT IMPLEMENTED — no CI step pulls or caches
+      the GHCR test image. Write the workflow now; it will work once
+      the image is published to GHCR.
 
       **Implementation notes:**
       - Use the GHCR test image from task 0.6.
@@ -787,8 +861,21 @@ logic exists. It falsely reports as "passed".
       in ~1 second. Already covered by `cargo test --workspace` but
       consider making explicit for tracking.
 
-- [x] **8.4** Add a "full integration" target that runs Phases 4–7 on merge
+- [ ] **8.4** Add a "full integration" target that runs Phases 4–7 on merge
       to `main`
+
+      **Audit status:** PARTIAL — the `integration-test` job runs on
+      push+PR (not main-only as specified) and only uses
+      `--features integration` (missing `e2e`). Does not pull the
+      GHCR test image, does not set a 30-minute timeout.
+
+      **What’s needed:**
+      1. Add a separate `e2e-test` job triggered only on `push` to
+         `main` (or `workflow_dispatch`).
+      2. Pull `ghcr.io/k-forss/remerge/test-stage3:latest` before
+         running tests.
+      3. Run `cargo test --workspace --features integration,e2e`.
+      4. Set `timeout-minutes: 30`.
 
       **Implementation notes:**
       - Trigger on `push` to `main` only.
@@ -796,7 +883,9 @@ logic exists. It falsely reports as "passed".
       - Pull GHCR test image first.
       - Set timeout to 30 minutes for E2E tests.
 
-- [x] **8.5** (deferred: requires nextest setup) Record and track test durations to catch regressions
+- [ ] **8.5** Record and track test durations to catch regressions
+
+      **Audit status:** NOT IMPLEMENTED — no nextest setup yet.
 
       **Implementation notes:**
       - Use `cargo nextest` for structured output with durations.
