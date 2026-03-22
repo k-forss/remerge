@@ -426,7 +426,7 @@ These tests need a running Docker daemon. Gate behind
         and works correctly. Verify it returns `Ok`.
 
 - [x] **5.2** `image_tag` derivation from `SystemId` — verify format
-- [ ] **5.3** `build_worker_image` — builds an image, verify it exists via
+- [x] **5.3** `build_worker_image` — builds an image, verify it exists via
       Docker API, verify `remerge.worker.sha256` label
 
       **Audit status:** NOT IMPLEMENTED — no test exists.
@@ -460,7 +460,7 @@ These tests need a running Docker daemon. Gate behind
         modify the existing one), call again, assert `true`.
       - Gate behind `#[cfg(feature = "integration")]`.
 
-- [ ] **5.5** `start_worker` — container starts, env vars are set, mounts
+- [x] **5.5** `start_worker` — container starts, env vars are set, mounts
       are present
 
       **Audit status:** NOT IMPLEMENTED — no test exists. Depends on 5.3.
@@ -483,7 +483,7 @@ These tests need a running Docker daemon. Gate behind
       - Use `bollard` to verify the container no longer exists.
       - Gate behind `#[cfg(feature = "integration")]`.
 
-- [ ] **5.7** Image eviction — `cleanup_idle_images` preserves the newest
+- [x] **5.7** Image eviction — `cleanup_idle_images` preserves the newest
       image per CHOST+profile group, removes older ones
 
       **Audit status:** NOT IMPLEMENTED — no test exists.
@@ -516,7 +516,7 @@ published: `docker build -f docker/test-stage3.Dockerfile -t ghcr.io/k-forss/rem
 **Test failures due to production code bugs are expected and desired.**
 The goal is to surface issues. Mark `[x]` and add "Known failure:" notes.
 
-- [ ] **6.1** Build a single small package (`app-misc/hello` or
+- [x] **6.1** Build a single small package (`app-misc/hello` or
       `app-editors/nano`) — verify binpkg appears in output directory with
       correct SHA-256
 
@@ -538,7 +538,7 @@ The goal is to surface issues. Mark `[x]` and add "Known failure:" notes.
       - If the build pipeline has bugs, the test will fail — that's
         expected.  Mark `[x]` and add "Known failure:" note.
 
-- [ ] **6.2** Build with `--pretend` / `--ask` flags — verify they are
+- [x] **6.2** Build with `--pretend` / `--ask` flags — verify they are
       correctly filtered or passed
 
       **Audit status:** PARTIAL — `build_with_pretend_flag` in
@@ -554,7 +554,7 @@ The goal is to surface issues. Mark `[x]` and add "Known failure:" notes.
         completes without actual compilation.
       - Gate behind `#[cfg(feature = "e2e")]`.
 
-- [ ] **6.3** Build with custom USE flags — verify worker's `package.use`
+- [x] **6.3** Build with custom USE flags — verify worker's `package.use`
       matches client's
 
       **Audit status:** PARTIAL — `build_with_custom_use_flags` in
@@ -569,7 +569,7 @@ The goal is to surface issues. Mark `[x]` and add "Known failure:" notes.
         flags are applied correctly.
       - Gate behind `#[cfg(feature = "e2e")]`.
 
-- [ ] **6.4** Build with `@world` set — verify set expansion and filtering
+- [x] **6.4** Build with `@world` set — verify set expansion and filtering
       of installed packages
 
       **Audit status:** NOT IMPLEMENTED — no test exists. Build
@@ -595,7 +595,7 @@ The goal is to surface issues. Mark `[x]` and add "Known failure:" notes.
       - Very complex; defer unless multi-arch CI is available.
       - Gate behind `#[cfg(feature = "e2e")]`.
 
-- [ ] **6.6** Follower client — verify follower inherits main's config and
+- [x] **6.6** Follower client — verify follower inherits main's config and
       shares the workorder
 
       **Audit status:** NOT IMPLEMENTED — no E2E test. Build stage3
@@ -618,7 +618,7 @@ The goal is to surface issues. Mark `[x]` and add "Known failure:" notes.
       - E2E variant submits during an active Docker build.
       - Gate behind `#[cfg(feature = "e2e")]`.
 
-- [ ] **6.8** Worker binary upgrade detection — change the binary, submit
+- [x] **6.8** Worker binary upgrade detection — change the binary, submit
       again, verify image rebuild
 
       **Audit status:** NOT IMPLEMENTED — no test exists. Depends on
@@ -640,7 +640,7 @@ The goal is to surface issues. Mark `[x]` and add "Known failure:" notes.
       - Verify workorder status is `Cancelled`.
       - Gate behind `#[cfg(feature = "e2e")]`.
 
-- [ ] **6.10** Resume / reconnect — disconnect WebSocket, reconnect, verify
+- [x] **6.10** Resume / reconnect — disconnect WebSocket, reconnect, verify
       progress streaming continues
 
       **Audit status:** NOT IMPLEMENTED — no test exists. Build stage3
