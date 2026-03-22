@@ -1035,3 +1035,93 @@ async fn ensure_repo_locations_rejects_traversal() {
         "error should mention invalid location: {err_msg}"
     );
 }
+
+// ── apply_config_inner ──────────────────────────────────────────────
+
+/// Full orchestration: apply_config_inner writes all portage config files.
+#[tokio::test]
+async fn apply_config_orchestration() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let base = tmp.path().join("etc/portage");
+    std::fs::create_dir_all(&base).expect("create base dir");
+
+    let config = common::fixtures::full_portage_config();
+
+    portage_setup::apply_config_inner(&base, &config, "x86_64-pc-linux-gnu", None, None)
+        .await
+        .expect("apply_config_inner should succeed");
+
+    // Verify make.conf was written.
+    let make_conf = std::fs::read_to_string(base.join("make.conf"))
+        .expect("make.conf should exist");
+    assert!(
+        make_conf.contains("CHOST="),
+        "make.conf should contain CHOST"
+    );
+    assert!(
+        make_conf.contains("CFLAGS="),
+        "make.conf should contain CFLAGS"
+    );
+
+    // Verify package.use was written.
+    assert!(
+        base.join("package.use/remerge").exists(),
+        "package.use/remerge should exist"
+    );
+
+    // Verify package.accept_keywords was written.
+    assert!(
+        base.join("package.accept_keywords/remerge").exists(),
+        "package.accept_keywords/remerge should exist"
+    );
+
+    // Verify package.license was written.
+    assert!(
+        base.join("package.license/remerge").exists(),
+        "package.license/remerge should exist"
+    );
+
+    // Verify package.mask was written.
+    assert!(
+        base.join("package.mask/remerge").exists(),
+        "package.mask/remerge should exist"
+    );
+
+    // Verify package.unmask was written.
+    assert!(
+        base.join("package.unmask/remerge").exists(),
+        "package.unmask/remerge should exist"
+    );
+
+    // Verify package.env was written.
+    assert!(
+        base.join("package.env/remerge").exists(),
+        "package.env/remerge should exist"
+    );
+
+    // Verify env files were written.
+    assert!(
+        base.join("env/no-lto.conf").exists(),
+        "env/no-lto.conf should exist"
+    );
+
+    // Verify repos.conf was written.
+    assert!(
+        base.join("repos.conf").is_dir(),
+        "repos.conf directory should exist"
+    );
+
+    // Verify profile overlay was written.
+    let use_mask = std::fs::read_to_string(base.join("profile/use.mask"))
+        .expect("profile/use.mask should exist");
+    assert!(
+        !use_mask.is_empty(),
+        "profile overlay use.mask should have content"
+    );
+
+    // Verify patches were written.
+    assert!(
+        base.join("patches/dev-libs/openssl").is_dir(),
+        "patches directory structure should exist"
+    );
+}

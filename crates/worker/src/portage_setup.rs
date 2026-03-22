@@ -42,6 +42,50 @@ pub async fn apply_config(
     Ok(())
 }
 
+/// Testable inner variant of [`apply_config`] that writes all portage
+/// configuration files relative to `base` (e.g. a temp dir) instead of
+/// hardcoded `/etc/portage/`.
+///
+/// This does NOT call `ensure_repo_locations` or `set_profile`'s
+/// on-disk repos.conf scanning, since those operate on absolute
+/// container paths.  Profile is set based on repo locations derived
+/// from the config's repos_conf.
+pub async fn apply_config_inner(
+    base: &Path,
+    config: &PortageConfig,
+    worker_chost: &str,
+    gpg_key: Option<&str>,
+    gpg_home: Option<&str>,
+) -> Result<()> {
+    write_make_conf_inner(base, config, worker_chost, gpg_key, gpg_home).await?;
+    write_package_use_inner(base, config).await?;
+    write_package_accept_keywords_inner(base, config).await?;
+    write_package_license_inner(base, config).await?;
+    write_package_mask_inner(base, config).await?;
+    write_package_unmask_inner(base, config).await?;
+    write_package_env_inner(base, config).await?;
+    write_env_files_inner(base, config).await?;
+    write_repos_conf_inner(base, config).await?;
+    write_profile_overlay_inner(&base.join("profile"), config).await?;
+    write_patches_inner(&base.join("patches"), config).await?;
+
+    // Derive repo locations from the config for profile setting.
+    let repo_locations: Vec<String> = config
+        .repos_conf
+        .values()
+        .flat_map(|content| parse_repo_sections(content))
+        .map(|(_, location)| location)
+        .collect();
+
+    set_profile_inner(&config.profile, &repo_locations, &base.join("make.profile")).await?;
+
+    info!(
+        "Portage configuration applied to {}",
+        base.display()
+    );
+    Ok(())
+}
+
 /// Write/overwrite `/etc/portage/make.conf` with the client's settings.
 ///
 /// Sets `CHOST` to the target and, when cross-compiling, also `CBUILD`.

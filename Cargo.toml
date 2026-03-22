@@ -23,6 +23,8 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 reqwest = { workspace = true }
 axum = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = "0.3"
 
 [workspace]
 resolver = "2"
@@ -82,6 +84,7 @@ hex = "0.4"
 regex = "1"
 bytes = "1"
 tempfile = "3"
+tokio-tungstenite = "0.28"
 
 [profile.release]
 lto = true

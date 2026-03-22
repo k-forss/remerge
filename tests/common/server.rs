@@ -21,6 +21,14 @@ pub struct TestServer {
 impl TestServer {
     /// Start an in-process test server. Requires Docker to be available.
     pub async fn start() -> Option<Self> {
+        Self::start_with_config(None).await
+    }
+
+    /// Start an in-process test server with a custom config override.
+    /// If `config_override` is None, uses the default config.
+    pub async fn start_with_config(
+        config_override: Option<remerge_server::config::ServerConfig>,
+    ) -> Option<Self> {
         if !docker_available() {
             return None;
         }
@@ -29,13 +37,12 @@ impl TestServer {
         let binpkg_dir = tempfile::TempDir::new().expect("temp dir");
         let state_dir = tempfile::TempDir::new().expect("temp dir");
 
-        // Create a minimal server config
-        let config = remerge_server::config::ServerConfig {
+        let config = config_override.unwrap_or_else(|| remerge_server::config::ServerConfig {
             binpkg_dir: binpkg_dir.path().to_path_buf(),
             binhost_url: format!("http://127.0.0.1:{port}/binpkgs"),
             state_dir: state_dir.path().to_path_buf(),
             ..Default::default()
-        };
+        });
 
         let state = match remerge_server::state::AppState::new(config).await {
             Ok(s) => std::sync::Arc::new(s),

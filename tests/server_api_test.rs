@@ -396,3 +396,146 @@ async fn follower_without_main_rejected() {
         "follower without main should be rejected"
     );
 }
+
+/// WebSocket /api/v1/workorders/:id/progress — connects and receives events.
+#[cfg(feature = "integration")]
+#[tokio::test]
+async fn websocket_progress_stream() {
+    use futures_util::StreamExt;
+
+    if !require_docker() {
+        return;
+    }
+    let Some(server) = common::server::TestServer::start().await else {
+        return;
+    };
+
+    // 1. Submit a workorder.
+    let req = SubmitWorkorderRequest {
+        client_id: uuid::Uuid::new_v4(),
+        role: remerge_types::client::ClientRole::Main,
+        atoms: vec!["dev-libs/openssl".into()],
+        emerge_args: vec![],
+        portage_config: common::fixtures::minimal_portage_config(),
+        system_id: common::fixtures::minimal_system_identity(),
+    };
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/api/v1/workorders", server.base_url))
+        .json(&req)
+        .send()
+        .await
+        .expect("submit request");
+    assert_eq!(resp.status(), 200);
+
+    let submit_resp: SubmitWorkorderResponse = resp.json().await.expect("parse response");
+    let workorder_id = submit_resp.workorder_id;
+
+    // 2. Connect to WebSocket.
+    let ws_url = format!(
+        "ws://127.0.0.1:{}/api/v1/workorders/{}/progress",
+        server.port, workorder_id
+    );
+
+    let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("WebSocket connection should succeed");
+
+    let (_, mut read) = ws_stream.split();
+
+    // 3. Cancel the workorder to trigger a StatusChanged event.
+    let resp = client
+        .delete(format!(
+            "{}/api/v1/workorders/{}",
+            server.base_url, workorder_id
+        ))
+        .send()
+        .await
+        .expect("cancel request");
+    assert_eq!(resp.status(), 200);
+
+    // 4. Read frames with timeout — we should get at least one text event.
+    let mut received_text = false;
+    for _ in 0..10 {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), read.next()).await {
+            Ok(Some(Ok(msg))) => {
+                if msg.is_text() {
+                    received_text = true;
+                    let text = msg.into_text().expect("text frame");
+                    // Should be a JSON BuildProgress event.
+                    assert!(
+                        text.contains("StatusChanged") || text.contains("Finished"),
+                        "text frame should contain status event: {text}"
+                    );
+                    break;
+                }
+            }
+            Ok(Some(Err(e))) => {
+                eprintln!("WebSocket error: {e}");
+                break;
+            }
+            Ok(None) => break,         // Stream closed.
+            Err(_) => break,           // Timeout.
+        }
+    }
+
+    assert!(
+        received_text,
+        "should have received at least one text frame with status event"
+    );
+}
+
+/// Auth enforcement: None mode allows all (implicitly tested above),
+/// Mtls mode rejects requests without cert header.
+#[cfg(feature = "integration")]
+#[tokio::test]
+async fn auth_mtls_rejects_without_cert() {
+    if !require_docker() {
+        return;
+    }
+
+    let port = common::free_port();
+    let binpkg_dir = tempfile::TempDir::new().expect("temp dir");
+    let state_dir = tempfile::TempDir::new().expect("temp dir");
+
+    let config = remerge_server::config::ServerConfig {
+        binpkg_dir: binpkg_dir.path().to_path_buf(),
+        binhost_url: format!("http://127.0.0.1:{port}/binpkgs"),
+        state_dir: state_dir.path().to_path_buf(),
+        auth: remerge_server::auth::AuthConfig {
+            mode: remerge_types::auth::AuthMode::Mtls,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let Some(server) = common::server::TestServer::start_with_config(Some(config)).await else {
+        return;
+    };
+
+    // Submit without cert header — should be rejected.
+    let req = SubmitWorkorderRequest {
+        client_id: uuid::Uuid::new_v4(),
+        role: remerge_types::client::ClientRole::Main,
+        atoms: vec!["dev-libs/openssl".into()],
+        emerge_args: vec![],
+        portage_config: common::fixtures::minimal_portage_config(),
+        system_id: common::fixtures::minimal_system_identity(),
+    };
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/api/v1/workorders", server.base_url))
+        .json(&req)
+        .send()
+        .await
+        .expect("submit request");
+
+    // Should get 401 or 403 — mTLS cert is required.
+    assert!(
+        resp.status() == 401 || resp.status() == 403,
+        "mTLS without cert should return 401 or 403, got {}",
+        resp.status()
+    );
+}

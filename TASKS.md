@@ -323,7 +323,7 @@ mock layer.
 - [x] **3.12** `build_makeopts` — server env REMERGE_PARALLEL_JOBS and
       REMERGE_LOAD_AVERAGE override client MAKEOPTS; absent env falls back
       to client MAKEOPTS; tested via `build_makeopts_inner`
-- [ ] **3.13** `apply_config` orchestration — call with a full `PortageConfig`
+- [x] **3.13** `apply_config` orchestration — call with a full `PortageConfig`
       and assert that all files are present under the temp root
 
       **Implementation notes:**
@@ -379,7 +379,7 @@ they report as "passed" despite not actually running. This must be fixed.
 - [x] **4.7** `GET /api/v1/health` — returns 200 with status "ok"
 - [x] **4.8** `GET /api/v1/info` — returns server version, auth mode,
       binhost URL
-- [ ] **4.9** WebSocket `/api/v1/workorders/:id/progress` — connects,
+- [x] **4.9** WebSocket `/api/v1/workorders/:id/progress` — connects,
       receives text events, binary PTY frames
 
       **Implementation notes:**
@@ -392,7 +392,7 @@ they report as "passed" despite not actually running. This must be fixed.
         the status change is received.
       - Requires Docker. Gate with `require_docker()`.
 
-- [ ] **4.10** Auth enforcement: `None` mode allows all, `Mtls` mode
+- [x] **4.10** Auth enforcement: `None` mode allows all, `Mtls` mode
       rejects missing cert, `Mixed` mode enforces main vs follower rules
 
       **Implementation notes:**
