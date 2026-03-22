@@ -110,18 +110,18 @@ jobs:
       - name: Build
         run: |
           if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }} --bin ${{ matrix.binary }}
+            cross build --release --target ${{ matrix.target }} -p ${{ matrix.package }} --bin ${{ matrix.binary }}
           else
-            cargo build --release --target ${{ matrix.target }} --bin ${{ matrix.binary }}
+            cargo build --release --target ${{ matrix.target }} -p ${{ matrix.package }} --bin ${{ matrix.binary }}
           fi
 
       - name: Build worker binary
         if: matrix.extra_binary
         run: |
           if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }} --bin ${{ matrix.extra_binary }}
+            cross build --release --target ${{ matrix.target }} -p remerge-worker --bin ${{ matrix.extra_binary }}
           else
-            cargo build --release --target ${{ matrix.target }} --bin ${{ matrix.extra_binary }}
+            cargo build --release --target ${{ matrix.target }} -p remerge-worker --bin ${{ matrix.extra_binary }}
           fi
 
       - name: Package

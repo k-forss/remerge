@@ -251,6 +251,11 @@ mod docker_tests {
     /// 6.5 (continued): Cross-arch image build — actually build a worker
     /// image with crossdev for a foreign target. Requires Docker and the
     /// stage3 base image. This is a slow test (crossdev compilation).
+    ///
+    /// Gated behind `e2e` — crossdev requires a fully synced portage tree
+    /// and is fragile in CI (emerge of sys-devel/crossdev can fail if the
+    /// tree snapshot doesn't have all required ebuilds).
+    #[cfg(feature = "e2e")]
     #[tokio::test]
     async fn cross_arch_image_build() {
         if !common::server::docker_available() {
