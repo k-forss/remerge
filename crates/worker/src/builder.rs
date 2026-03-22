@@ -129,38 +129,73 @@ async fn sync_portage() -> Result<()> {
 /// already available.  But client overlays (layman, eselect-repository,
 /// GURU, etc.) may not be present on the server.  This function detects
 /// those and syncs them individually via `emaint sync -r <name>`.
+///
+/// Overlays whose `sync-uri` uses an SSH or authenticated URI scheme
+/// (`git@`, `ssh://`, etc.) are skipped because the worker container
+/// lacks the client's SSH keys.
 async fn sync_missing_repos() -> Result<()> {
     let repos = discover_configured_repos().await;
     let mut synced = 0usize;
+    let mut skipped = 0usize;
 
-    for (name, location) in &repos {
-        if is_repo_populated(location) {
+    for repo in &repos {
+        if is_repo_populated(&repo.location) {
             continue;
         }
 
-        info!(repo = %name, location = %location, "Syncing missing overlay");
+        // Skip repos whose sync-uri requires authentication.
+        if let Some(ref uri) = repo.sync_uri
+            && requires_auth(uri)
+        {
+            info!(
+                repo = %repo.name,
+                sync_uri = %uri,
+                "Skipping overlay — sync-uri requires authentication"
+            );
+            skipped += 1;
+            continue;
+        }
+
+        info!(repo = %repo.name, location = %repo.location, "Syncing missing overlay");
         let status = Command::new("emaint")
-            .args(["sync", "-r", name])
+            .args(["sync", "-r", &repo.name])
             .status()
             .await
-            .with_context(|| format!("Failed to sync overlay {name}"))?;
+            .with_context(|| format!("Failed to sync overlay {}", repo.name))?;
 
         if status.success() {
             synced += 1;
         } else {
-            tracing::warn!(repo = %name, "Overlay sync failed (continuing anyway)");
+            tracing::warn!(repo = %repo.name, "Overlay sync failed (continuing anyway)");
         }
     }
 
     if synced > 0 {
         info!(synced, "Synced missing overlay repos");
     }
+    if skipped > 0 {
+        info!(skipped, "Skipped overlays requiring authentication");
+    }
     Ok(())
 }
 
-/// Read `/etc/portage/repos.conf/` and return `(name, location)` pairs
-/// for all configured repositories.
-async fn discover_configured_repos() -> Vec<(String, String)> {
+/// Returns `true` if a sync-uri requires authentication (SSH, etc.)
+/// and would fail inside an ephemeral worker container.
+fn requires_auth(uri: &str) -> bool {
+    // git@host:path  or  ssh://  or  git+ssh://
+    uri.contains('@') || uri.starts_with("ssh://") || uri.starts_with("git+ssh://")
+}
+
+/// Metadata about a configured repo.
+struct RepoInfo {
+    name: String,
+    location: String,
+    sync_uri: Option<String>,
+}
+
+/// Read `/etc/portage/repos.conf/` and return metadata for all configured
+/// repositories — including sync-uri when present.
+async fn discover_configured_repos() -> Vec<RepoInfo> {
     let conf_path = std::path::Path::new("/etc/portage/repos.conf");
     let mut repos = Vec::new();
 
@@ -170,14 +205,69 @@ async fn discover_configured_repos() -> Vec<(String, String)> {
         };
         while let Ok(Some(entry)) = dir.next_entry().await {
             if let Ok(content) = tokio::fs::read_to_string(entry.path()).await {
-                repos.extend(crate::portage_setup::parse_repo_sections(&content));
+                repos.extend(parse_repo_sections_full(&content));
             }
         }
     } else if conf_path.is_file()
         && let Ok(content) = tokio::fs::read_to_string(conf_path).await
     {
-        repos.extend(crate::portage_setup::parse_repo_sections(&content));
+        repos.extend(parse_repo_sections_full(&content));
     }
+
+    repos
+}
+
+/// Parse an INI-style repos.conf file and return full metadata including
+/// sync-uri.  The `[DEFAULT]` section and sections without a `location`
+/// key are skipped.
+fn parse_repo_sections_full(content: &str) -> Vec<RepoInfo> {
+    let mut repos = Vec::new();
+    let mut current_name = String::new();
+    let mut current_location: Option<String> = None;
+    let mut current_sync_uri: Option<String> = None;
+
+    let flush = |name: &str,
+                 location: Option<String>,
+                 sync_uri: Option<String>,
+                 out: &mut Vec<RepoInfo>| {
+        if !name.is_empty()
+            && !name.eq_ignore_ascii_case("DEFAULT")
+            && let Some(loc) = location
+        {
+            out.push(RepoInfo {
+                name: name.to_string(),
+                location: loc,
+                sync_uri,
+            });
+        }
+    };
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            flush(
+                &current_name,
+                current_location.take(),
+                current_sync_uri.take(),
+                &mut repos,
+            );
+            current_name = trimmed[1..trimmed.len() - 1].to_string();
+        } else if let Some((key, value)) = trimmed.split_once('=') {
+            let key = key.trim();
+            let value = value.trim().to_string();
+            if key.eq_ignore_ascii_case("location") {
+                current_location = Some(value);
+            } else if key.eq_ignore_ascii_case("sync-uri") {
+                current_sync_uri = Some(value);
+            }
+        }
+    }
+    flush(
+        &current_name,
+        current_location,
+        current_sync_uri,
+        &mut repos,
+    );
 
     repos
 }
