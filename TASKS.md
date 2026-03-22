@@ -24,6 +24,41 @@ All items are ordered by dependency (earlier items unblock later ones).
       tests on `ubuntu-latest` with Docker available (GitHub-hosted runners
       have Docker pre-installed)
 
+      **Implementation notes:**
+      - Add an `integration-test` job that runs
+        `cargo test --workspace --features integration` with Docker already
+        available on the runner.
+      - Add a separate `e2e-test` job (manual or merge-to-main only) that
+        pulls `ghcr.io/<owner>/remerge-test-stage3:latest` and runs
+        `cargo test --workspace --features e2e`.
+      - Depend on the new GHCR test image from task 0.6.
+
+- [ ] **0.6** Create and publish a remerge integration test Docker image to GHCR
+
+      **Implementation notes:**
+      This is a prerequisite for all Gentoo-specific tests (Phase 2 tasks
+      2.1–2.6, 2.8, Phase 3 tasks 3.1–3.8, 3.13, and all E2E tests).
+
+      Create `docker/test-stage3.Dockerfile` that:
+      1. Starts from `gentoo/stage3:latest`
+      2. Runs `emerge --sync` (or copies a pre-synced portage tree snapshot)
+      3. Installs `portageq` (already in stage3, verify it works)
+      4. Installs `cpuid2cpuflags` (for CPU flag detection tests)
+      5. Creates a minimal `/var/db/pkg` tree with a few known packages
+         for `is_installed` tests
+      6. Creates a minimal portage tree layout in `/var/db/repos/gentoo`
+         with profiles and a few ebuilds
+      7. Tags as `ghcr.io/<owner>/remerge-test-stage3:latest`
+
+      Add a GitHub Actions workflow `docker/publish-test-image.yml` that:
+      - Triggers on changes to `docker/test-stage3.Dockerfile` or manual
+        dispatch
+      - Builds and pushes to GHCR with `packages: write` permission
+      - Caches layers to speed up rebuilds
+
+      Tests that need this image should use `#[cfg(feature = "e2e")]` or
+      check for the image availability and skip gracefully.
+
 ---
 
 ## Phase 1 — Types & Validation (no I/O)
@@ -51,21 +86,62 @@ Tests that create a temp directory tree mimicking `/etc/portage/` and `/var/db/p
 
 - [ ] **2.1** `read_config` golden path: populate a full temp portage tree in a
       temp dir, set `ROOT` to that dir, call `PortageReader::new()?.read_config()`,
-      assert every field (requires portageq — skipped in non-Gentoo CI)
+      assert every field
+
+      **Implementation notes:**
+      - `read_config()` calls `portageq envvar USE` and other `portageq`
+        commands internally. These are not available on non-Gentoo hosts.
+      - **Option A (preferred):** Run this test inside the GHCR test image
+        from task 0.6 using `docker run`. Gate behind `#[cfg(feature = "e2e")]`.
+      - **Option B:** Accept that `portageq` falls back gracefully (the code
+        has fallback paths when `portageq` fails) and test only the
+        fallback-path behaviour on non-Gentoo hosts. This tests a subset.
+      - Choose Option A for full coverage; implement Option B as a separate
+        lower-priority task for fast CI.
+
 - [ ] **2.2** `read_config` with missing optional dirs (no `package.use/`,
       no `patches/`, no `profile/` overlay) — should succeed with empty maps
-      (requires portageq — skipped in non-Gentoo CI)
+
+      **Implementation notes:**
+      Same constraints as 2.1 — requires `portageq` or fallback testing.
+      Gate behind `#[cfg(feature = "e2e")]` for full test; add a fallback
+      variant that tests just the file-parsing logic without `portageq`.
+
 - [ ] **2.3** `read_config` with `package.use` as a single file vs. a directory
-      of files (Portage supports both) (requires portageq — skipped in
-      non-Gentoo CI)
+      of files (Portage supports both)
+
+      **Implementation notes:**
+      Same constraints as 2.1. The file-vs-directory distinction is handled
+      in `read_config()` which calls `portageq`. Gate behind
+      `#[cfg(feature = "e2e")]`.
+
 - [ ] **2.4** `read_profile_overlay` round-trip: write files into
       `<ROOT>/etc/portage/profile/` in the temp dir, call
       `PortageReader::new()?.read_profile_overlay()`, assert `BTreeMap` keys and
-      content (requires portageq — skipped in non-Gentoo CI)
+      content
+
+      **Implementation notes:**
+      `read_profile_overlay()` is called from within `read_config()`.
+      Check if it's a separate `pub` method or only called internally.
+      If internal, either:
+      - Extract to a standalone `pub fn` with a path parameter, OR
+      - Test via `read_config()` inside the GHCR image.
+      `PortageReader::new()` calls `portageq` to find the portage root.
+      Gate behind `#[cfg(feature = "e2e")]` or add `_inner` variant.
+
 - [ ] **2.5** `read_patches_recursive` with nested `category/package/*.patch`
-      (requires portageq — skipped in non-Gentoo CI)
+
+      **Implementation notes:**
+      Same as 2.4 — check if this is separately callable. If only internal
+      to `read_config()`, needs `_inner` variant or E2E test.
+      Gate behind `#[cfg(feature = "e2e")]`.
+
 - [ ] **2.6** `read_repos_conf` with multiple `[section]` blocks, verify
-      repo names and locations (requires portageq — skipped in non-Gentoo CI)
+      repo names and locations
+
+      **Implementation notes:**
+      Same as 2.4. Gate behind `#[cfg(feature = "e2e")]`.
+
 - [x] **2.7** `is_installed` with version constraints:
   - [x] `category/pkg` — any version matches
   - [x] `=category/pkg-1.2.3` — exact match
@@ -80,6 +156,16 @@ Tests that create a temp directory tree mimicking `/etc/portage/` and `/var/db/p
   - [x] Uninstalled package — returns false
 - [ ] **2.8** `expand_set` for `@world` (reads world file) and `@system`
       (calls `portageq`) — requires portageq
+
+      **Implementation notes:**
+      - `@world` expansion reads `/var/lib/portage/world` — this can be
+        tested with a temp dir on any host by setting ROOT.
+      - `@system` expansion calls `portageq` — requires Gentoo or the
+        GHCR test image.
+      - Split into two tests: `expand_set_world` (no portageq needed,
+        runs in default CI) and `expand_set_system` (needs portageq,
+        gate behind `#[cfg(feature = "e2e")]`).
+
 - [x] **2.9** `split_name_version` edge cases: numeric-only names
       (`dev-libs/1lib`), multi-hyphen (`x11-libs/gtk+-2.0`), no version
 - [x] **2.10** `compare_versions` edge cases: suffixes (`_alpha`, `_beta`,
@@ -91,24 +177,114 @@ Tests that create a temp directory tree mimicking `/etc/portage/` and `/var/db/p
 
 Tests that call `portage_setup` functions against a temp directory.
 
+**Note:** Tasks 3.1–3.8 and 3.13 require writing to hardcoded paths under
+`/etc/portage/` because the production functions (`write_make_conf`,
+`write_package_use`, `write_env_files`, etc.) are **private** and use
+hardcoded absolute paths. To test these without root access:
+
+**Required prerequisite:** Create `_inner` variants (like was done for
+`write_profile_overlay_inner`, `write_patches_inner`, `set_profile_inner`,
+and `build_makeopts_inner`) that accept a base path parameter. Make them
+`pub` for integration testing. This is a minimal visibility change, not a
+mock layer.
+
+- [ ] **3.0** Create `_inner` variants for private portage_setup functions
+
+      **Implementation notes:**
+      Add `pub` `_inner` variants for these functions in
+      `crates/worker/src/portage_setup.rs`:
+      - `write_make_conf_inner(base: &Path, config: &PortageConfig, worker_chost: &str, gpg_key: Option<&str>, gpg_home: Option<&str>)`
+      - `write_package_use_inner(base: &Path, config: &PortageConfig)`
+      - `write_package_accept_keywords_inner(base: &Path, config: &PortageConfig)`
+      - `write_package_license_inner(base: &Path, config: &PortageConfig)`
+      - `write_package_mask_inner(base: &Path, config: &PortageConfig)`
+      - `write_package_unmask_inner(base: &Path, config: &PortageConfig)`
+      - `write_package_env_inner(base: &Path, config: &PortageConfig)`
+      - `write_env_files_inner(base: &Path, config: &PortageConfig)`
+      - `write_repos_conf_inner(base: &Path, config: &PortageConfig, repos_dir: Option<&Path>)`
+
+      Each `_inner` variant writes files relative to `base` instead of
+      `/etc/portage/`. The existing functions become thin wrappers:
+      ```rust
+      async fn write_make_conf(...) -> Result<()> {
+          write_make_conf_inner(Path::new("/etc/portage"), ...).await
+      }
+      ```
+
+      Follow the exact pattern already established by:
+      - `write_profile_overlay` → `write_profile_overlay_inner`
+      - `write_patches` → `write_patches_inner`
+      - `set_profile` → `set_profile_inner`
+      - `build_makeopts` → `build_makeopts_inner`
+
 - [ ] **3.1** `write_make_conf` golden path: provide a `MakeConf`, assert
-      generated file content line-by-line (writes to hardcoded `/etc/portage/` —
-      requires root or container environment)
+      generated file content line-by-line
+
+      **Implementation notes:**
+      Depends on task 3.0 (`write_make_conf_inner`). Use a temp dir as
+      base path. Assert CHOST, CFLAGS, CXXFLAGS, LDFLAGS, MAKEOPTS, USE,
+      FEATURES, ACCEPT_LICENSE, ACCEPT_KEYWORDS, CPU_FLAGS, USE_EXPAND,
+      extra vars, PKGDIR lines are all present and correct.
+
 - [ ] **3.2** `write_make_conf` with `use_flags_resolved = true` — USE line
-      must start with `-* ` (requires root)
+      must start with `-* `
+
+      **Implementation notes:**
+      Depends on task 3.0. Set `make_conf.use_flags_resolved = true`,
+      verify the output contains `USE="-* flag1 flag2"`.
+
 - [ ] **3.3** `write_make_conf` with `use_flags_resolved = false` — no `-*`
-      prefix (requires root)
+      prefix
+
+      **Implementation notes:**
+      Depends on task 3.0. Set `make_conf.use_flags_resolved = false`,
+      verify the output does NOT contain `-*`.
+
 - [ ] **3.4** `write_make_conf` with USE_EXPAND flags — must appear as
-      separate variables, not inside USE (requires root)
+      separate variables, not inside USE
+
+      **Implementation notes:**
+      Depends on task 3.0. Populate `make_conf.use_expand` with
+      `VIDEO_CARDS: ["intel"]` and `INPUT_DEVICES: ["libinput"]`,
+      verify output has `VIDEO_CARDS="intel"` and
+      `INPUT_DEVICES="libinput"` as separate lines.
+
 - [ ] **3.5** `write_package_config` for each config type (use, keywords,
       license, mask, unmask, env) — both single-entry and multi-entry
-      (requires root)
+
+      **Implementation notes:**
+      Depends on task 3.0. Test each `write_package_*_inner` function.
+      For each: create a temp dir, call the function, read the written
+      file, assert content matches expected format:
+      - `package.use/remerge`: `atom flag1 flag2\n`
+      - `package.accept_keywords/remerge`: `atom ~amd64\n`
+      - `package.license/remerge`: `atom license-name\n`
+      - `package.mask/remerge`: `atom\n`
+      - `package.unmask/remerge`: `atom\n`
+      - `package.env/remerge`: `atom env-file.conf\n`
+
 - [ ] **3.6** `write_env_files` — write, verify content and permissions
-      (requires root)
+
+      **Implementation notes:**
+      Depends on task 3.0 (`write_env_files_inner`). Write multiple env
+      files, verify they appear in `base/env/`, verify content matches,
+      verify invalid filenames (containing `/` or `..`) are skipped.
+
 - [ ] **3.7** `write_repos_conf` with server `repos_dir` bind-mount remapping
-      (locations must be rewritten to `/var/db/repos/<name>`) (requires root)
+      (locations must be rewritten to `/var/db/repos/<name>`)
+
+      **Implementation notes:**
+      Depends on task 3.0 (`write_repos_conf_inner`). Pass a `repos_dir`
+      value and verify that the `location =` lines in the output are
+      rewritten to use the repos_dir path.
+
 - [ ] **3.8** `write_repos_conf` without server repos_dir — locations
-      preserved as-is (requires root)
+      preserved as-is
+
+      **Implementation notes:**
+      Depends on task 3.0 (`write_repos_conf_inner`). Pass `None` for
+      repos_dir and verify that `location =` lines are preserved.
+
 - [x] **3.9** `set_profile` — creates symlink pointing to the correct repo's
       `profiles/<profile>` path; tested via `set_profile_inner` with temp dirs
 - [x] **3.10** `write_profile_overlay` — writes files to temp dir,
@@ -122,7 +298,14 @@ Tests that call `portage_setup` functions against a temp directory.
       to client MAKEOPTS; tested via `build_makeopts_inner`
 - [ ] **3.13** `apply_config` orchestration — call with a full `PortageConfig`
       and assert that all files are present under the temp root
-      (requires root — writes to hardcoded paths)
+
+      **Implementation notes:**
+      - `apply_config()` calls all the private `write_*` functions which
+        write to hardcoded `/etc/portage/` paths.
+      - After task 3.0 is complete, create an `apply_config_inner` that
+        takes a base path, or test this inside the GHCR Docker image.
+      - **Recommended:** Gate behind `#[cfg(feature = "e2e")]` and run
+        inside the test container where root writes are safe.
 
 ---
 
@@ -131,6 +314,31 @@ Tests that call `portage_setup` functions against a temp directory.
 Tests that spin up the axum app in-process. Require Docker for AppState
 initialization but do not run builds — they test HTTP API responses only.
 Tests skip gracefully when Docker is unavailable.
+
+**Audit note:** All Phase 4 tests currently skip silently when Docker is
+unavailable — they `return` early with `eprintln`. In CI without Docker,
+they report as "passed" despite not actually running. This must be fixed.
+
+- [ ] **4.0** Fix Phase 4 test skip behavior
+
+      **Implementation notes:**
+      Replace the `if !require_docker() { return; }` pattern with a
+      strategy that makes skipped tests visible:
+      - **Option A (recommended):** Keep the skip pattern but ensure the
+        CI `integration-test` job (task 0.5) has Docker and counts test
+        executions. Add a test that asserts Docker IS available when the
+        `integration` feature is enabled:
+        ```rust
+        #[cfg(feature = "integration")]
+        #[test]
+        fn docker_must_be_available() {
+            assert!(docker_available(), "Docker required for integration tests");
+        }
+        ```
+      - **Option B:** Use `#[ignore]` on all Docker-dependent tests and
+        run with `--include-ignored` in CI.
+      - Move all server API tests behind `#[cfg(feature = "integration")]`
+        so they are only compiled when Docker is expected to be present.
 
 - [x] **4.1** `POST /api/v1/workorders` — valid submission returns 200 +
       workorder ID
@@ -146,13 +354,44 @@ Tests skip gracefully when Docker is unavailable.
       binhost URL
 - [ ] **4.9** WebSocket `/api/v1/workorders/:id/progress` — connects,
       receives text events, binary PTY frames
+
+      **Implementation notes:**
+      - Add `tokio-tungstenite` to dev-dependencies (already in workspace).
+      - Submit a workorder, then connect to the WebSocket URL from the
+        `SubmitWorkorderResponse.progress_ws_url`.
+      - Verify WebSocket upgrade succeeds (101).
+      - Cancel the workorder to trigger a `StatusChanged` event.
+      - Read frames with a timeout, verify a text frame containing
+        the status change is received.
+      - Requires Docker. Gate with `require_docker()`.
+
 - [ ] **4.10** Auth enforcement: `None` mode allows all, `Mtls` mode
       rejects missing cert, `Mixed` mode enforces main vs follower rules
-      (covered by unit tests in server/auth.rs)
+
+      **Implementation notes:**
+      - `None` mode is already implicitly tested by all other Phase 4
+        tests (the default config uses `AuthMode::None`).
+      - For `Mtls`/`Mixed` mode: create a separate `TestServer` variant
+        that accepts a custom `ServerConfig`. Set `auth.mode = Mtls`.
+        Submit a request without the cert header, assert 401/403.
+      - The `auth.rs` module already has 14 unit tests covering the
+        logic. These integration tests verify the axum middleware.
+      - Requires Docker. Gate with `require_docker()`.
+
 - [x] **4.11** Client registry: follower registration requires existing main
 - [ ] **4.12** Config diff detection: same config → empty diff, changed
-      package.use → `portage_changed = true` (covered by unit tests in
-      server/registry.rs)
+      package.use → `portage_changed = true`
+
+      **Implementation notes:**
+      - The `registry.rs` already has 7 unit tests covering diff logic.
+      - For integration: submit from client A, then submit again from
+        client A with changed USE flags. The server should detect the
+        config change internally.
+      - Check if `portage_changed` is surfaced in any API response.
+        If not directly observable via HTTP, this is covered by unit
+        tests and can be skipped as an integration test.
+      - Requires Docker. Gate with `require_docker()`.
+
 - [x] **4.13** Metrics endpoint (`/metrics`) returns Prometheus text format
 - [x] **4.14** GET /api/v1/workorders/{nonexistent} returns 404
 
@@ -163,17 +402,83 @@ Tests skip gracefully when Docker is unavailable.
 These tests need a running Docker daemon. Gate behind
 `#[cfg(feature = "integration")]`.
 
-- [x] **5.1** `DockerManager::new` — connects to local Docker socket
+- [ ] **5.1** `DockerManager::new` — connects to local Docker socket
+
+      **Audit note:** The current `docker_availability_check` test is a
+      no-op — it always passes regardless of Docker status. The
+      `docker_manager_connects` test does work correctly. Remove
+      or replace `docker_availability_check`.
+
+      **Implementation notes:**
+      - Remove the no-op `docker_availability_check` test.
+      - The `docker_manager_connects` test is the actual implementation
+        and works correctly. Verify it returns `Ok`.
+
 - [x] **5.2** `image_tag` derivation from `SystemId` — verify format
 - [ ] **5.3** `build_worker_image` — builds an image, verify it exists via
       Docker API, verify `remerge.worker.sha256` label
+
+      **Implementation notes:**
+      - `build_worker_image(&self, sys: &SystemIdentity, tag: &str)`
+        builds a Docker image using an internal Dockerfile that COPYs
+        the worker binary into a Gentoo stage3 base image.
+      - Requires `config.worker_binary` to point to a valid ELF binary.
+      - For testing: create a dummy binary (e.g., a small shell script
+        or a `#!/bin/true`), configure `ServerConfig.worker_binary`.
+      - The base image needs to exist — either pull `gentoo/stage3` or
+        use the GHCR test image from task 0.6.
+      - After build, use `bollard` inspect to verify the image exists
+        and has the `remerge.worker.sha256` label.
+      - Clean up the test image with `remove_image()` in a drop guard.
+      - Gate behind `#[cfg(feature = "integration")]`.
+      - This test will be slow (~30s) due to Docker image building.
+
 - [ ] **5.4** `needs_rebuild` — returns `false` for freshly-built image,
       `true` after worker binary changes
+
+      **Implementation notes:**
+      - Depends on 5.3 (need to build an image first).
+      - `image_needs_rebuild(&self, tag: &str) -> bool` checks the
+        `remerge.worker.sha256` label on the image against the current
+        binary hash.
+      - Build image, call `image_needs_rebuild`, assert `false`.
+      - Change the `worker_binary` path to a different binary (or
+        modify the existing one), call again, assert `true`.
+      - Gate behind `#[cfg(feature = "integration")]`.
+
 - [ ] **5.5** `start_worker` — container starts, env vars are set, mounts
       are present
+
+      **Implementation notes:**
+      - `start_worker(&self, container_name: &str, image_tag: &str, ...)`
+        creates and starts a container.
+      - Requires a valid worker image (depends on 5.3).
+      - After starting, inspect the container with `bollard`:
+        - Verify `REMERGE_WORKORDER` env var is set.
+        - Verify the binpkg mount is present.
+      - Stop and remove the container after inspection.
+      - Gate behind `#[cfg(feature = "integration")]`.
+
 - [ ] **5.6** Container cleanup — `remove_container` removes the container
+
+      **Implementation notes:**
+      - Create and start a test container, stop it.
+      - Call `remove_container(container_id)`.
+      - Use `bollard` to verify the container no longer exists.
+      - Gate behind `#[cfg(feature = "integration")]`.
+
 - [ ] **5.7** Image eviction — `cleanup_idle_images` preserves the newest
       image per CHOST+profile group, removes older ones
+
+      **Implementation notes:**
+      - Check if there is a public `cleanup_idle_images` or equivalent
+        method. Search for it in `docker.rs`.
+      - If it's part of a background task, may need to extract the logic
+        into a testable function.
+      - Create multiple test images with different tags, set different
+        `image_last_used` timestamps in `AppState`.
+      - Run eviction, verify only the newest per group survives.
+      - Gate behind `#[cfg(feature = "integration")]`.
 
 ---
 
@@ -183,27 +488,112 @@ Full pipeline tests. Require Docker, a Gentoo stage3 image, and network
 access (for `emerge --sync`). These are slow and should be gated behind
 `#[cfg(feature = "e2e")]` or run only in a dedicated CI job.
 
+**Audit note:** The current `e2e_test.rs` contains only a placeholder
+function with `eprintln!("...")` and an early return. No actual E2E test
+logic exists. It falsely reports as "passed".
+
+**All E2E tests depend on task 0.6** (GHCR test Docker image).
+
 - [ ] **6.1** Build a single small package (`app-misc/hello` or
       `app-editors/nano`) — verify binpkg appears in output directory with
       correct SHA-256
+
+      **Implementation notes:**
+      - Start server in-process with test config.
+      - Submit workorder for `app-misc/hello` using `reqwest`.
+      - Connect to WebSocket, wait for `Finished` event (timeout: 10min).
+      - Check `binpkg_dir` for the output `.gpkg.tar` file.
+      - Verify SHA-256 matches the `WorkorderResult`.
+      - The test stage3 image must have a synced portage tree.
+      - Gate behind `#[cfg(feature = "e2e")]`.
+
 - [ ] **6.2** Build with `--pretend` / `--ask` flags — verify they are
       correctly filtered or passed
+
+      **Implementation notes:**
+      - Check `crates/worker/src/builder.rs` for arg filtering logic.
+      - `--pretend` should be passed through to emerge.
+      - `--ask` should be filtered (non-interactive container).
+      - Submit with `emerge_args: ["--pretend"]`, verify the build
+        completes without actual compilation.
+      - Gate behind `#[cfg(feature = "e2e")]`.
+
 - [ ] **6.3** Build with custom USE flags — verify worker's `package.use`
       matches client's
+
+      **Implementation notes:**
+      - Submit with specific `package_use` entries.
+      - Use `--pretend` to avoid long builds.
+      - Verify from build output or container inspection that the USE
+        flags are applied correctly.
+      - Gate behind `#[cfg(feature = "e2e")]`.
+
 - [ ] **6.4** Build with `@world` set — verify set expansion and filtering
       of installed packages
+
+      **Implementation notes:**
+      - Submit with atom `@world`.
+      - The CLI should expand this by reading the world file and
+        filtering installed packages.
+      - Verify the workorder's atoms list contains the expanded set.
+      - Gate behind `#[cfg(feature = "e2e")]`.
+
 - [ ] **6.5** Cross-architecture build (if CI has multi-arch Docker) — verify
       crossdev setup and `emerge-<CHOST>` invocation
+
+      **Implementation notes:**
+      - Requires QEMU user-static for multi-arch Docker.
+      - Submit with a different CHOST (e.g., `aarch64-unknown-linux-gnu`).
+      - Verify crossdev setup and correct emerge wrapper.
+      - Very complex; defer unless multi-arch CI is available.
+      - Gate behind `#[cfg(feature = "e2e")]`.
+
 - [ ] **6.6** Follower client — verify follower inherits main's config and
       shares the workorder
+
+      **Implementation notes:**
+      - Submit as `ClientRole::Main`, note workorder ID.
+      - Submit as `ClientRole::Follower` with matching system ID.
+      - Verify follower is accepted and gets the same workorder.
+      - Connect both to WebSocket, verify both receive events.
+      - Gate behind `#[cfg(feature = "e2e")]`.
+
 - [ ] **6.7** Concurrent workorder rejection — submit while another is active,
       verify 409
+
+      **Implementation notes:**
+      - Already covered at API level by task 4.3.
+      - E2E variant submits during an active Docker build.
+      - Gate behind `#[cfg(feature = "e2e")]`.
+
 - [ ] **6.8** Worker binary upgrade detection — change the binary, submit
       again, verify image rebuild
+
+      **Implementation notes:**
+      - Build once with binary A.
+      - Swap to binary B, submit again.
+      - Verify a new Docker image is built (check image ID or label).
+      - Gate behind `#[cfg(feature = "e2e")]`.
+
 - [ ] **6.9** Cancellation — submit, cancel via API, verify container is
       stopped and removed
+
+      **Implementation notes:**
+      - Submit workorder, wait for `Building` status via WebSocket.
+      - Cancel via `DELETE /api/v1/workorders/:id`.
+      - Verify container is stopped and removed (check Docker).
+      - Verify workorder status is `Cancelled`.
+      - Gate behind `#[cfg(feature = "e2e")]`.
+
 - [ ] **6.10** Resume / reconnect — disconnect WebSocket, reconnect, verify
       progress streaming continues
+
+      **Implementation notes:**
+      - Connect to WebSocket, receive some events.
+      - Drop the connection.
+      - Reconnect to the same workorder's WebSocket URL.
+      - Verify events continue (broadcast channel replays or continues).
+      - Gate behind `#[cfg(feature = "e2e")]`.
 
 ---
 
@@ -211,22 +601,94 @@ access (for `emerge --sync`). These are slow and should be gated behind
 
 - [ ] **7.1** Worker container exits non-zero — verify `Failed` status and
       error propagation
+
+      **Implementation notes:**
+      - Submit a workorder with an atom that will fail (e.g., nonexistent
+        package like `dev-null/does-not-exist`).
+      - Wait for completion via WebSocket.
+      - Verify `WorkorderStatus::Failed { reason }`.
+      - Requires Docker + Gentoo image.
+      - Gate behind `#[cfg(feature = "e2e")]`.
+
 - [ ] **7.2** Missing dependency — verify structured event
       `missing_dependencies` is emitted
+
+      **Implementation notes:**
+      - Trigger by masking a required dependency.
+      - Verify WebSocket receives appropriate `BuildEvent`.
+      - Requires Docker + Gentoo.
+      - Gate behind `#[cfg(feature = "e2e")]`.
+
 - [ ] **7.3** USE conflict — verify structured event `use_conflicts` is
       emitted
+
+      **Implementation notes:**
+      - Configure conflicting USE flags on a package's dependencies.
+      - Verify WebSocket receives USE conflict event.
+      - Requires Docker + Gentoo.
+      - Gate behind `#[cfg(feature = "e2e")]`.
+
 - [ ] **7.4** Fetch failure — verify structured event `fetch_failures` is
       emitted
+
+      **Implementation notes:**
+      - Block network in container or use package with broken SRC_URI.
+      - Verify fetch failure event on WebSocket.
+      - Requires Docker + Gentoo.
+      - Gate behind `#[cfg(feature = "e2e")]`.
+
 - [ ] **7.5** Docker socket unavailable — verify graceful error
+
+      **Implementation notes:**
+      - Set `docker_socket` to `/nonexistent/docker.sock`.
+      - Call `AppState::new()` or `DockerManager::new()`.
+      - Verify a clear error is returned, not a panic.
+      - Does NOT require Docker — tests the error path.
+      - No feature gate needed; add to `error_test.rs`.
+
 - [ ] **7.6** Server config validation — missing `binpkg_dir`, invalid
       `auth` section, missing TLS cert
+
+      **Implementation notes:**
+      - Create `ServerConfig` with various invalid configurations.
+      - Verify `AppState::new()` returns appropriate errors.
+      - Sub-tests:
+        - `auth.mode = Mtls` without cert paths
+        - Non-writable `binpkg_dir`
+        - Invalid `tls` config with non-existent cert files
+      - Some sub-tests may not need Docker; test what's possible.
+
 - [ ] **7.7** Workorder TTL expiry — verify `reap_old_workorders` removes
       stale entries
+
+      **Implementation notes:**
+      - Search for `reap_old_workorders` or equivalent in server code.
+      - If it's a background task in `main.rs`, may need to extract
+        the reaping logic into a testable function.
+      - Set `retention_hours = 0` or very small, submit and complete
+        a workorder, trigger reaping, verify removal.
+      - Requires Docker for AppState.
+
 - [ ] **7.8** Max retained workorders — verify cap is enforced
+
+      **Implementation notes:**
+      - Set `max_retained_workorders = 2`.
+      - Submit and complete 3+ workorders (different client IDs).
+      - List workorders, verify at most 2 completed ones remain.
+      - Requires Docker for AppState.
+
 - [x] **7.9** Path traversal in `profile_overlay` keys — verify rejection
 - [x] **7.10** Path traversal in `patches` keys — verify rejection
 - [x] **7.11** Shell injection in atom names — verify rejection
 - [ ] **7.12** Oversized workorder — verify graceful handling
+
+      **Implementation notes:**
+      - Submit a workorder with a very large body (e.g., 10MB JSON).
+      - Verify the server rejects or handles it without OOM/crash.
+      - Check if axum has `DefaultBodyLimit` configured.
+      - If no limit exists, consider adding one and testing it.
+      - Requires Docker for AppState.
+
 - [x] **7.13** Deserialization error paths — empty JSON, invalid JSON,
       wrong type, missing required fields
 - [x] **7.14** Validation edge cases — null bytes, newlines, whitespace-only
@@ -236,10 +698,49 @@ access (for `emerge --sync`). These are slow and should be gated behind
 ## Phase 8 — CI & Regression
 
 - [ ] **8.1** Add integration test job to CI with Docker
-      (`services: docker:dind` or native runner Docker)
+
+      **Implementation notes:**
+      Add to `.github/workflows/ci.yml`:
+      ```yaml
+      integration-test:
+        name: Integration Tests
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+          - uses: dtolnay/rust-toolchain@stable
+          - uses: Swatinem/rust-cache@v2
+          - name: Run integration tests
+            run: cargo test --workspace --features integration
+      ```
+      Docker is pre-installed on ubuntu-latest runners.
+
 - [ ] **8.2** Cache Gentoo stage3 image in CI to speed up E2E tests
+
+      **Implementation notes:**
+      - Use the GHCR test image from task 0.6.
+      - Pull `ghcr.io/<owner>/remerge-test-stage3:latest` in CI.
+      - Use `docker/setup-buildx-action` for layer caching.
+
 - [ ] **8.3** Add a "smoke test" target that runs the fastest subset
       (Phases 1–3) on every PR
+
+      **Implementation notes:**
+      Phases 1–3 (minus portageq-dependent tests) run without Docker
+      in ~1 second. Already covered by `cargo test --workspace` but
+      consider making explicit for tracking.
+
 - [ ] **8.4** Add a "full integration" target that runs Phases 4–7 on merge
       to `main`
+
+      **Implementation notes:**
+      - Trigger on `push` to `main` only.
+      - Run `cargo test --workspace --features integration,e2e`.
+      - Pull GHCR test image first.
+      - Set timeout to 30 minutes for E2E tests.
+
 - [ ] **8.5** Record and track test durations to catch regressions
+
+      **Implementation notes:**
+      - Use `cargo nextest` for structured output with durations.
+      - Store results as CI artifacts.
+      - Alert on tests exceeding 2x baseline duration.

@@ -1,8 +1,12 @@
 # Integration Test Suite — Agent Prompt
 
-You are implementing a comprehensive integration test suite for **remerge**,
-a distributed Gentoo binary-package builder written in Rust.  This document
-is your single source of truth.  Read it in full before writing any code.
+You are continuing the implementation of a comprehensive integration test
+suite for **remerge**, a distributed Gentoo binary-package builder written
+in Rust.  A previous agent started this work; you are picking up where it
+left off.
+
+**Read this entire document before writing any code.**
+**Read `TASKS.md` for the authoritative task list and status.**
 
 ---
 
@@ -22,7 +26,7 @@ crates:
 
 ```
 CLI reads /etc/portage/ → serializes PortageConfig
-  → HTTP POST to server /api/v1/workorder
+  → HTTP POST to server /api/v1/workorders
   → server queues Workorder, builds/reuses Docker image
   → starts container with REMERGE_WORKORDER env var (JSON)
   → worker deserializes, writes /etc/portage/ inside container
@@ -34,333 +38,364 @@ CLI reads /etc/portage/ → serializes PortageConfig
 
 ---
 
-## 2  Existing Test Coverage
+## 2  Current State of Implementation
 
-All existing tests are inline `#[cfg(test)]` unit tests (72 total).  There
-are **no integration tests**, **no test fixtures**, **no mock infrastructure**,
-and **no `tests/` directory**.
+### What exists and works
 
-| Module | Tests | What they cover |
-|--------|-------|-----------------|
-| `types/validation.rs` | 11 | `validate_atom` |
-| `types/portage.rs` | 2 | Serde round-trips |
-| `server/auth.rs` | 14 | All 3 auth modes, fingerprint normalisation |
-| `server/registry.rs` | 7 | Client registry (async) |
-| `worker/portage_setup.rs` | 8 | MAKEOPTS, USE flags, repo section parsing |
-| `cli/config.rs` | 5 | Config file parsing, persistence |
-| `cli/portage.rs` | 10 | make.conf parsing, `split_name_version`, version comparison |
-
-### Gaps to fill
-
-- CLI portage reader (`read_config`, `is_installed`, set expansion)
-- Server HTTP/WS API endpoints
-- Server queue processor
-- Docker lifecycle (build, start, attach, remove, image eviction)
-- Worker builder (`build_packages`, `sync_repos`)
-- End-to-end CLI → binpkg pipeline
-- Error paths (missing deps, USE conflicts, path traversal, shell injection)
-
----
-
-## 3  Architecture Decisions
-
-### 3.1  Test location
-
-Create a top-level `tests/` directory in the workspace root.  Use a single
-integration test crate with multiple modules:
+The previous agent created the full test file structure:
 
 ```
 tests/
   common/
-    mod.rs          — shared helpers
-    fixtures.rs     — fixture builders
-    server.rs       — in-process server harness
-  types_test.rs     — Phase 1 (pure logic)
-  cli_portage_test.rs — Phase 2 (filesystem)
-  worker_setup_test.rs — Phase 3 (filesystem)
-  server_api_test.rs   — Phase 4 (in-process HTTP)
-  docker_test.rs       — Phase 5 (Docker daemon)
-  e2e_test.rs          — Phase 6 (full pipeline)
-  error_test.rs        — Phase 7 (error paths)
+    mod.rs          — free_port(), with_timeout()
+    fixtures.rs     — portage_tree(), vdb_tree(), minimal_portage_config(),
+                      full_portage_config(), minimal_system_identity()
+    server.rs       — docker_available(), TestServer::start()
+  types_test.rs     — Phase 1: 27 tests, all pass ✅
+  cli_portage_test.rs — Phase 2 (partial): 19 tests, all pass ✅
+  worker_setup_test.rs — Phase 3 (partial): 15 tests, all pass ✅
+  server_api_test.rs   — Phase 4 (partial): 11 tests, pass with Docker ✅
+  docker_test.rs       — Phase 5 (partial): 3 tests, pass with Docker ✅
+  e2e_test.rs          — Phase 6: PLACEHOLDER ONLY ❌
+  error_test.rs        — Phase 7 (partial): 14 tests, all pass ✅
 ```
+
+The `Cargo.toml` has `integration` and `e2e` features configured.
+All four crates expose `pub mod` in their `lib.rs` for testing.
+Some worker functions have `_inner` variants for testability:
+`write_profile_overlay_inner`, `write_patches_inner`,
+`set_profile_inner`, `build_makeopts_inner`, `parse_repo_sections`.
+
+### What is NOT done (your work)
+
+Refer to `TASKS.md` — every unchecked `[ ]` task needs implementation.
+Key gaps, in priority order:
+
+1. **Task 3.0** — Create `_inner` variants for all remaining private worker
+   functions. This UNBLOCKS tasks 3.1–3.8 and 3.13.
+2. **Tasks 3.1–3.8** — Test all portage config writing functions.
+3. **Task 4.0** — Fix silent test skipping in Phase 4.
+4. **Task 5.1** — Fix no-op Docker availability test.
+5. **Tasks 4.9, 4.10, 4.12** — Missing server API tests.
+6. **Tasks 5.3–5.7** — Docker lifecycle tests.
+7. **Task 0.6** — GHCR test Docker image for Gentoo-specific tests.
+8. **Tasks 0.5, 8.1–8.5** — CI integration.
+9. **Tasks 7.1–7.8, 7.12** — Error path tests.
+10. **Phase 6** — Full E2E tests (currently all placeholders).
+
+### Known issue
+
+There is a failing unit test in the worker crate:
+`portage_setup::tests::set_profile_skips_when_profile_not_found`.
+This is a pre-existing bug in `crates/worker/src/portage_setup.rs`, not in
+the integration tests. Fix it if you can identify the issue, but it is not
+your primary task.
+
+---
+
+## 3  Architecture Decisions (established)
+
+### 3.1  Test location
+
+Top-level `tests/` directory with multiple test files (already created).
+Each file is a separate integration test crate. Shared code is in
+`tests/common/`.
 
 ### 3.2  Feature gating
 
-- Phases 1–4 run with `cargo test` (no feature flag).
-- Phase 5 (Docker) is gated behind `#[cfg(feature = "integration")]`.
-- Phase 6 (E2E) is gated behind `#[cfg(feature = "e2e")]`.
-- Add these features to the workspace `Cargo.toml`.
+- Phases 1–3 run with `cargo test` (no feature flag).
+- Phase 4 currently runs without feature flag but requires Docker —
+  consider gating behind `integration`.
+- Phase 5 (Docker) is behind `#[cfg(feature = "integration")]`.
+- Phase 6 (E2E) is behind `#[cfg(feature = "e2e")]`.
 
-### 3.3  Test helpers (`tests/common/mod.rs`)
+### 3.3  In-process server harness
 
-Provide the following reusable utilities:
+`TestServer::start()` in `tests/common/server.rs` starts an axum app on a
+random port. It requires Docker because `AppState::new()` creates a
+`DockerManager`. All server API tests use this harness.
 
-```rust
-/// Allocate a random free TCP port and return the address.
-pub fn free_port() -> u16;
+### 3.4  Docker tests
 
-/// Create a temp directory with a populated `/etc/portage/` tree.
-/// Returns (TempDir, PathBuf) — keep TempDir alive for the test duration.
-pub fn portage_tree() -> (TempDir, PathBuf);
-
-/// Create a temp directory with a populated `/var/db/pkg/` VDB.
-pub fn vdb_tree(packages: &[(&str, &str)]) -> (TempDir, PathBuf);
-
-/// Build a minimal PortageConfig with sensible defaults.
-pub fn minimal_portage_config() -> PortageConfig;
-
-/// Build a minimal ServerConfig pointing at temp dirs.
-pub fn minimal_server_config(port: u16, binpkg_dir: &Path) -> ServerConfig;
-
-/// Start the axum server in-process and return a handle.
-pub async fn start_test_server(config: ServerConfig) -> TestServer;
-
-/// Assert with a timeout — panics if the future doesn't resolve.
-pub async fn with_timeout<F: Future>(duration: Duration, f: F) -> F::Output;
-```
-
-### 3.4  In-process server harness
-
-For Phase 4 tests, start the axum app on `127.0.0.1:<free_port>` inside the
-test process.  Use `reqwest` as the HTTP client and `tokio-tungstenite` for
-WebSocket tests.  Do **not** spawn a separate OS process.
-
-### 3.5  Docker tests
-
-For Phase 5, connect to the local Docker socket via `bollard`.  Tag test
-images with `remerge-test-<uuid>` and clean up in a `Drop` guard.  Skip
-tests if Docker is not available (`bollard::Docker::connect_with_local_defaults()`
-fails → skip, don't panic).
+Connect via `bollard`. Tag test images with unique names. Clean up in
+`Drop` guards. Skip if Docker unavailable.
 
 ---
 
-## 4  Key Source Files to Read
+## 4  Detailed Implementation Guide
 
-Before writing any test, read these files to understand the real interfaces:
+### 4.1  Task 3.0 — Create `_inner` variants
+
+This is the highest-priority task. Without it, tasks 3.1–3.8 and 3.13
+cannot be implemented.
+
+**Location:** `crates/worker/src/portage_setup.rs`
+
+**Pattern to follow** (already established in the same file):
+
+```rust
+// The public function is the private one, called with hardcoded path:
+async fn write_profile_overlay(config: &PortageConfig) -> Result<()> {
+    write_profile_overlay_inner(Path::new("/etc/portage/profile"), config).await
+}
+
+// The testable inner function accepts a path parameter:
+pub async fn write_profile_overlay_inner(base: &Path, config: &PortageConfig) -> Result<()> {
+    // ... actual implementation that writes to `base`
+}
+```
+
+**Functions needing `_inner` variants:**
+
+| Private function | `_inner` signature |
+|-----------------|-------------------|
+| `write_make_conf(config, worker_chost, gpg_key, gpg_home)` | `pub async fn write_make_conf_inner(base: &Path, config: &PortageConfig, worker_chost: &str, gpg_key: Option<&str>, gpg_home: Option<&str>) -> Result<()>` |
+| `write_package_use(config)` | `pub async fn write_package_use_inner(base: &Path, config: &PortageConfig) -> Result<()>` |
+| `write_package_accept_keywords(config)` | `pub async fn write_package_accept_keywords_inner(base: &Path, config: &PortageConfig) -> Result<()>` |
+| `write_package_license(config)` | `pub async fn write_package_license_inner(base: &Path, config: &PortageConfig) -> Result<()>` |
+| `write_package_mask(config)` | `pub async fn write_package_mask_inner(base: &Path, config: &PortageConfig) -> Result<()>` |
+| `write_package_unmask(config)` | `pub async fn write_package_unmask_inner(base: &Path, config: &PortageConfig) -> Result<()>` |
+| `write_package_env(config)` | `pub async fn write_package_env_inner(base: &Path, config: &PortageConfig) -> Result<()>` |
+| `write_env_files(config)` | `pub async fn write_env_files_inner(base: &Path, config: &PortageConfig) -> Result<()>` |
+| `write_repos_conf(config)` | `pub async fn write_repos_conf_inner(base: &Path, config: &PortageConfig, repos_dir: Option<&Path>) -> Result<()>` |
+
+**Key rules:**
+- Move the implementation body into the `_inner` variant.
+- Replace hardcoded paths like `"/etc/portage/package.use/remerge"` with
+  `base.join("package.use/remerge")`.
+- The original private function becomes a one-line wrapper calling
+  `_inner` with `Path::new("/etc/portage")` as base.
+- For `write_repos_conf`, the `repos_dir` parameter should control
+  location remapping (the private version reads from server env vars).
+- The `ensure_dir` helper creates directories — make sure it uses the
+  `base` path too, or inline the `create_dir_all` call.
+
+### 4.2  Tasks 3.1–3.8 — Test portage config writing
+
+Add tests to `tests/worker_setup_test.rs` for each `_inner` function.
+
+**Test pattern:**
+```rust
+#[tokio::test]
+async fn write_make_conf_golden_path() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().to_path_buf();
+    std::fs::create_dir_all(base.join("package.use")).unwrap();
+
+    let config = common::fixtures::full_portage_config();
+    portage_setup::write_make_conf_inner(&base, &config, "x86_64-pc-linux-gnu", None, None)
+        .await
+        .expect("write_make_conf_inner");
+
+    let content = std::fs::read_to_string(base.join("make.conf")).unwrap();
+    assert!(content.contains("CHOST="), "must have CHOST");
+    assert!(content.contains("CFLAGS="), "must have CFLAGS");
+    assert!(content.contains("USE="), "must have USE");
+    // ... assert all expected lines
+}
+```
+
+### 4.3  Task 4.0 — Fix silent test skipping
+
+The Phase 4 tests in `tests/server_api_test.rs` use this pattern:
+
+```rust
+if !require_docker() { return; }
+```
+
+This makes tests silently pass without running. Options:
+
+**Recommended approach:**
+1. Gate Phase 4 tests behind `#[cfg(feature = "integration")]`.
+2. Add a sentinel test in `server_api_test.rs`:
+   ```rust
+   #[cfg(feature = "integration")]
+   #[test]
+   fn docker_must_be_available_for_integration() {
+       assert!(
+           common::server::docker_available(),
+           "Docker is required for integration tests but was not found"
+       );
+   }
+   ```
+3. Keep the `require_docker()` pattern as a safety net for running
+   without the feature flag.
+
+### 4.4  Task 5.1 — Fix no-op Docker test
+
+Replace `docker_availability_check` in `tests/docker_test.rs`:
+
+```rust
+// REMOVE this no-op test:
+#[test]
+fn docker_availability_check() { /* always passes */ }
+
+// The existing docker_manager_connects test is the real implementation.
+```
+
+### 4.5  Task 4.9 — WebSocket test
+
+```rust
+use tokio_tungstenite::connect_async;
+
+#[tokio::test]
+async fn websocket_connects_and_receives_events() {
+    if !require_docker() { return; }
+    let Some(server) = TestServer::start().await else { return; };
+
+    // Submit workorder
+    let resp = submit_workorder(&server).await;
+    let ws_url = resp.progress_ws_url.replace("http://", "ws://");
+
+    // Connect WebSocket
+    let (mut ws, _) = connect_async(&ws_url).await.expect("ws connect");
+
+    // Cancel the workorder to trigger a status change event
+    cancel_workorder(&server, resp.workorder_id).await;
+
+    // Read frames with timeout
+    let frame = with_timeout(Duration::from_secs(5), ws.next()).await;
+    // Assert it's a text frame with status change info
+}
+```
+
+### 4.6  Task 0.6 — GHCR test Docker image
+
+Create `docker/test-stage3.Dockerfile`:
+
+```dockerfile
+FROM gentoo/stage3:latest
+
+# Sync portage tree (this is the slow part — ~5min)
+RUN emerge --sync
+
+# Install test dependencies
+RUN emerge -1 app-misc/hello cpuid2cpuflags
+
+# Create a known VDB state for is_installed tests
+# (app-misc/hello and its deps will already be in /var/db/pkg/)
+
+# Create world file for expand_set tests
+RUN echo "app-misc/hello" >> /var/lib/portage/world
+
+# Verify portageq works
+RUN portageq envvar USE
+
+LABEL org.opencontainers.image.source=https://github.com/k-forss/remerge
+LABEL org.opencontainers.image.description="Remerge integration test image"
+```
+
+Create `.github/workflows/test-image.yml`:
+
+```yaml
+name: Build Test Image
+
+on:
+  push:
+    paths: ['docker/test-stage3.Dockerfile']
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/test-stage3.Dockerfile
+          push: true
+          tags: ghcr.io/${{ github.repository }}/test-stage3:latest
+```
+
+### 4.7  Tasks 7.5–7.6 — Error path tests (no Docker needed)
+
+Add to `tests/error_test.rs`:
+
+```rust
+/// Docker socket unavailable returns error, not panic.
+#[tokio::test]
+async fn docker_socket_unavailable_returns_error() {
+    let config = remerge_server::config::ServerConfig {
+        docker_socket: "/nonexistent/docker.sock".into(),
+        ..Default::default()
+    };
+    let result = remerge_server::docker::DockerManager::new(&config).await;
+    assert!(result.is_err(), "should error on bad socket");
+}
+```
+
+### 4.8  Tasks 2.1–2.6 — Gentoo-specific reader tests
+
+These tests require `portageq` which is only available on Gentoo.
+Two strategies:
+
+**For fast CI (non-Gentoo):**
+- Test the fallback code paths where `portageq` fails.
+- `PortageReader::new()` succeeds even without portageq — it just
+  can't resolve some variables.
+- Write tests that exercise the file-reading logic without portageq.
+
+**For full E2E CI (with GHCR image):**
+- Run inside the test stage3 container where portageq is available.
+- Gate behind `#[cfg(feature = "e2e")]`.
+
+### 4.9  Task 2.8 — `expand_set` tests
+
+Split into two:
+
+```rust
+/// @world expansion reads the world file — no portageq needed.
+#[test]
+fn expand_set_world() {
+    let (_tmp, root) = common::fixtures::portage_tree();
+    unsafe { std::env::set_var("ROOT", root.to_str().unwrap()); }
+    let reader = remerge::portage::PortageReader::new().unwrap();
+    let atoms = reader.expand_set("@world");
+    assert!(!atoms.is_empty(), "world set should expand");
+    assert!(atoms.contains(&"dev-libs/openssl".to_string()));
+}
+
+/// @system expansion requires portageq — E2E only.
+#[cfg(feature = "e2e")]
+#[test]
+fn expand_set_system() {
+    // ... run inside Gentoo container
+}
+```
+
+---
+
+## 5  Key Source Files Reference
 
 | File | What to learn |
 |------|---------------|
-| `crates/types/src/portage.rs` | `PortageConfig`, `MakeConf`, `SystemId`, field names, serde annotations |
-| `crates/types/src/workorder.rs` | `Workorder`, `WorkorderStatus`, `WorkorderResult`, `BuiltPackage`, `FailedPackage` |
-| `crates/types/src/validation.rs` | `validate_atom` — all acceptance/rejection rules |
+| `crates/types/src/portage.rs` | `PortageConfig`, `MakeConf`, `SystemIdentity`, field names, serde |
+| `crates/types/src/workorder.rs` | `Workorder`, `WorkorderStatus`, `BuildEvent`, `WorkorderResult`, `BuiltPackage`, `FailedPackage` |
+| `crates/types/src/validation.rs` | `validate_atom`, `AtomValidationError` |
 | `crates/types/src/client.rs` | `ClientRole`, `ClientState`, `ConfigDiff` |
-| `crates/types/src/auth.rs` | `AuthMode` enum |
-| `crates/cli/src/portage.rs` | `PortageReader`, `read_config`, `is_installed`, `expand_set`, `split_name_version`, `compare_versions`, `parse_atom_operator`, `split_revision` |
-| `crates/cli/src/args.rs` | `Cli` struct, `run()`, `extract_atoms()`, `run_local_emerge()` |
-| `crates/cli/src/cflags.rs` | `resolve_flags()` — march=native resolution |
-| `crates/cli/src/config.rs` | `CliConfig`, `load_or_create()` |
-| `crates/server/src/main.rs` | Server bootstrap, background tasks, axum router |
-| `crates/server/src/config.rs` | `ServerConfig` fields, env var overrides |
-| `crates/server/src/api.rs` | All HTTP/WS routes and handlers |
-| `crates/server/src/auth.rs` | `AuthState`, `authenticate()`, 3 modes |
-| `crates/server/src/registry.rs` | `ClientRegistry`, `register_or_update()`, follower rules |
-| `crates/server/src/queue.rs` | `process_queue()`, `process_workorder()`, event parsing |
-| `crates/server/src/docker.rs` | `DockerManager`, image build, container lifecycle |
-| `crates/server/src/state.rs` | `AppState` — central shared state |
-| `crates/worker/src/main.rs` | Worker bootstrap, cross-compilation detection |
-| `crates/worker/src/portage_setup.rs` | `apply_config()`, `write_make_conf()`, `set_profile()`, `write_profile_overlay()`, `write_patches()`, `write_repos_conf()` |
+| `crates/types/src/auth.rs` | `AuthMode` |
+| `crates/types/src/api.rs` | API request/response types: `SubmitWorkorderRequest`, `SubmitWorkorderResponse`, `WorkorderStatusResponse`, `ListWorkordersResponse`, `CancelWorkorderResponse`, `HealthResponse`, `ServerInfoResponse` |
+| `crates/cli/src/portage.rs` | `PortageReader`, `is_installed`, `expand_set`, `split_name_version`, `compare_versions`, `parse_atom_operator`, `split_revision`, `AtomOp` |
+| `crates/server/src/api.rs` | `router()` — axum routes and handlers |
+| `crates/server/src/config.rs` | `ServerConfig` — all fields have serde defaults |
+| `crates/server/src/state.rs` | `AppState::new()` — requires Docker for `DockerManager` |
+| `crates/server/src/docker.rs` | `DockerManager::new()`, `image_tag()`, `image_needs_rebuild()`, `build_worker_image()`, `start_worker()`, `remove_container()`, `remove_image()`, `stop_container()` |
+| `crates/server/src/main.rs` | `run_eviction_task()` — background workorder eviction (lines 177–260) |
+| `crates/worker/src/portage_setup.rs` | `apply_config()`, all `write_*` and `*_inner` functions |
 | `crates/worker/src/builder.rs` | `build_packages()`, `sync_repos()`, arg filtering |
-| `crates/worker/src/crossdev.rs` | `emerge_command()`, `setup_crossdev()` |
-
----
-
-## 5  Detailed Test Specifications
-
-### Phase 1 — Types & Validation (no I/O)
-
-**Goal:** Verify all shared types serialize, deserialize, validate, and
-display correctly.
-
-1. **PortageConfig round-trip** — construct a config with every field
-   populated (including `profile_overlay`, `patches`, `repos_conf`,
-   `use_flags_resolved = true`).  Serialize to JSON, deserialize, assert
-   field-by-field equality.
-
-2. **PortageConfig with defaults** — deserialize a minimal JSON object
-   `{}` into `PortageConfig`.  Assert `profile_overlay` is an empty
-   `BTreeMap`, `use_flags_resolved` is `false`, etc.
-
-3. **Workorder status transitions** — create a Pending workorder, walk it
-   through every status.  Verify timestamps are set correctly.
-
-4. **validate_atom exhaustive** — test every legal form:
-   - Qualified: `dev-libs/openssl`
-   - Versioned: `=dev-libs/openssl-3.1.0`, `>=dev-libs/openssl-3.0`,
-     `~dev-libs/openssl-3.1.0`, `=dev-libs/openssl-3.1*`
-   - Sets: `@world`, `@system`
-   - Unqualified: `gcc`
-   - Rejection: empty, `; rm -rf`, `$(evil)`, `` `evil` ``,
-     `=gcc-12` (versioned unqualified)
-
-5. **ClientRole / AuthMode Display+FromStr** — round-trip through string.
-
-### Phase 2 — CLI Portage Reader (filesystem)
-
-**Goal:** Test `PortageReader` against a synthetic portage tree in a temp
-directory.
-
-**Setup pattern:**
-```rust
-let tmp = tempdir()?;
-let root = tmp.path();
-// Create /etc/portage/make.conf, package.use/, repos.conf, etc.
-std::env::set_var("ROOT", root);
-let reader = PortageReader::new()?;
-let config = reader.read_config()?;
-```
-
-Key tests:
-
-1. **Full golden path** — populate every directory and file a real Gentoo
-   system would have.  Call `read_config()` and assert every field.
-
-2. **Missing optional directories** — only create `make.conf`.  Assert
-   `package_use` is empty, `patches` is empty, `profile_overlay` is empty.
-
-3. **`is_installed` version constraints** — create VDB entries in
-   `/var/db/pkg/dev-libs/openssl-3.1.0-r2/` and
-   `/var/db/pkg/dev-libs/openssl-1.1.1w/`, then test:
-   - `dev-libs/openssl` → true (any version)
-   - `=dev-libs/openssl-3.1.0-r2` → true (exact)
-   - `=dev-libs/openssl-3.1.0` → false (different revision in VDB)
-   - `>=dev-libs/openssl-3.0` → true
-   - `<dev-libs/openssl-2.0` → true (1.1.1w matches)
-   - `>dev-libs/openssl-4.0` → false
-   - `~dev-libs/openssl-3.1.0` → true (any revision of 3.1.0)
-   - `=dev-libs/openssl-3.1*` → true (glob)
-   - `=dev-libs/openssl-3.2*` → false
-   - `@world` → false (set)
-   - `dev-libs/nonexistent` → false
-
-4. **`read_profile_overlay`** — create files in `<root>/etc/portage/profile/`
-   including nested subdirectories.  Assert the BTreeMap contains all
-   relative paths as keys and file contents as values.
-
-5. **`read_patches_recursive`** — create patches in
-   `<root>/etc/portage/patches/dev-libs/openssl/fix.patch`.  Assert key
-   format and content.
-
-### Phase 3 — Worker Portage Setup (filesystem)
-
-**Goal:** Test worker-side portage config writing against a temp directory.
-
-**Setup pattern:**
-```rust
-let tmp = tempdir()?;
-let root = tmp.path();
-std::fs::create_dir_all(root.join("etc/portage"))?;
-// call write_make_conf, write_package_config, etc.
-// then read files back and assert content
-```
-
-Key tests:
-
-1. **`write_make_conf` golden path** — pass a fully-populated `MakeConf`
-   with CHOST, CBUILD, CFLAGS, USE, FEATURES, signing, use_expand.
-   Read generated file, assert every expected line is present.
-
-2. **`write_make_conf` with `use_flags_resolved = true`** — USE line must
-   start with `USE="-* flag1 flag2"`.
-
-3. **`write_make_conf` with `use_flags_resolved = false`** — USE line must
-   NOT have `-*` prefix.
-
-4. **`write_make_conf` with USE_EXPAND** — verify `VIDEO_CARDS="intel"`,
-   `INPUT_DEVICES="libinput"` appear as separate variables.
-
-5. **`write_package_config`** — for each type (use, keywords, license,
-   mask, unmask, env), write multi-entry configs and read back.
-
-6. **`write_repos_conf` with remapping** — set server repos_dir, verify
-   location values are rewritten.
-
-7. **`set_profile`** — create repo directory structures with
-   `profiles/<profile>` paths, call `set_profile`, verify symlink target.
-
-8. **`write_profile_overlay`** — write overlay files, verify they appear
-   in `/etc/portage/profile/`.
-
-9. **`write_profile_overlay` path traversal** — keys containing `..` or
-   starting with `/` must be rejected.
-
-10. **`write_patches`** — write patches, verify directory structure and
-    file content.
-
-11. **`apply_config` orchestration** — call `apply_config` with a full
-    `PortageConfig` and verify that all expected files exist.
-
-### Phase 4 — Server API (in-process, no Docker)
-
-**Goal:** Test the axum HTTP/WS API without Docker.
-
-**Approach:** The server's queue processor calls `DockerManager` — for these
-tests you need to either:
-- (a) Let the queue idle (don't submit workorders that reach "Building"), or
-- (b) Submit workorders and test only the API-level response (status codes,
-  JSON shape, auth enforcement) without waiting for completion.
-
-Key tests:
-
-1. **Submit workorder** — POST valid JSON, assert 200, parse workorder ID.
-2. **Submit invalid atoms** — POST with `; rm -rf /`, assert 400.
-3. **Duplicate active** — submit twice with same client, assert 409.
-4. **Get workorder** — fetch by ID, assert fields match.
-5. **List workorders** — submit several, list, assert count and ordering.
-6. **Cancel** — submit, cancel, verify status = Cancelled.
-7. **Health** — GET /health → 200.
-8. **Info** — GET /api/v1/info → version, binhost_url, auth_mode.
-9. **Auth: None mode** — all requests pass.
-10. **Auth: Mtls mode** — missing cert header → 401.
-11. **WebSocket** — connect, verify text frame with initial status event.
-12. **Metrics** — GET /metrics → contains `remerge_` prefix lines.
-13. **Client registry** — submit as follower without main → error.
-
-### Phase 5 — Docker Integration
-
-**Gate:** `#[cfg(feature = "integration")]`
-
-**Pre-condition check:**
-```rust
-fn docker_available() -> bool {
-    bollard::Docker::connect_with_local_defaults().is_ok()
-}
-```
-Skip all tests if Docker is not available.
-
-Key tests:
-
-1. **Connect** — `DockerManager::new()` succeeds.
-2. **Build image** — build from Gentoo stage3, verify image exists.
-3. **Rebuild detection** — `needs_rebuild` returns `false` after build,
-   `true` after binary hash change.
-4. **Start container** — verify env vars and mounts.
-5. **Cleanup** — remove container, verify gone.
-6. **Image eviction** — create multiple images, run cleanup, verify only
-   newest per group survives.
-
-### Phase 6 — End-to-End
-
-**Gate:** `#[cfg(feature = "e2e")]`
-
-These are slow (~minutes).  The test process must:
-1. Start the server in-process.
-2. Use the CLI client library (not the binary) to submit a workorder.
-3. Wait for WebSocket completion.
-4. Assert binpkg file exists with correct SHA-256.
-
-Candidate packages for E2E: `app-misc/hello`, `virtual/libc` (fast builds).
-
-### Phase 7 — Error Paths
-
-Intentionally trigger every known error path:
-
-1. **Worker exit non-zero** — assert `WorkorderStatus::Failed`.
-2. **Missing dep** — assert `missing_dependencies` event.
-3. **USE conflict** — assert `use_conflicts` event.
-4. **Path traversal in profile_overlay** — assert rejection.
-5. **Path traversal in patches** — assert rejection.
-6. **Shell injection in atoms** — assert validation rejects.
-7. **Workorder TTL expiry** — advance time, verify reaping.
+| `tests/common/mod.rs` | `free_port()`, `with_timeout()` |
+| `tests/common/fixtures.rs` | `portage_tree()`, `vdb_tree()`, `minimal_portage_config()`, `full_portage_config()`, `minimal_system_identity()` |
+| `tests/common/server.rs` | `docker_available()`, `TestServer::start()` |
 
 ---
 
@@ -371,43 +406,91 @@ Intentionally trigger every known error path:
 - Use `#[tokio::test]` for async tests.
 - Use `assert!`, `assert_eq!`, `assert_ne!` with descriptive messages.
 - Every test function has a `/// doc comment` explaining what it verifies.
-- No `.unwrap()` in production code — use `anyhow::Result` in tests.
+- No `.unwrap()` in production code — use `anyhow::Result` in tests where
+  appropriate, `.unwrap()` / `.expect()` is fine in test code.
 - Clean up temp dirs and Docker resources in `Drop` guards.
+- Follow the code style in `CONTRIBUTING.md`.
 
 ---
 
-## 7  Dependencies to Add
+## 7  Dependencies
 
-Add these to the workspace `Cargo.toml` under `[workspace.dependencies]`:
-
-```toml
-tempfile = "3"                # temp dirs for filesystem tests
-tokio-tungstenite = "0.26"    # WebSocket client for API tests
-```
-
-And in whatever crate hosts the integration tests:
+These are already configured in the workspace `Cargo.toml`:
 
 ```toml
 [dev-dependencies]
-tempfile = { workspace = true }
-tokio-tungstenite = { workspace = true }
-reqwest = { workspace = true }
-bollard = { workspace = true }
+remerge-types = { path = "crates/types" }
+remerge = { path = "crates/cli" }
+remerge-worker = { path = "crates/worker" }
+remerge-server = { path = "crates/server" }
 serde_json = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
-remerge-types = { workspace = true }
+reqwest = { workspace = true }
+axum = { workspace = true }
+```
+
+If you need `tokio-tungstenite` for WebSocket tests, add it:
+```toml
+tokio-tungstenite = "0.26"
+```
+to both `[workspace.dependencies]` and `[dev-dependencies]`.
+
+If you need `bollard` in integration tests, add it to `[dev-dependencies]`:
+```toml
+bollard = { workspace = true }
 ```
 
 ---
 
-## 8  Audit Checklist
+## 8  Execution Order
 
-After implementing all tests, verify:
+Work through tasks in this order for maximum unblocking:
+
+1. **Task 3.0** — Create `_inner` variants (unblocks 3.1–3.8, 3.13)
+2. **Tasks 3.1–3.8** — Portage config writing tests
+3. **Task 4.0** — Fix silent skipping
+4. **Task 5.1** — Fix no-op Docker test
+5. **Tasks 4.9, 4.10** — WebSocket + auth tests
+6. **Tasks 7.5, 7.6** — Error paths (no Docker needed)
+7. **Task 2.8** — `expand_set` (world part, no portageq needed)
+8. **Task 0.6** — GHCR test image
+9. **Tasks 0.5, 8.1** — CI jobs
+10. **Tasks 5.3–5.7** — Docker lifecycle tests
+11. **Tasks 7.1–7.4, 7.7, 7.8, 7.12** — Remaining error paths
+12. **Phase 6** — E2E tests
+13. **Tasks 8.2–8.5** — CI optimization
+
+---
+
+## 9  Constraints
+
+- Do **not** modify existing source code unless:
+  - A function needs a `pub` `_inner` variant for testability
+    (task 3.0, following the established pattern).
+  - A function needs `pub` visibility to be callable from integration
+    tests (e.g., `pub(crate)` → `pub`). Minimize changes.
+- Do **not** add trait abstractions or mock layers to production code.
+- Do **not** add dependencies not listed in §7.
+- Do **not** create Docker images during Phase 1–4 tests.
+- Follow the code style in `CONTRIBUTING.md`.
+- After every batch of changes, verify with:
+  ```sh
+  cargo test --workspace 2>&1 | tail -5    # quick check
+  cargo clippy --workspace --all-targets -- -D warnings
+  cargo fmt --all -- --check
+  ```
+
+---
+
+## 10  Verification Checklist
+
+After implementing all tasks, verify:
 
 - [ ] `cargo test --workspace` passes (Phases 1–4)
-- [ ] `cargo test --workspace --features integration` passes when Docker is
-      available (Phases 1–5)
+- [ ] `cargo test --workspace --features integration` passes with Docker
+      (Phases 1–5)
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` clean
 - [ ] `cargo fmt --all -- --check` clean
 - [ ] No test depends on network access (except E2E)
@@ -415,42 +498,40 @@ After implementing all tests, verify:
 - [ ] Every `PortageConfig` field is exercised in at least one test
 - [ ] Every `validate_atom` rejection class has a dedicated test
 - [ ] Every `is_installed` operator variant has at least 2 tests
-      (satisfied + unsatisfied)
 - [ ] Every server API route has at least one test
 - [ ] Path traversal rejection is tested for `profile_overlay` and `patches`
 - [ ] Feature-gated tests skip gracefully when prerequisites are missing
+- [ ] Phase 4 tests don't silently pass when Docker is unavailable
+- [ ] `e2e_test.rs` has real test logic, not just placeholders
 
 ---
 
-## 9  File Listing
+## 11  File Listing
 
-When you are done, the following files should exist:
+When done, these files should exist (★ = needs changes, ✓ = exists and done):
 
 ```
 tests/
   common/
-    mod.rs
-    fixtures.rs
-    server.rs
-  types_test.rs
-  cli_portage_test.rs
-  worker_setup_test.rs
-  server_api_test.rs
-  docker_test.rs
-  e2e_test.rs
-  error_test.rs
-TASKS.md            (already exists — check off completed items)
+    mod.rs           ✓ (may need minor additions)
+    fixtures.rs      ✓ (may need minor additions)
+    server.rs        ★ (may need TestServer variants for auth tests)
+  types_test.rs      ✓
+  cli_portage_test.rs ★ (add expand_set tests)
+  worker_setup_test.rs ★ (add 3.1–3.8 tests)
+  server_api_test.rs   ★ (add 4.0, 4.9, 4.10, 4.12 tests)
+  docker_test.rs       ★ (fix 5.1, add 5.3–5.7 tests)
+  e2e_test.rs          ★ (replace placeholder with real tests)
+  error_test.rs        ★ (add 7.1–7.8, 7.12 tests)
+
+crates/worker/src/portage_setup.rs ★ (add _inner variants for task 3.0)
+
+docker/
+  test-stage3.Dockerfile  ★ (NEW — task 0.6)
+
+.github/workflows/
+  ci.yml                  ★ (add integration-test job — task 0.5)
+  test-image.yml          ★ (NEW — task 0.6)
+
+TASKS.md                  ✓ (check off tasks as you complete them)
 ```
-
----
-
-## 10  Constraints
-
-- Do **not** modify any existing source code unless a function is not `pub`
-  and needs to be made accessible for testing.  If you change visibility,
-  do it minimally (e.g. `pub(crate)` → `pub`).
-- Do **not** add trait abstractions or mock layers to production code.
-  Test at the boundary (filesystem, HTTP, Docker socket).
-- Do **not** add any dependencies that are not listed in §7.
-- Do **not** create Docker images during Phase 1–4 tests.
-- Follow the code style in `CONTRIBUTING.md`.
