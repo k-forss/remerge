@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -113,24 +113,7 @@ async fn main() -> Result<()> {
 async fn serve_tls(app: axum::Router, addr: &str, tls_cfg: &config::TlsConfig) -> Result<()> {
     use tokio_rustls::TlsAcceptor;
 
-    let cert_pem = std::fs::read(&tls_cfg.cert)
-        .with_context(|| format!("Failed to read TLS cert: {}", tls_cfg.cert.display()))?;
-    let key_pem = std::fs::read(&tls_cfg.key)
-        .with_context(|| format!("Failed to read TLS key: {}", tls_cfg.key.display()))?;
-
-    use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
-
-    let certs = CertificateDer::pem_slice_iter(&cert_pem)
-        .collect::<Result<Vec<_>, _>>()
-        .context("Failed to parse TLS certificate")?;
-    let key =
-        PrivateKeyDer::from_pem_slice(&key_pem).context("No private key found in key file")?;
-
-    let mut tls_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .context("Invalid TLS configuration")?;
-    tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let tls_config = tls_cfg.load_rustls_config()?;
 
     let acceptor = TlsAcceptor::from(Arc::new(tls_config));
     let listener = tokio::net::TcpListener::bind(addr).await?;

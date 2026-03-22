@@ -267,3 +267,16 @@ pub fn minimal_system_identity() -> SystemIdentity {
         profile: "default/linux/amd64/23.0".into(),
     }
 }
+
+/// Build a cross-architecture SystemIdentity (aarch64) for crossdev tests.
+pub fn cross_arch_system_identity() -> SystemIdentity {
+    SystemIdentity {
+        arch: "arm64".into(),
+        chost: "aarch64-unknown-linux-gnu".into(),
+        gcc_version: "13.2.0".into(),
+        libc_version: "2.38".into(),
+        kernel_version: "6.6.0".into(),
+        python_targets: vec!["python3_12".into()],
+        profile: "default/linux/arm64/23.0".into(),
+    }
+}

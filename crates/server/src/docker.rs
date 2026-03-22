@@ -221,7 +221,7 @@ impl DockerManager {
     /// For native builds, uses the matching `gentoo/stage3` variant.
     /// For cross-architecture builds, uses an `amd64` stage3 with `crossdev`
     /// pre-installed so the worker can build for the target CHOST.
-    fn generate_dockerfile(&self, sys: &SystemIdentity) -> String {
+    pub fn generate_dockerfile(&self, sys: &SystemIdentity) -> String {
         let target_arch = sys.chost.split('-').next().unwrap_or("x86_64");
 
         // Determine if this is a cross-build.

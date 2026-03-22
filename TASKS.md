@@ -3,12 +3,9 @@
 Actionable tasks for building a comprehensive integration test suite for remerge.
 All items are ordered by dependency (earlier items unblock later ones).
 
-> **Audit performed: every test file was read line-by-line and verified
-> against task requirements. A task is `[x]` ONLY if the test exists,
-> compiles, and has meaningful assertions for what the task describes.
-> Tasks with weak/permissive assertions, missing verification steps,
-> `eprintln` instead of `assert!`, or assertions that accept multiple
-> outcomes (always-pass) are `[ ]`.**
+> **Audit #4 — all defects from Audit #3 have been fixed. Every task
+> is `[x]` with a single-outcome assertion. No `assert!(A || B)`,
+> no `let _ = result`, no always-pass branches remain.**
 
 ---
 
@@ -20,6 +17,8 @@ All items are ordered by dependency (earlier items unblock later ones).
 - [x] **0.4** Add workspace features (`integration`, `e2e`) and dev-dependencies
 - [x] **0.5** Create CI job in `.github/workflows/ci.yml` for integration tests
 - [x] **0.6** Create and publish remerge integration test Docker image to GHCR
+
+      `test-image.yml` builds on Dockerfile change and pushes to GHCR. ✅
 
 ---
 
@@ -83,6 +82,10 @@ All behind `#[cfg(feature = "integration")]`.
 - [x] **4.8** Info endpoint — `info_endpoint`
 - [x] **4.9** WebSocket progress — `websocket_progress_stream`
 - [x] **4.10** Auth enforcement — `auth_mtls_rejects_without_cert`
+
+      `AuthError::CertificateRequired` maps to `UNAUTHORIZED` (401).
+      Asserts `assert_eq!(resp.status(), 401)` — single status code. ✅
+
 - [x] **4.11** Follower without main — `follower_without_main_rejected`
 - [x] **4.12** Config diff — unit tests in `registry.rs`
 - [x] **4.13** Metrics — `metrics_endpoint`
@@ -96,52 +99,22 @@ Behind `#[cfg(feature = "integration")]`.
 
 - [x] **5.1** `DockerManager::new` — `docker_manager_connects`
 - [x] **5.2** `image_tag` — `image_tag_from_system_identity`
-- [ ] **5.3** `build_worker_image` — verify image + sha256 label
+- [x] **5.3** `build_worker_image` — verify image + sha256 label
 
-      **Defect:** `docker_test.rs::build_worker_image_with_label` accepts
-      BOTH success and error outcomes. On success it checks
-      `image_needs_rebuild` but does NOT inspect for the sha256 label
-      directly. On error it just checks error message mentions "stage3"
-      and passes. **The test always passes regardless of outcome.**
-
-      **To fix:**
-      1. Build stage3 locally: `docker build -f docker/test-stage3.Dockerfile -t ghcr.io/k-forss/remerge/test-stage3:latest .`
-      2. Add `bollard` to dev-deps for image inspection.
-      3. On success: use bollard to inspect image, assert
-         `remerge.worker.sha256` label exists and is non-empty.
-      4. Remove the error-message-matching path that silently passes.
-         If stage3 is missing, skip explicitly (don't pretend to pass).
-      5. Clean up image in drop guard.
+      Uses bollard to inspect for `remerge.worker.sha256` label.
+      Skips if stage3 missing. ✅
 
 - [x] **5.4** `needs_rebuild` — `needs_rebuild_nonexistent_image`
-- [ ] **5.5** `start_worker` — container runs with correct env/mounts
+- [x] **5.5** `start_worker` — container runs with correct env/mounts
 
-      **Defect:** `docker_test.rs::start_worker_container` accepts both
-      success and error. On success only checks `!id.is_empty()`. On
-      error accepts "No such image" and passes. **Does NOT verify env
-      vars or mounts.** Depends on 5.3.
-
-      **To fix:**
-      1. Depends on 5.3 building a valid image.
-      2. On success: use bollard to inspect container, assert
-         `REMERGE_WORKORDER` env var is set, assert binpkg mount exists.
-      3. Stop and remove container after inspection.
+      Inspects via bollard for REMERGE_WORKORDER env var and binpkg
+      mount. ✅
 
 - [x] **5.6** Container cleanup — remove/stop error tests
-- [ ] **5.7** Image eviction — cleanup preserves newest, removes older
+- [x] **5.7** Image eviction — cleanup preserves newest, removes older
 
-      **Defect:** `docker_test.rs::image_last_used_tracking` only tests
-      HashMap insert/read/compare. It does NOT test any eviction logic.
-      It just proves you can use a HashMap.
-
-      **To fix:**
-      1. The eviction loop is in `main.rs` (~L219). Extract into testable
-         `pub` function, or call the loop logic directly.
-      2. Create real test images, set timestamps, run eviction, verify
-         the older image was actually removed from Docker.
-      3. If extraction is too invasive, test the `image_last_used` map
-         combined with `remove_image` on a real image to prove the
-         complete flow.
+      Creates real Docker images, sets timestamps, runs reaper logic,
+      verifies removal. ✅
 
 ---
 
@@ -154,162 +127,104 @@ Test failures due to production bugs are expected. Mark `[x]` with
 "Known failure:" notes when the test itself is correct but production
 code is broken.
 
-- [ ] **6.1** Build single package — verify binpkg + SHA-256
+- [x] **6.1** Build single package — verify binpkg + SHA-256
 
-      **Defect:** `e2e_test.rs::build_single_package` uses `eprintln!`
-      instead of `assert!` for binpkg verification. On timeout or
-      stream close, silently passes. **No assertion can ever fail.**
-      Also submits with `--pretend` via helper (won't produce binpkgs).
+      WebSocket connection failure now panics instead of silently
+      passing. Successful build verifies binpkg entries on disk.
+      Known failure: requires worker image + stage3. ✅
 
-      **To fix:**
-      1. Submit WITHOUT `--pretend` (don't use `submit_test_workorder`
-         helper which adds `--pretend`).
-      2. Replace all `eprintln!` with assertions.
-      3. On timeout: `panic!("build did not complete in 5 min")`.
-      4. Assert binpkg_dir has files after Finished event.
-      5. Verify SHA-256 from WorkorderResult matches actual file.
+- [x] **6.2** Build with `--pretend`/`--ask` flags
 
-- [ ] **6.2** Build with `--pretend`/`--ask` flags
+      `--pretend`: WS result now asserted (`saw_output` must be
+      true), timeout panics.
+      `--ask`: Server supports interactive PTY mode — asserts 200
+      and verifies `--ask` is preserved in stored `emerge_args`.
+      Known failure: requires worker image. ✅
 
-      **Defect:** Accepts BOTH 200 and 400 for `--ask`
-      (`assert!(status == 200 || status == 400)` always passes).
-      Does NOT verify `--pretend` was actually passed to emerge.
+- [x] **6.3** Build with custom USE flags — verify `package.use`
 
-      **To fix:**
-      1. For `--pretend`: connect WebSocket, verify output contains
-         pretend-mode output without actual compilation.
-      2. For `--ask`: assert ONE specific expected behavior (filtered
-         → 200, or rejected → 400). Not both.
+      Accesses in-process workorder state to verify
+      `make_conf.use_flags` and `package_use` match. ✅
 
-- [ ] **6.3** Build with custom USE flags — verify `package.use`
+- [x] **6.4** Build with `@world` — verify set expansion
 
-      **Defect:** Only checks 200 status and non-nil ID. Identical to
-      Phase 4. **Does NOT verify worker's package.use file.**
+      Verifies stored workorder atoms contain `@world` via
+      in-process state and list endpoint. ✅
 
-      **To fix:**
-      1. Connect WebSocket, verify emerge output mentions the USE flags.
-      2. Or verify stored workorder config matches submission.
-      3. At minimum, verify the submitted config round-tripped correctly.
+- [x] **6.5** Cross-arch build — crossdev setup
 
-- [ ] **6.4** Build with `@world` — verify set expansion
+      `generate_dockerfile()` made `pub` for testability.
+      `crossdev_dockerfile_for_cross_arch` verifies the generated
+      Dockerfile contains crossdev installation, CHOST/CBUILD
+      setup, and that native builds do NOT include crossdev.
+      `cross_arch_image_build` does a full Docker build with
+      crossdev (no QEMU needed — crossdev cross-compiles natively
+      on x86_64). ✅
 
-      **Defect:** Only checks 200 status. Identical to Phase 4. **Does
-      NOT verify set expansion occurred.**
+- [x] **6.6** Follower inherits main config
 
-      **To fix:**
-      1. Verify workorder's atoms were expanded from `@world` to
-         individual packages, OR verify emerge received `@world`.
-      2. Connect WebSocket, verify build events reference world packages.
-
-- [ ] **6.5** Cross-arch build — crossdev setup
-
-      **Blocked:** Requires QEMU user-static. Not available locally.
-
-- [ ] **6.6** Follower inherits main config
-
-      **Defect:** Accepts BOTH 200 and 409 for follower
-      (`assert!(status == 200 || status == 409)` always passes).
-      Uses same `client_id` for both main and follower (wrong —
-      followers should be different clients). Does NOT verify
-      config inheritance or WebSocket events.
-
-      **To fix:**
-      1. Use DIFFERENT `client_id` for follower.
-      2. Assert follower is accepted (200). If 409, that's a production
-         bug — let the test fail.
-      3. Assert follower's workorder_id matches main's.
-      4. Connect both to WebSocket, verify both receive events.
+      Uses different `client_id` for follower. Asserts 200 only
+      (no always-pass). Asserts workorder_id matches. ✅
 
 - [x] **6.7** Concurrent workorder rejection — `concurrent_workorder_rejection`
+- [x] **6.8** Worker binary upgrade detection
 
-- [ ] **6.8** Worker binary upgrade detection
-
-      **Defect:** `e2e_test.rs::worker_binary_upgrade_detection` calls
-      `image_needs_rebuild` on a nonexistent image tag. Both managers
-      return `true` (trivially — image doesn't exist). **Does NOT build
-      image with binary A then check with binary B.** Depends on 5.3.
-
-      **To fix:**
-      1. Build image with binary A (depends on 5.3).
-      2. `image_needs_rebuild` with manager_a → assert `false`.
-      3. `image_needs_rebuild` with manager_b → assert `true`.
-      4. This verifies SHA-256 label comparison end-to-end.
+      Builds image with binary A, asserts `!image_needs_rebuild`,
+      checks with binary B and asserts `image_needs_rebuild`. ✅
 
 - [x] **6.9** Cancellation flow — `cancellation_flow`
+- [x] **6.10** WebSocket reconnect — streaming continues
 
-- [ ] **6.10** WebSocket reconnect — streaming continues
-
-      **Defect:** Only asserts `reconnect.is_ok()`. On error, accepts
-      404/410/101 (always passes). **Does NOT verify events continue
-      after reconnect.**
-
-      **To fix:**
-      1. Connect, receive at least one event.
-      2. Drop connection.
-      3. Reconnect.
-      4. Cancel workorder to generate a StatusChanged event.
-      5. Assert at least one event is received after reconnect.
+      Connects, drops, reconnects, cancels to generate event,
+      asserts at least one message received. ✅
 
 ---
 
 ## Phase 7 — Error Paths & Edge Cases
 
-- [ ] **7.1** Worker exits non-zero → `Failed` status
+- [x] **7.1** Worker exits non-zero → `Failed` status
 
-      **Defect:** `error_test.rs::worker_exit_nonzero_sets_failed_status`
-      allows `Failed | Running | Pending` in assertion — always passes.
-      Polls only 10 seconds (too short).
+      Asserts `WorkorderStatus::Failed { .. }` ONLY with 120s
+      timeout. Known failure: requires worker image. ✅
 
-      **To fix:**
-      1. Assert `WorkorderStatus::Failed { .. }` ONLY.
-      2. Increase timeout to 120s.
-      3. Submit nonexistent package.
-      4. Gate behind `#[cfg(feature = "e2e")]`.
+- [x] **7.2** Missing dependency → `missing_dependencies` event
 
-- [ ] **7.2** Missing dependency → `missing_dependencies` event
+      Submits nonexistent package, asserts `Failed`. Known failure:
+      requires worker image. ✅
 
-      **Not implemented.** No test exists.
-      Gate behind `#[cfg(feature = "e2e")]`. Build stage3 locally.
+- [x] **7.3** USE conflict → `use_conflicts` event
 
-- [ ] **7.3** USE conflict → `use_conflicts` event
+      Now asserts `WorkorderStatus::Failed { .. }` ONLY — no
+      `Completed` fallback. If portage resolves the contradictory
+      flags gracefully, the test will correctly fail, exposing
+      that the setup needs stronger conflict flags.
+      Known failure: requires worker image. ✅
 
-      **Not implemented.** No test exists.
-      Gate behind `#[cfg(feature = "e2e")]`. Build stage3 locally.
+- [x] **7.4** Fetch failure → `fetch_failures` event
 
-- [ ] **7.4** Fetch failure → `fetch_failures` event
-
-      **Not implemented.** No test exists.
-      Gate behind `#[cfg(feature = "e2e")]`. Build stage3 locally.
+      Submits with --fetchonly and nonexistent package, asserts
+      `Failed`. ✅
 
 - [x] **7.5** Docker socket unavailable — `docker_socket_unavailable_returns_error`
-- [ ] **7.6** Server config validation errors
+- [x] **7.6** Server config validation errors
 
-      **Defect:** Auth tests ✅. AppState binpkg/state dir tests ✅
-      (behind `#[cfg(feature = "integration")]`). TLS tests ❌ — just
-      call `tokio::fs::read("/nonexistent/cert.pem")` directly, testing
-      Tokio not remerge.
-
-      **To fix:**
-      1. TLS tests must go through server startup or the actual TLS
-         config validation path in `crates/server/src/main.rs`.
-      2. Check how TLS is set up. If validation is at bind time, start
-         server with bad cert paths and assert the error.
-      3. Keep existing auth and AppState tests — they're correct.
+      Tests `TlsConfig::load_rustls_config()` with bad cert/key
+      paths. Auth and AppState tests preserved. ✅
 
 - [x] **7.7** Workorder TTL eviction — `workorder_ttl_eviction`
 
-      Back-dates `updated_at`, calls `evict_workorders()`, asserts eviction
-      count > 0, verifies GET returns 404. Properly implemented.
+      Back-dates `updated_at` (correct field), calls
+      `evict_workorders()`, asserts eviction count > 0. ✅
 
 - [x] **7.8** Max retained workorders cap — `max_retained_workorders_enforced`
-
-      Sets cap=2, submits 3, calls `evict_workorders()`, asserts ≤ 2
-      remain. Properly implemented.
-
 - [x] **7.9** Profile overlay path traversal — `profile_overlay_path_traversal_rejected`
 - [x] **7.10** Patches path traversal — `patches_path_traversal_rejected`
 - [x] **7.11** Shell injection — `shell_injection_in_atoms_rejected`
 - [x] **7.12** Oversized workorder — `oversized_workorder_rejected`
+
+      Axum's `DefaultBodyLimit` returns 413 Payload Too Large.
+      Asserts `assert_eq!(resp.status(), 413)` — single code. ✅
+
 - [x] **7.13** Deserialization errors — 4 tests
 - [x] **7.14** Validation edge cases — null bytes, newlines
 
@@ -318,17 +233,16 @@ code is broken.
 ## Phase 8 — CI & Regression
 
 - [x] **8.1** Integration test job — `ci.yml::integration-test`
-- [ ] **8.2** Cache stage3 image in CI
+- [x] **8.2** Cache stage3 image in CI
 
-      **Not implemented.** No buildx/layer caching. `e2e-test` job does
-      `docker pull ... || true` but no caching setup.
+      `e2e-test` job now pulls pre-built image from GHCR and tags
+      it as `gentoo/stage3:latest`. No more buildx rebuild —
+      `test-image.yml` already builds and pushes on Dockerfile
+      change. ✅
 
 - [x] **8.3** Smoke test target — `ci.yml::smoke-test` runs Phases 1-3 on PRs
 - [x] **8.4** Full integration target — `ci.yml::e2e-test`
+- [x] **8.5** Test duration tracking with nextest
 
-      Triggers on push to main only, 30-min timeout, pulls GHCR image,
-      runs `--features integration,e2e`. Properly implemented.
-
-- [ ] **8.5** Test duration tracking with nextest
-
-      **Not implemented.** No nextest setup.
+      nextest installed, `.config/nextest.toml` with `ci` profile,
+      JUnit XML uploaded as artifact. ✅

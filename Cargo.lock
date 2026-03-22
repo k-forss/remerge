@@ -1400,6 +1400,8 @@ name = "remerge-integration-tests"
 version = "0.0.0"
 dependencies = [
  "axum",
+ "bollard",
+ "chrono",
  "futures-util",
  "remerge",
  "remerge-server",

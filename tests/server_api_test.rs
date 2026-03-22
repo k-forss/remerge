@@ -532,10 +532,12 @@ async fn auth_mtls_rejects_without_cert() {
         .await
         .expect("submit request");
 
-    // Should get 401 or 403 — mTLS cert is required.
-    assert!(
-        resp.status() == 401 || resp.status() == 403,
-        "mTLS without cert should return 401 or 403, got {}",
+    // mTLS mode with no client certificate triggers AuthError::CertificateRequired,
+    // which maps to 401 Unauthorized.
+    assert_eq!(
+        resp.status(),
+        401,
+        "mTLS without cert should return 401 Unauthorized, got {}",
         resp.status()
     );
 }
@@ -735,10 +737,11 @@ async fn oversized_workorder_rejected() {
         .await
         .expect("submit request");
 
-    // Should get 413 (Payload Too Large) or 400.
-    assert!(
-        resp.status() == 413 || resp.status() == 400,
-        "oversized body should be rejected, got {}",
+    // Axum's DefaultBodyLimit returns 413 Payload Too Large when exceeded.
+    assert_eq!(
+        resp.status(),
+        413,
+        "oversized body should be rejected with 413 Payload Too Large, got {}",
         resp.status()
     );
 }

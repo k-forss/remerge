@@ -1,0 +1,16 @@
+# nextest configuration for remerge.
+#
+# The `ci` profile is used in GitHub Actions to produce JUnit XML output
+# for test duration tracking (task 8.5).
+
+[profile.default]
+# Show slow tests after this threshold.
+slow-timeout = { period = "30s", terminate-after = 3 }
+
+[profile.ci]
+# Produce JUnit XML output for CI integration.
+junit = { path = "junit.xml" }
+# Fail fast in CI.
+fail-fast = true
+# Show slow tests.
+slow-timeout = { period = "30s", terminate-after = 3 }

@@ -201,6 +201,35 @@ pub struct TlsConfig {
     pub key: PathBuf,
 }
 
+impl TlsConfig {
+    /// Load and validate the TLS certificate and key from disk.
+    ///
+    /// Returns a configured [`rustls::ServerConfig`] on success, or an error
+    /// if the files are missing, unreadable, or contain invalid PEM data.
+    pub fn load_rustls_config(&self) -> Result<rustls::ServerConfig> {
+        let cert_pem = std::fs::read(&self.cert)
+            .with_context(|| format!("Failed to read TLS cert: {}", self.cert.display()))?;
+        let key_pem = std::fs::read(&self.key)
+            .with_context(|| format!("Failed to read TLS key: {}", self.key.display()))?;
+
+        use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+
+        let certs = CertificateDer::pem_slice_iter(&cert_pem)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("Failed to parse TLS certificate")?;
+        let key =
+            PrivateKeyDer::from_pem_slice(&key_pem).context("No private key found in key file")?;
+
+        let mut tls_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .context("Invalid TLS configuration")?;
+        tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+        Ok(tls_config)
+    }
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
