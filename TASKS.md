@@ -270,13 +270,40 @@ mock layer.
       files, verify they appear in `base/env/`, verify content matches,
       verify invalid filenames (containing `/` or `..`) are skipped.
 
-- [x] **3.7** `write_repos_conf` with server `repos_dir` bind-mount remapping
+- [ ] **3.7** `write_repos_conf` with server `repos_dir` bind-mount remapping
       (locations must be rewritten to `/var/db/repos/<name>`)
 
+      **Audit finding:** UNCHECKED — the `write_repos_conf_inner` function
+      does NOT accept a `repos_dir` parameter and does NOT perform any
+      remapping. The remapping logic lives in `ensure_repo_locations()`
+      (a private function at line ~510 in `portage_setup.rs`) which:
+      - symlinks repo locations to bind-mounted paths under `/var/db/repos/`
+      - remaps overlays to `/var/tmp/remerge-repos/` when `REMERGE_SKIP_SYNC=1`
+      - uses `rewrite_repo_location()` to update `location =` lines in-place
+
+      The existing `write_repos_conf_creates_files` test only verifies that
+      raw content is written to `repos.conf/<name>` — it does NOT test
+      the remapping/symlinking behavior at all.
+
       **Implementation notes:**
-      Depends on task 3.0 (`write_repos_conf_inner`). Pass a `repos_dir`
-      value and verify that the `location =` lines in the output are
-      rewritten to use the repos_dir path.
+      Two approaches:
+      - **Option A (preferred):** Create `ensure_repo_locations_inner(config,
+        repos_base, repos_conf_base)` that operates on parametric paths
+        instead of hardcoded `/var/db/repos` and `/etc/portage/repos.conf/`.
+        Then write tests that create a temp bind-mount dir and verify
+        symlinks and rewrites.
+      - **Option B:** Test inside the GHCR Docker image (task 0.6) where
+        the function can operate on real paths. Gate behind
+        `#[cfg(feature = "e2e")]`.
+      - For Option A, also create `rewrite_repo_location_inner(repos_conf_base,
+        filename, old_loc, new_loc)` since the current function uses
+        hardcoded `/etc/portage/repos.conf/{filename}`.
+      - Test cases:
+        1. Repo in bind-mount → symlink created at `location`
+        2. Repo NOT in bind-mount, `REMERGE_SKIP_SYNC=1` → remapped to
+           writable path and `location =` line rewritten
+        3. Repo NOT in bind-mount, no skip-sync → empty dir created
+        4. Invalid location (traversal) → bail with error
 
 - [x] **3.8** `write_repos_conf` without server repos_dir — locations
       preserved as-is
@@ -646,17 +673,46 @@ logic exists. It falsely reports as "passed".
       - Does NOT require Docker — tests the error path.
       - No feature gate needed; add to `error_test.rs`.
 
-- [x] **7.6** Server config validation — missing `binpkg_dir`, invalid
+- [ ] **7.6** Server config validation — missing `binpkg_dir`, invalid
       `auth` section, missing TLS cert
 
+      **Audit finding:** UNCHECKED — the existing tests in `error_test.rs`
+      (`server_config_default_roundtrip` and
+      `server_config_empty_object_uses_defaults`) only test serde
+      serialization, NOT validation error paths.  None of the specified
+      validation scenarios are actually tested.
+
       **Implementation notes:**
-      - Create `ServerConfig` with various invalid configurations.
-      - Verify `AppState::new()` returns appropriate errors.
-      - Sub-tests:
-        - `auth.mode = Mtls` without cert paths
-        - Non-writable `binpkg_dir`
-        - Invalid `tls` config with non-existent cert files
-      - Some sub-tests may not need Docker; test what's possible.
+      - These tests do NOT require Docker — they test config validation
+        before `AppState::new()` reaches `DockerManager`.
+      - Sub-tests to implement in `tests/error_test.rs`:
+
+        1. **`auth.mode = Mtls` without cert paths:** Create a
+           `ServerConfig` with `auth.mode = AuthMode::Mtls` but no
+           `auth.ca_cert` / `auth.server_cert` paths.  Call
+           `AppState::new()` or the auth validation path.  Assert an
+           error is returned.
+           - Check `crates/server/src/auth.rs` for `CertRegistry::new()`
+             to see if it validates cert paths.  If it doesn't validate
+             eagerly, the test should verify what happens when a
+             connection is attempted.
+
+        2. **Non-writable `binpkg_dir`:** Set `binpkg_dir` to a path
+           like `/proc/nonexistent` (non-creatable).  Call
+           `AppState::new()`.  The `create_dir_all` in state.rs:74
+           should fail.  Assert error.
+
+        3. **Invalid TLS config:** Set TLS cert paths to non-existent
+           files.  Check if the server validates at startup.
+           - If TLS validation is lazy (checked on bind), this may
+             require starting the server and verifying the error.
+
+        4. **`state_dir` non-writable:** Set `state_dir` to a
+           non-creatable path.  Assert `AppState::new()` errors.
+
+      - Some sub-tests may need Docker for `AppState::new()` to reach
+        the validation point.  If `DockerManager::new()` fails first,
+        test the validation functions directly instead.
 
 - [ ] **7.7** Workorder TTL expiry — verify `reap_old_workorders` removes
       stale entries
