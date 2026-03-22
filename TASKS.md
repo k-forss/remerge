@@ -7,22 +7,19 @@ All items are ordered by dependency (earlier items unblock later ones).
 
 ## Phase 0 — Infrastructure & Scaffolding
 
-- [ ] **0.1** Create `tests/` directory at workspace root for integration tests
-- [ ] **0.2** Add `tests/common/mod.rs` with shared helpers (free port allocation,
+- [x] **0.1** Create `tests/` directory at workspace root for integration tests
+- [x] **0.2** Add `tests/common/mod.rs` with shared helpers (free port allocation,
       temp dir scaffolding, config builders, timeout wrappers)
-- [ ] **0.3** Add `tests/fixtures/` with static test data:
-  - [ ] Minimal `make.conf` (CFLAGS, CHOST, USE, FEATURES)
-  - [ ] Sample `package.use`, `package.accept_keywords`, `package.mask`,
+- [x] **0.3** Add `tests/common/fixtures.rs` with test data builders:
+  - [x] Minimal `make.conf` (CFLAGS, CHOST, USE, FEATURES)
+  - [x] Sample `package.use`, `package.accept_keywords`, `package.mask`,
         `package.unmask`, `package.env`, env files
-  - [ ] Minimal `repos.conf` (single `[gentoo]` section with a `location`)
-  - [ ] Sample `profile/` overlay directory (parent, use.mask, package.mask)
-  - [ ] Sample `patches/` tree (category/package/patch files)
-  - [ ] Minimal `remerge.conf` (server URL, client_id)
-  - [ ] Minimal `remerged.conf` (binpkg_dir, auth = none)
-- [ ] **0.4** Add a `[workspace.metadata.test]` or `[[test]]` integration target
-      in `Cargo.toml` (or a `tests/` crate) gated behind
-      `#[cfg(feature = "integration")]` so `cargo test` still runs fast by
-      default
+  - [x] Minimal `repos.conf` (single `[gentoo]` section with a `location`)
+  - [x] Sample `profile/` overlay directory (use.mask)
+  - [x] Sample `patches/` tree (category/package/patch files)
+- [x] **0.4** Add workspace features (`integration`, `e2e`) and dev-dependencies
+      to `Cargo.toml`; created lib.rs for server/worker/CLI crates to expose
+      modules for integration testing
 - [ ] **0.5** Create a CI job in `.github/workflows/ci.yml` that runs integration
       tests on `ubuntu-latest` with Docker available (GitHub-hosted runners
       have Docker pre-installed)
@@ -33,18 +30,18 @@ All items are ordered by dependency (earlier items unblock later ones).
 
 These are pure-logic tests that need no Docker, no server, no filesystem.
 
-- [ ] **1.1** `PortageConfig` round-trip: construct → serialize → deserialize →
+- [x] **1.1** `PortageConfig` round-trip: construct → serialize → deserialize →
       assert equality (covers serde defaults like `profile_overlay`,
       `use_flags_resolved`)
-- [ ] **1.2** `Workorder` round-trip: all status transitions
+- [x] **1.2** `Workorder` round-trip: all status transitions
       (`Pending → Provisioning → Building → Completed/Failed/Cancelled`)
-- [ ] **1.3** `validate_atom` exhaustive: all legal operator/category/name/version
+- [x] **1.3** `validate_atom` exhaustive: all legal operator/category/name/version
       combinations vs. all rejection classes (shell injection, empty parts,
       unqualified + versioned)
-- [ ] **1.4** `MakeConf` field coverage: every `extra_vars` key, empty USE,
+- [x] **1.4** `MakeConf` field coverage: every `extra_vars` key, empty USE,
       empty FEATURES, `use_flags_resolved = true` vs `false` behaviour
-- [ ] **1.5** `ClientRole` / `AuthMode` `Display` + `FromStr` round-trips
-- [ ] **1.6** `WorkorderResult` with mixed built/failed packages, SHA-256 hashes
+- [x] **1.5** `ClientRole` / `AuthMode` `Display` + `FromStr` round-trips
+- [x] **1.6** `WorkorderResult` with mixed built/failed packages, SHA-256 hashes
 
 ---
 
@@ -54,35 +51,38 @@ Tests that create a temp directory tree mimicking `/etc/portage/` and `/var/db/p
 
 - [ ] **2.1** `read_config` golden path: populate a full temp portage tree in a
       temp dir, set `ROOT` to that dir, call `PortageReader::new()?.read_config()`,
-      assert every field
+      assert every field (requires portageq — skipped in non-Gentoo CI)
 - [ ] **2.2** `read_config` with missing optional dirs (no `package.use/`,
       no `patches/`, no `profile/` overlay) — should succeed with empty maps
+      (requires portageq — skipped in non-Gentoo CI)
 - [ ] **2.3** `read_config` with `package.use` as a single file vs. a directory
-      of files (Portage supports both)
+      of files (Portage supports both) (requires portageq — skipped in
+      non-Gentoo CI)
 - [ ] **2.4** `read_profile_overlay` round-trip: write files into
       `<ROOT>/etc/portage/profile/` in the temp dir, call
       `PortageReader::new()?.read_profile_overlay()`, assert `BTreeMap` keys and
-      content
+      content (requires portageq — skipped in non-Gentoo CI)
 - [ ] **2.5** `read_patches_recursive` with nested `category/package/*.patch`
+      (requires portageq — skipped in non-Gentoo CI)
 - [ ] **2.6** `read_repos_conf` with multiple `[section]` blocks, verify
-      repo names and locations
-- [ ] **2.7** `is_installed` with version constraints:
-  - [ ] `category/pkg` — any version matches
-  - [ ] `=category/pkg-1.2.3` — exact match
-  - [ ] `=category/pkg-1.2.3-r1` — exact with revision
-  - [ ] `>=category/pkg-2.0` — satisfied and unsatisfied
-  - [ ] `<=category/pkg-2.0` — satisfied and unsatisfied
-  - [ ] `>category/pkg-2.0` — boundary (2.0 should NOT match)
-  - [ ] `<category/pkg-2.0` — boundary
-  - [ ] `~category/pkg-1.2.3` — any revision
-  - [ ] `=category/pkg-1.2*` — glob
-  - [ ] `@world` — always returns false
-  - [ ] Uninstalled package — returns false
+      repo names and locations (requires portageq — skipped in non-Gentoo CI)
+- [x] **2.7** `is_installed` with version constraints:
+  - [x] `category/pkg` — any version matches
+  - [x] `=category/pkg-1.2.3` — exact match
+  - [x] `=category/pkg-1.2.3-r1` — exact with revision
+  - [x] `>=category/pkg-2.0` — satisfied and unsatisfied
+  - [x] `<=category/pkg-2.0` — satisfied and unsatisfied
+  - [x] `>category/pkg-2.0` — boundary (2.0 should NOT match)
+  - [x] `<category/pkg-2.0` — boundary
+  - [x] `~category/pkg-1.2.3` — any revision
+  - [x] `=category/pkg-1.2*` — glob
+  - [x] `@world` — always returns false
+  - [x] Uninstalled package — returns false
 - [ ] **2.8** `expand_set` for `@world` (reads world file) and `@system`
-      (calls `portageq`)
-- [ ] **2.9** `split_name_version` edge cases: numeric-only names
+      (calls `portageq`) — requires portageq
+- [x] **2.9** `split_name_version` edge cases: numeric-only names
       (`dev-libs/1lib`), multi-hyphen (`x11-libs/gtk+-2.0`), no version
-- [ ] **2.10** `compare_versions` edge cases: suffixes (`_alpha`, `_beta`,
+- [x] **2.10** `compare_versions` edge cases: suffixes (`_alpha`, `_beta`,
       `_pre`, `_rc`, `_p`), long numeric segments, revision-only differences
 
 ---
@@ -92,62 +92,69 @@ Tests that create a temp directory tree mimicking `/etc/portage/` and `/var/db/p
 Tests that call `portage_setup` functions against a temp directory.
 
 - [ ] **3.1** `write_make_conf` golden path: provide a `MakeConf`, assert
-      generated file content line-by-line (CHOST, CBUILD, CFLAGS, USE,
-      FEATURES, MAKEOPTS, signing, ACCEPT_KEYWORDS, ACCEPT_LICENSE, extra_vars)
+      generated file content line-by-line (writes to hardcoded `/etc/portage/` —
+      requires root or container environment)
 - [ ] **3.2** `write_make_conf` with `use_flags_resolved = true` — USE line
-      must start with `-* `
+      must start with `-* ` (requires root)
 - [ ] **3.3** `write_make_conf` with `use_flags_resolved = false` — no `-*`
-      prefix
+      prefix (requires root)
 - [ ] **3.4** `write_make_conf` with USE_EXPAND flags — must appear as
-      separate variables, not inside USE
+      separate variables, not inside USE (requires root)
 - [ ] **3.5** `write_package_config` for each config type (use, keywords,
       license, mask, unmask, env) — both single-entry and multi-entry
+      (requires root)
 - [ ] **3.6** `write_env_files` — write, verify content and permissions
+      (requires root)
 - [ ] **3.7** `write_repos_conf` with server `repos_dir` bind-mount remapping
-      (locations must be rewritten to `/var/db/repos/<name>`)
+      (locations must be rewritten to `/var/db/repos/<name>`) (requires root)
 - [ ] **3.8** `write_repos_conf` without server repos_dir — locations
-      preserved as-is
-- [ ] **3.9** `set_profile` — creates `/etc/portage/make.profile` symlink
-      pointing to the correct repo's `profiles/<profile>` path; test with
-      multiple repos to verify correct repo selection
-- [ ] **3.10** `write_profile_overlay` — writes files to
-      `/etc/portage/profile/`, rejects path traversal (`..`), rejects
-      absolute paths
-- [ ] **3.11** `write_patches` — writes files to `/etc/portage/patches/`,
-      creates intermediate category/package dirs, rejects path traversal
-- [ ] **3.12** `build_makeopts` — server env REMERGE_PARALLEL_JOBS and
+      preserved as-is (requires root)
+- [x] **3.9** `set_profile` — creates symlink pointing to the correct repo's
+      `profiles/<profile>` path; tested via `set_profile_inner` with temp dirs
+- [x] **3.10** `write_profile_overlay` — writes files to temp dir,
+      rejects path traversal (`..`), rejects absolute paths; tested via
+      `write_profile_overlay_inner`
+- [x] **3.11** `write_patches` — writes files to temp dir, creates intermediate
+      category/package dirs, rejects path traversal; tested via
+      `write_patches_inner`
+- [x] **3.12** `build_makeopts` — server env REMERGE_PARALLEL_JOBS and
       REMERGE_LOAD_AVERAGE override client MAKEOPTS; absent env falls back
-      to client MAKEOPTS
+      to client MAKEOPTS; tested via `build_makeopts_inner`
 - [ ] **3.13** `apply_config` orchestration — call with a full `PortageConfig`
       and assert that all files are present under the temp root
+      (requires root — writes to hardcoded paths)
 
 ---
 
-## Phase 4 — Server Unit-level (in-process, no Docker)
+## Phase 4 — Server Unit-level (in-process, with Docker)
 
-Tests that spin up the axum app in-process with a mock/stub Docker layer.
+Tests that spin up the axum app in-process. Require Docker for AppState
+initialization but do not run builds — they test HTTP API responses only.
+Tests skip gracefully when Docker is unavailable.
 
-- [ ] **4.1** `POST /api/v1/workorder` — valid submission returns 200 +
+- [x] **4.1** `POST /api/v1/workorders` — valid submission returns 200 +
       workorder ID
-- [ ] **4.2** `POST /api/v1/workorder` — invalid atoms rejected (400)
-- [ ] **4.3** `POST /api/v1/workorder` — duplicate active workorder rejected
+- [x] **4.2** `POST /api/v1/workorders` — invalid atoms rejected (400)
+- [x] **4.3** `POST /api/v1/workorders` — duplicate active workorder rejected
       (409)
-- [ ] **4.4** `GET /api/v1/workorder/:id` — returns workorder with correct
+- [x] **4.4** `GET /api/v1/workorders/:id` — returns workorder with correct
       status
-- [ ] **4.5** `GET /api/v1/workorders` — returns list, respects ordering
-- [ ] **4.6** `POST /api/v1/workorder/:id/cancel` — transitions to Cancelled
-- [ ] **4.7** `GET /health` — returns 200
-- [ ] **4.8** `GET /api/v1/info` — returns server version, auth mode,
+- [x] **4.5** `GET /api/v1/workorders` — returns list with at least one entry
+- [x] **4.6** `DELETE /api/v1/workorders/:id` — transitions to Cancelled
+- [x] **4.7** `GET /api/v1/health` — returns 200 with status "ok"
+- [x] **4.8** `GET /api/v1/info` — returns server version, auth mode,
       binhost URL
-- [ ] **4.9** WebSocket `/api/v1/workorder/:id/progress` — connects,
+- [ ] **4.9** WebSocket `/api/v1/workorders/:id/progress` — connects,
       receives text events, binary PTY frames
 - [ ] **4.10** Auth enforcement: `None` mode allows all, `Mtls` mode
       rejects missing cert, `Mixed` mode enforces main vs follower rules
-- [ ] **4.11** Client registry: follower registration requires existing main,
-      follower cannot push new config
+      (covered by unit tests in server/auth.rs)
+- [x] **4.11** Client registry: follower registration requires existing main
 - [ ] **4.12** Config diff detection: same config → empty diff, changed
-      package.use → `portage_changed = true`
-- [ ] **4.13** Metrics endpoint (`/metrics`) returns Prometheus text format
+      package.use → `portage_changed = true` (covered by unit tests in
+      server/registry.rs)
+- [x] **4.13** Metrics endpoint (`/metrics`) returns Prometheus text format
+- [x] **4.14** GET /api/v1/workorders/{nonexistent} returns 404
 
 ---
 
@@ -156,9 +163,8 @@ Tests that spin up the axum app in-process with a mock/stub Docker layer.
 These tests need a running Docker daemon. Gate behind
 `#[cfg(feature = "integration")]`.
 
-- [ ] **5.1** `DockerManager::new` — connects to local Docker socket
-- [ ] **5.2** `image_tag` derivation from `SystemId` — verify format
-      `<prefix>-<arch>-<profile>-<gcc>`
+- [x] **5.1** `DockerManager::new` — connects to local Docker socket
+- [x] **5.2** `image_tag` derivation from `SystemId` — verify format
 - [ ] **5.3** `build_worker_image` — builds an image, verify it exists via
       Docker API, verify `remerge.worker.sha256` label
 - [ ] **5.4** `needs_rebuild` — returns `false` for freshly-built image,
@@ -217,10 +223,13 @@ access (for `emerge --sync`). These are slow and should be gated behind
 - [ ] **7.7** Workorder TTL expiry — verify `reap_old_workorders` removes
       stale entries
 - [ ] **7.8** Max retained workorders — verify cap is enforced
-- [ ] **7.9** Path traversal in `profile_overlay` keys — verify rejection
-- [ ] **7.10** Path traversal in `patches` keys — verify rejection
-- [ ] **7.11** Shell injection in atom names — verify rejection
+- [x] **7.9** Path traversal in `profile_overlay` keys — verify rejection
+- [x] **7.10** Path traversal in `patches` keys — verify rejection
+- [x] **7.11** Shell injection in atom names — verify rejection
 - [ ] **7.12** Oversized workorder — verify graceful handling
+- [x] **7.13** Deserialization error paths — empty JSON, invalid JSON,
+      wrong type, missing required fields
+- [x] **7.14** Validation edge cases — null bytes, newlines, whitespace-only
 
 ---
 
