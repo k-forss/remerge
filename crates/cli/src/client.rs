@@ -164,6 +164,26 @@ impl RemergeClient {
         stdin_handle.abort();
         ws_stdin_handle.abort();
 
+        // If we didn't receive a Finished event but the connection closed,
+        // try to fetch the result from the REST API as a fallback.  This
+        // handles the edge case where the WS Close frame arrives before
+        // or instead of a Finished event (e.g. channel lagged, server
+        // shutdown, etc.).
+        if final_result.is_none() {
+            debug!("No Finished event received — attempting REST fallback");
+            // Give the server a moment to persist the result.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            // Extract workorder ID from the WS URL.
+            // URL format: ws://host/api/v1/workorders/{id}/progress
+            // The UUID is the second-to-last path segment.
+            let segments: Vec<&str> = ws_url.split('/').collect();
+            if let Some(id_str) = segments.iter().rev().nth(1)
+                && let Ok(id) = id_str.parse::<uuid::Uuid>()
+            {
+                final_result = self.fetch_result(id).await.ok();
+            }
+        }
+
         final_result.context("Build finished but no result was received")
     }
 

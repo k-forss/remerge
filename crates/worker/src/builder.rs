@@ -13,6 +13,8 @@ use tracing::info;
 
 use remerge_types::workorder::Workorder;
 
+use crate::portage_setup::{self, RepoSection};
+
 /// Build all packages in the workorder using emerge.
 ///
 /// `emerge_cmd` is either `"emerge"` (native) or `"emerge-<CHOST>"` (cross).
@@ -129,38 +131,82 @@ async fn sync_portage() -> Result<()> {
 /// already available.  But client overlays (layman, eselect-repository,
 /// GURU, etc.) may not be present on the server.  This function detects
 /// those and syncs them individually via `emaint sync -r <name>`.
+///
+/// Overlays whose `sync-uri` uses an SSH or authenticated URI scheme
+/// (`git@`, `ssh://`, etc.) are skipped because the worker container
+/// lacks the client's SSH keys.
 async fn sync_missing_repos() -> Result<()> {
     let repos = discover_configured_repos().await;
     let mut synced = 0usize;
+    let mut skipped = 0usize;
 
-    for (name, location) in &repos {
-        if is_repo_populated(location) {
+    for repo in &repos {
+        if is_repo_populated(&repo.location) {
             continue;
         }
 
-        info!(repo = %name, location = %location, "Syncing missing overlay");
+        // Skip repos whose sync-uri requires authentication.
+        if let Some(ref uri) = repo.sync_uri
+            && requires_auth(uri)
+        {
+            info!(
+                repo = %repo.name,
+                sync_uri = %uri,
+                "Skipping overlay — sync-uri requires authentication"
+            );
+            skipped += 1;
+            continue;
+        }
+
+        info!(repo = %repo.name, location = %repo.location, "Syncing missing overlay");
         let status = Command::new("emaint")
-            .args(["sync", "-r", name])
+            .args(["sync", "-r", &repo.name])
             .status()
             .await
-            .with_context(|| format!("Failed to sync overlay {name}"))?;
+            .with_context(|| format!("Failed to sync overlay {}", repo.name))?;
 
         if status.success() {
             synced += 1;
         } else {
-            tracing::warn!(repo = %name, "Overlay sync failed (continuing anyway)");
+            tracing::warn!(repo = %repo.name, "Overlay sync failed (continuing anyway)");
         }
     }
 
     if synced > 0 {
         info!(synced, "Synced missing overlay repos");
     }
+    if skipped > 0 {
+        info!(skipped, "Skipped overlays requiring authentication");
+    }
     Ok(())
 }
 
-/// Read `/etc/portage/repos.conf/` and return `(name, location)` pairs
-/// for all configured repositories.
-async fn discover_configured_repos() -> Vec<(String, String)> {
+/// Returns `true` if a sync-uri requires authentication (SSH, etc.)
+/// and would fail inside an ephemeral worker container.
+fn requires_auth(uri: &str) -> bool {
+    let lower = uri.to_ascii_lowercase();
+
+    // Explicit SSH scheme URIs.
+    if lower.starts_with("ssh://") || lower.starts_with("git+ssh://") {
+        return true;
+    }
+
+    // scp-like syntax: user@host:path — no scheme present, '@' before ':',
+    // no '/' before '@' (which would indicate a path component in an HTTP URL).
+    if !uri.contains("://")
+        && let Some(at_pos) = uri.find('@')
+        && uri[at_pos + 1..].starts_with(|c: char| c.is_ascii_alphanumeric())
+        && uri[..at_pos].chars().all(|c| c != '/')
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Read `/etc/portage/repos.conf/` and return metadata for all configured
+/// repositories — including sync-uri when present.
+async fn discover_configured_repos() -> Vec<RepoSection> {
     let conf_path = std::path::Path::new("/etc/portage/repos.conf");
     let mut repos = Vec::new();
 
@@ -170,13 +216,13 @@ async fn discover_configured_repos() -> Vec<(String, String)> {
         };
         while let Ok(Some(entry)) = dir.next_entry().await {
             if let Ok(content) = tokio::fs::read_to_string(entry.path()).await {
-                repos.extend(crate::portage_setup::parse_repo_sections(&content));
+                repos.extend(portage_setup::parse_repo_sections_full(&content));
             }
         }
     } else if conf_path.is_file()
         && let Ok(content) = tokio::fs::read_to_string(conf_path).await
     {
-        repos.extend(crate::portage_setup::parse_repo_sections(&content));
+        repos.extend(portage_setup::parse_repo_sections_full(&content));
     }
 
     repos
