@@ -329,23 +329,37 @@ async fn worker_exit_nonzero_sets_failed_status() {
         let submit_resp: remerge_types::api::SubmitWorkorderResponse =
             resp.json().await.expect("parse");
 
-        // Wait briefly for the worker to process and fail.
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        // Poll for status change with short intervals instead of a long sleep.
+        let mut final_status = None;
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-        let resp = reqwest::get(format!(
-            "{}/api/v1/workorders/{}",
-            server.base_url, submit_resp.workorder_id
-        ))
-        .await
-        .expect("get status");
+            let resp = reqwest::get(format!(
+                "{}/api/v1/workorders/{}",
+                server.base_url, submit_resp.workorder_id
+            ))
+            .await
+            .expect("get status");
 
-        if resp.status() == 200 {
-            let status: remerge_types::api::WorkorderStatusResponse =
-                resp.json().await.expect("parse status");
-            // Should be Failed or still Running (depending on timing).
+            if resp.status() == 200 {
+                let status: remerge_types::api::WorkorderStatusResponse =
+                    resp.json().await.expect("parse status");
+                final_status = Some(status.status.clone());
+                if matches!(
+                    status.status,
+                    remerge_types::workorder::WorkorderStatus::Failed { .. }
+                        | remerge_types::workorder::WorkorderStatus::Completed
+                        | remerge_types::workorder::WorkorderStatus::Cancelled
+                ) {
+                    break;
+                }
+            }
+        }
+
+        if let Some(status) = final_status {
             assert!(
                 matches!(
-                    status.status,
+                    status,
                     remerge_types::workorder::WorkorderStatus::Failed { .. }
                         | remerge_types::workorder::WorkorderStatus::Running
                         | remerge_types::workorder::WorkorderStatus::Pending

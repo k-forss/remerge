@@ -225,10 +225,13 @@ mod e2e_tests {
         .await
         .expect("get");
         let status: WorkorderStatusResponse = resp.json().await.expect("parse status");
-        assert_eq!(
-            format!("{:?}", status.status),
-            "Cancelled",
-            "status should be Cancelled"
+        assert!(
+            matches!(
+                status.status,
+                remerge_types::workorder::WorkorderStatus::Cancelled
+            ),
+            "status should be Cancelled, got {:?}",
+            status.status
         );
     }
 }
