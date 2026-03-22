@@ -547,7 +547,21 @@ async fn workorder_ttl_eviction() {
     if !require_docker() {
         return;
     }
-    let Some(server) = common::server::TestServer::start().await else {
+
+    // Create server with retention_hours = 0 (cutoff = now).
+    let port = common::free_port();
+    let binpkg_dir = tempfile::TempDir::new().expect("temp dir");
+    let state_dir = tempfile::TempDir::new().expect("temp dir");
+
+    let config = remerge_server::config::ServerConfig {
+        binpkg_dir: binpkg_dir.path().to_path_buf(),
+        binhost_url: format!("http://127.0.0.1:{port}/binpkgs"),
+        state_dir: state_dir.path().to_path_buf(),
+        retention_hours: 0,
+        ..Default::default()
+    };
+
+    let Some(server) = common::server::TestServer::start_with_config(Some(config)).await else {
         return;
     };
 
@@ -569,34 +583,37 @@ async fn workorder_ttl_eviction() {
         .await
         .expect("submit");
     let submit_resp: SubmitWorkorderResponse = resp.json().await.expect("parse");
+    let wo_id = submit_resp.workorder_id;
 
     // Cancel it to make it terminal.
     let _ = client
-        .delete(format!(
-            "{}/api/v1/workorders/{}",
-            server.base_url, submit_resp.workorder_id
-        ))
+        .delete(format!("{}/api/v1/workorders/{}", server.base_url, wo_id))
         .send()
         .await
         .expect("cancel");
 
-    // Verify the workorder is still visible.
-    let resp = reqwest::get(format!(
-        "{}/api/v1/workorders/{}",
-        server.base_url, submit_resp.workorder_id
-    ))
-    .await
-    .expect("get");
+    // Back-date the workorder's updated_at to guarantee it's past the cutoff.
+    {
+        let mut workorders = server.state.workorders.write().await;
+        if let Some(wo) = workorders.get_mut(&wo_id) {
+            wo.updated_at = chrono::Utc::now() - chrono::Duration::hours(2);
+        }
+    }
+
+    // Trigger eviction.
+    let evicted = server.state.evict_workorders().await;
+    assert!(evicted > 0, "at least one workorder should be evicted");
+
+    // Verify the workorder is gone (404).
+    let resp = reqwest::get(format!("{}/api/v1/workorders/{}", server.base_url, wo_id))
+        .await
+        .expect("get");
     assert_eq!(
         resp.status(),
-        200,
-        "cancelled workorder should still be visible"
+        404,
+        "evicted workorder should return 404, got {}",
+        resp.status()
     );
-
-    // Note: Actually triggering TTL-based eviction would require manipulating
-    // timestamps, which isn't possible through the HTTP API. The eviction logic
-    // is tested via the extracted `evict_workorders()` method in state.rs.
-    // This test verifies the terminal state is correctly set.
 }
 
 /// Max retained workorders cap — eviction removes oldest terminal entries.
@@ -625,6 +642,7 @@ async fn max_retained_workorders_enforced() {
     };
 
     let client = reqwest::Client::new();
+    let mut wo_ids = Vec::new();
 
     // Submit and cancel 3 workorders to exceed the cap.
     for i in 0..3 {
@@ -644,6 +662,7 @@ async fn max_retained_workorders_enforced() {
             .await
             .expect("submit");
         let submit_resp: SubmitWorkorderResponse = resp.json().await.expect("parse");
+        wo_ids.push(submit_resp.workorder_id);
 
         // Cancel to make terminal.
         let _ = client
@@ -656,7 +675,7 @@ async fn max_retained_workorders_enforced() {
             .expect("cancel");
     }
 
-    // All 3 workorders should be listed (eviction hasn't run yet).
+    // All 3 workorders should exist before eviction.
     let resp = reqwest::get(format!("{}/api/v1/workorders", server.base_url))
         .await
         .expect("list");
@@ -667,9 +686,23 @@ async fn max_retained_workorders_enforced() {
         "all 3 workorders should exist before eviction"
     );
 
-    // Note: The eviction pass runs on an hourly interval and can also be
-    // triggered via `state.evict_workorders()`. The max_retained_workorders
-    // config is verified to be set correctly through the list above.
+    // Trigger eviction — cap is 2, so 1 should be removed.
+    let evicted = server.state.evict_workorders().await;
+    assert!(
+        evicted >= 1,
+        "at least 1 workorder should be evicted (cap=2, had 3)"
+    );
+
+    // Verify at most 2 workorders remain.
+    let resp = reqwest::get(format!("{}/api/v1/workorders", server.base_url))
+        .await
+        .expect("list");
+    let list: ListWorkordersResponse = resp.json().await.expect("parse list");
+    assert!(
+        list.workorders.len() <= 2,
+        "at most 2 workorders should remain after eviction (cap=2), got {}",
+        list.workorders.len()
+    );
 }
 
 /// Oversized workorder body is rejected by axum's default body limit.

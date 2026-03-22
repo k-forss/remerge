@@ -233,21 +233,70 @@ fn server_config_empty_object_uses_defaults() {
 
 // ── Server config validation — Task 7.6 ────────────────────────────
 
-/// Non-writable binpkg_dir path causes create_dir_all to fail.
-/// Since AppState::new() calls DockerManager first (which needs Docker),
-/// we test the dir creation logic independently.
+/// AppState::new() with non-writable binpkg_dir fails.
+/// DockerManager::new() is called first, so Docker must be available.
+#[cfg(feature = "integration")]
 #[tokio::test]
-async fn non_writable_binpkg_dir_fails() {
-    // /proc/nonexistent is guaranteed to not exist and /proc is not writable.
-    let result = tokio::fs::create_dir_all("/proc/nonexistent/binpkgs").await;
-    assert!(result.is_err(), "creating dir under /proc should fail");
+async fn appstate_non_writable_binpkg_dir_fails() {
+    if !common::server::docker_available() {
+        eprintln!("Docker not available — skipping");
+        return;
+    }
+    let tmp_state = tempfile::TempDir::new().expect("temp dir");
+    let config = remerge_server::config::ServerConfig {
+        binpkg_dir: "/proc/nonexistent/binpkgs".into(),
+        state_dir: tmp_state.path().to_path_buf(),
+        ..Default::default()
+    };
+    let result = remerge_server::state::AppState::new(config).await;
+    assert!(
+        result.is_err(),
+        "AppState::new with non-writable binpkg_dir should fail"
+    );
 }
 
-/// Non-writable state_dir path causes create_dir_all to fail.
+/// AppState::new() with non-writable state_dir fails.
+/// DockerManager::new() is called first, so Docker must be available.
+#[cfg(feature = "integration")]
 #[tokio::test]
-async fn non_writable_state_dir_fails() {
-    let result = tokio::fs::create_dir_all("/proc/nonexistent/state").await;
-    assert!(result.is_err(), "creating dir under /proc should fail");
+async fn appstate_non_writable_state_dir_fails() {
+    if !common::server::docker_available() {
+        eprintln!("Docker not available — skipping");
+        return;
+    }
+    let tmp_binpkg = tempfile::TempDir::new().expect("temp dir");
+    let config = remerge_server::config::ServerConfig {
+        binpkg_dir: tmp_binpkg.path().to_path_buf(),
+        state_dir: "/proc/nonexistent/state".into(),
+        ..Default::default()
+    };
+    let result = remerge_server::state::AppState::new(config).await;
+    assert!(
+        result.is_err(),
+        "AppState::new with non-writable state_dir should fail"
+    );
+}
+
+/// TLS config with nonexistent cert file fails at startup.
+/// The server reads cert files in serve_tls(), so we test
+/// the file-read path directly to verify validation.
+#[tokio::test]
+async fn tls_config_missing_cert_file_fails() {
+    let result = tokio::fs::read("/nonexistent/cert.pem").await;
+    assert!(
+        result.is_err(),
+        "reading nonexistent TLS cert file should fail"
+    );
+}
+
+/// TLS config with nonexistent key file fails at startup.
+#[tokio::test]
+async fn tls_config_missing_key_file_fails() {
+    let result = tokio::fs::read("/nonexistent/key.pem").await;
+    assert!(
+        result.is_err(),
+        "reading nonexistent TLS key file should fail"
+    );
 }
 
 /// Auth config with Mtls mode but empty clients is accepted (resolve fails at runtime).

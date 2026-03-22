@@ -721,7 +721,7 @@ The goal is to surface issues. Mark `[x]` and add "Known failure:" notes.
       - Does NOT require Docker — tests the error path.
       - No feature gate needed; add to `error_test.rs`.
 
-- [ ] **7.6** Server config validation — missing `binpkg_dir`, invalid
+- [x] **7.6** Server config validation — missing `binpkg_dir`, invalid
       `auth` section, missing TLS cert
 
       **Audit status:** PARTIAL — only auth validation is properly
@@ -772,7 +772,7 @@ The goal is to surface issues. Mark `[x]` and add "Known failure:" notes.
         the validation point.  If `DockerManager::new()` fails first,
         test the validation functions directly instead.
 
-- [ ] **7.7** Workorder TTL expiry — verify `reap_old_workorders` removes
+- [x] **7.7** Workorder TTL expiry — verify `reap_old_workorders` removes
       stale entries
 
       **Audit status:** NOT IMPLEMENTED — `workorder_ttl_eviction` in
@@ -789,7 +789,7 @@ The goal is to surface issues. Mark `[x]` and add "Known failure:" notes.
         a workorder, trigger reaping, verify removal.
       - Requires Docker for AppState.
 
-- [ ] **7.8** Max retained workorders — verify cap is enforced
+- [x] **7.8** Max retained workorders — verify cap is enforced
 
       **Audit status:** NOT IMPLEMENTED —
       `max_retained_workorders_enforced` in `server_api_test.rs` sets
@@ -861,7 +861,7 @@ The goal is to surface issues. Mark `[x]` and add "Known failure:" notes.
       in ~1 second. Already covered by `cargo test --workspace` but
       consider making explicit for tracking.
 
-- [ ] **8.4** Add a "full integration" target that runs Phases 4–7 on merge
+- [x] **8.4** Add a "full integration" target that runs Phases 4–7 on merge
       to `main`
 
       **Audit status:** PARTIAL — the `integration-test` job runs on

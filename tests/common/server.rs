@@ -13,6 +13,7 @@ pub fn docker_available() -> bool {
 pub struct TestServer {
     pub port: u16,
     pub base_url: String,
+    pub state: std::sync::Arc<remerge_server::state::AppState>,
     _handle: tokio::task::JoinHandle<()>,
     _binpkg_dir: tempfile::TempDir,
     _state_dir: tempfile::TempDir,
@@ -49,7 +50,7 @@ impl TestServer {
             Err(_) => return None,
         };
 
-        let app = remerge_server::api::router(state);
+        let app = remerge_server::api::router(state.clone());
         let addr = format!("127.0.0.1:{port}");
         let listener = tokio::net::TcpListener::bind(&addr).await.ok()?;
 
@@ -63,6 +64,7 @@ impl TestServer {
         Some(TestServer {
             port,
             base_url: format!("http://127.0.0.1:{port}"),
+            state,
             _handle: handle,
             _binpkg_dir: binpkg_dir,
             _state_dir: state_dir,
