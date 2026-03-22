@@ -55,8 +55,13 @@ sha2 = "0.10"
 hex = "0.4"
 regex = "1"
 bytes = "1"
+tempfile = "3"
 
 [profile.release]
 lto = true
 strip = true
 codegen-units = 1
+
+[workspace.features]
+integration = []
+e2e = []

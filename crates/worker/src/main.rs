@@ -1,6 +1,4 @@
-mod builder;
-mod crossdev;
-mod portage_setup;
+use remerge_worker::{builder, crossdev, portage_setup};
 
 use anyhow::{Context, Result};
 use tracing::info;

@@ -1,14 +1,3 @@
-mod api;
-mod auth;
-mod config;
-mod docker;
-mod metrics;
-mod persistence;
-mod queue;
-mod registry;
-mod repo;
-mod state;
-
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,8 +8,9 @@ use tracing_subscriber::EnvFilter;
 
 use remerge_types::workorder::WorkorderStatus;
 
-use crate::config::ServerConfig;
-use crate::state::AppState;
+use remerge_server::config::{self, ServerConfig};
+use remerge_server::state::AppState;
+use remerge_server::{api, persistence, queue};
 
 /// remerge-server — binary host build coordinator.
 #[derive(Parser, Debug)]

@@ -1,8 +1,4 @@
-mod args;
-mod cflags;
-mod client;
-mod config;
-mod portage;
+use remerge::args;
 
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;
