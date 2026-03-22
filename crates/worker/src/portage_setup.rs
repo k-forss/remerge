@@ -560,7 +560,7 @@ async fn write_profile_overlay(config: &PortageConfig) -> Result<()> {
     write_profile_overlay_inner(Path::new("/etc/portage/profile"), config).await
 }
 
-async fn write_profile_overlay_inner(base: &Path, config: &PortageConfig) -> Result<()> {
+pub async fn write_profile_overlay_inner(base: &Path, config: &PortageConfig) -> Result<()> {
     if config.profile_overlay.is_empty() {
         return Ok(());
     }
@@ -649,7 +649,7 @@ async fn set_profile(config: &PortageConfig) -> Result<()> {
     .await
 }
 
-async fn set_profile_inner(
+pub async fn set_profile_inner(
     profile: &str,
     repo_locations: &[String],
     link_path: &Path,
@@ -706,7 +706,7 @@ async fn write_patches(config: &PortageConfig) -> Result<()> {
     write_patches_inner(Path::new("/etc/portage/patches"), config).await
 }
 
-async fn write_patches_inner(base: &Path, config: &PortageConfig) -> Result<()> {
+pub async fn write_patches_inner(base: &Path, config: &PortageConfig) -> Result<()> {
     if config.patches.is_empty() {
         return Ok(());
     }
@@ -751,7 +751,7 @@ async fn write_patches_inner(base: &Path, config: &PortageConfig) -> Result<()> 
 /// Parse an INI-style repos.conf file and return `(section_name, location)`
 /// pairs.  The `[DEFAULT]` section and sections without a `location` key
 /// are skipped.
-pub(crate) fn parse_repo_sections(content: &str) -> Vec<(String, String)> {
+pub fn parse_repo_sections(content: &str) -> Vec<(String, String)> {
     let mut repos = Vec::new();
     let mut current_name = String::new();
     let mut current_location: Option<String> = None;
@@ -821,7 +821,7 @@ fn build_makeopts(client_makeopts: &str) -> String {
     )
 }
 
-fn build_makeopts_inner(
+pub fn build_makeopts_inner(
     client_makeopts: &str,
     server_jobs: Option<&str>,
     server_load: Option<&str>,

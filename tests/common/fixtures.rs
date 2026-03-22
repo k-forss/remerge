@@ -66,18 +66,10 @@ INPUT_DEVICES="libinput"
     .unwrap();
 
     // Write package.mask
-    std::fs::write(
-        portage.join("package.mask/custom"),
-        ">=dev-libs/foo-2.0\n",
-    )
-    .unwrap();
+    std::fs::write(portage.join("package.mask/custom"), ">=dev-libs/foo-2.0\n").unwrap();
 
     // Write package.unmask
-    std::fs::write(
-        portage.join("package.unmask/custom"),
-        "=dev-libs/bar-1.5\n",
-    )
-    .unwrap();
+    std::fs::write(portage.join("package.unmask/custom"), "=dev-libs/bar-1.5\n").unwrap();
 
     // Write package.env
     std::fs::write(
@@ -165,10 +157,7 @@ pub fn full_portage_config() -> PortageConfig {
         "VIDEO_CARDS".to_string(),
         vec!["intel".to_string(), "amdgpu".to_string()],
     );
-    use_expand.insert(
-        "INPUT_DEVICES".to_string(),
-        vec!["libinput".to_string()],
-    );
+    use_expand.insert("INPUT_DEVICES".to_string(), vec!["libinput".to_string()]);
 
     let mut extra = BTreeMap::new();
     extra.insert(
@@ -196,7 +185,10 @@ pub fn full_portage_config() -> PortageConfig {
     );
 
     let mut env_files = BTreeMap::new();
-    env_files.insert("no-lto.conf".to_string(), "CFLAGS=\"-fno-lto\"\n".to_string());
+    env_files.insert(
+        "no-lto.conf".to_string(),
+        "CFLAGS=\"-fno-lto\"\n".to_string(),
+    );
 
     PortageConfig {
         make_conf: MakeConf {
@@ -210,11 +202,7 @@ pub fn full_portage_config() -> PortageConfig {
                 "dbus".into(),
                 "-systemd".into(),
             ],
-            features: vec![
-                "buildpkg".into(),
-                "noclean".into(),
-                "parallel-fetch".into(),
-            ],
+            features: vec!["buildpkg".into(), "noclean".into(), "parallel-fetch".into()],
             accept_license: "-* @FREE".to_string(),
             accept_keywords: "~amd64".to_string(),
             emerge_default_opts: "--verbose --keep-going".to_string(),

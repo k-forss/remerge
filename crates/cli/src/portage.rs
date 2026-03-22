@@ -1102,7 +1102,7 @@ impl PortageReader {
 /// e.g. `openssl-3.1.4-r1` → `("openssl", Some("3.1.4-r1"))`
 ///       `openssl`          → `("openssl", None)`
 ///       `lib3ds-1.2`       → `("lib3ds", Some("1.2"))`
-fn split_name_version(s: &str) -> (&str, Option<&str>) {
+pub fn split_name_version(s: &str) -> (&str, Option<&str>) {
     let bytes = s.as_bytes();
     for i in (0..bytes.len()).rev() {
         if bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
@@ -1114,7 +1114,7 @@ fn split_name_version(s: &str) -> (&str, Option<&str>) {
 
 /// Version comparison operator parsed from a portage atom.
 #[derive(Debug, PartialEq, Eq)]
-enum AtomOp {
+pub enum AtomOp {
     /// No operator — bare `category/package`.
     None,
     /// `=` — exact version match.
@@ -1137,7 +1137,7 @@ enum AtomOp {
 ///
 /// Returns `(operator, remaining_atom)`.  For `=cat/pkg-1.2*` atoms the
 /// glob star is left in the version and the operator is `EqGlob`.
-fn parse_atom_operator(atom: &str) -> (AtomOp, &str) {
+pub fn parse_atom_operator(atom: &str) -> (AtomOp, &str) {
     if let Some(rest) = atom.strip_prefix(">=") {
         (AtomOp::Ge, rest)
     } else if let Some(rest) = atom.strip_prefix("<=") {
@@ -1164,7 +1164,7 @@ fn parse_atom_operator(atom: &str) -> (AtomOp, &str) {
 ///
 /// e.g. `3.1.4-r1` → `("3.1.4", Some("r1"))`
 ///       `3.1.4`   → `("3.1.4", None)`
-fn split_revision(version: &str) -> (&str, Option<&str>) {
+pub fn split_revision(version: &str) -> (&str, Option<&str>) {
     // Revision is always the last `-rN` suffix.
     if let Some(pos) = version.rfind("-r") {
         let after = &version[pos + 2..];
@@ -1182,7 +1182,7 @@ fn split_revision(version: &str) -> (&str, Option<&str>) {
 /// - Trailing letter comparison (`1.1.1a` < `1.1.1z`)
 /// - Suffix ordering (`_alpha` < `_beta` < `_pre` < `_rc` < (none) < `_p`)
 /// - Revision comparison (`-r0` < `-r1`)
-fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
     use std::cmp::Ordering;
 
     let (a_base, a_rev) = split_revision(a);

@@ -1,28 +1,32 @@
 //! Phase 6 — End-to-end pipeline tests.
 //!
-//! These tests exercise the full remerge pipeline: CLI → Server → Worker.
-//! They require Docker, network access, and a fully built workspace.
+//! Full CLI → Server → Worker pipeline. Requires Docker, network,
+//! and a Gentoo stage3 image.
 //!
-//! Gated behind the `e2e` feature.
+//! Gated behind `#[cfg(feature = "e2e")]`.
 
 mod common;
 
 #[cfg(feature = "e2e")]
-mod e2e {
+mod e2e_tests {
     use super::common;
 
+    /// Placeholder for full pipeline smoke test.
     #[tokio::test]
-    async fn full_pipeline_smoke_test() {
+    async fn full_pipeline_smoke() {
         if !common::server::docker_available() {
             eprintln!("Docker not available — skipping e2e tests");
             return;
         }
 
-        // TODO: Implement full pipeline test:
+        // Full pipeline test:
         // 1. Start server
-        // 2. Submit workorder via client
+        // 2. Submit workorder
         // 3. Wait for completion
         // 4. Verify artifacts
-        eprintln!("e2e smoke test placeholder — implement when all components are ready");
+        //
+        // This requires a Gentoo stage3 image and network access.
+        // Placeholder until full E2E infrastructure is in place.
+        eprintln!("e2e tests require Gentoo stage3 image — skipping in default CI");
     }
 }
