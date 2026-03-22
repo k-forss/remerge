@@ -902,37 +902,76 @@ pub async fn write_patches_inner(base: &Path, config: &PortageConfig) -> Result<
     Ok(())
 }
 
-/// Parse an INI-style repos.conf file and return `(section_name, location)`
-/// pairs.  The `[DEFAULT]` section and sections without a `location` key
-/// are skipped.
-pub fn parse_repo_sections(content: &str) -> Vec<(String, String)> {
+/// Metadata about a configured repository parsed from repos.conf.
+pub struct RepoSection {
+    pub name: String,
+    pub location: String,
+    pub sync_uri: Option<String>,
+}
+
+/// Parse an INI-style repos.conf file and return full metadata including
+/// `sync-uri`.  The `[DEFAULT]` section and sections without a `location`
+/// key are skipped.
+pub fn parse_repo_sections_full(content: &str) -> Vec<RepoSection> {
     let mut repos = Vec::new();
     let mut current_name = String::new();
     let mut current_location: Option<String> = None;
+    let mut current_sync_uri: Option<String> = None;
 
-    let flush = |name: &str, location: Option<String>, out: &mut Vec<(String, String)>| {
+    let flush = |name: &str,
+                 location: Option<String>,
+                 sync_uri: Option<String>,
+                 out: &mut Vec<RepoSection>| {
         if !name.is_empty()
             && !name.eq_ignore_ascii_case("DEFAULT")
             && let Some(loc) = location
         {
-            out.push((name.to_string(), loc));
+            out.push(RepoSection {
+                name: name.to_string(),
+                location: loc,
+                sync_uri,
+            });
         }
     };
 
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            flush(&current_name, current_location.take(), &mut repos);
+            flush(
+                &current_name,
+                current_location.take(),
+                current_sync_uri.take(),
+                &mut repos,
+            );
             current_name = trimmed[1..trimmed.len() - 1].to_string();
-        } else if let Some((key, value)) = trimmed.split_once('=')
-            && key.trim().eq_ignore_ascii_case("location")
-        {
-            current_location = Some(value.trim().to_string());
+        } else if let Some((key, value)) = trimmed.split_once('=') {
+            let key = key.trim();
+            let value = value.trim().to_string();
+            if key.eq_ignore_ascii_case("location") {
+                current_location = Some(value);
+            } else if key.eq_ignore_ascii_case("sync-uri") {
+                current_sync_uri = Some(value);
+            }
         }
     }
-    flush(&current_name, current_location, &mut repos);
+    flush(
+        &current_name,
+        current_location,
+        current_sync_uri,
+        &mut repos,
+    );
 
     repos
+}
+
+/// Parse an INI-style repos.conf file and return `(section_name, location)`
+/// pairs.  The `[DEFAULT]` section and sections without a `location` key
+/// are skipped.
+pub fn parse_repo_sections(content: &str) -> Vec<(String, String)> {
+    parse_repo_sections_full(content)
+        .into_iter()
+        .map(|r| (r.name, r.location))
+        .collect()
 }
 
 /// Build the `MAKEOPTS` value from server-provided env vars, falling back to
@@ -1319,13 +1358,9 @@ sync-type = git
         // be found there and the assertion would fail).
         let locations: Vec<String> = vec!["/nonexistent/repo".to_string()];
 
-        set_profile_inner(
-            "remerge-test-nonexistent-profile/23.0",
-            &locations,
-            &link,
-        )
-        .await
-        .expect("should return Ok even when profile is missing");
+        set_profile_inner("remerge-test-nonexistent-profile/23.0", &locations, &link)
+            .await
+            .expect("should return Ok even when profile is missing");
 
         assert!(
             !link.exists(),

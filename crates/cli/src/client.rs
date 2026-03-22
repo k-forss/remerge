@@ -173,8 +173,11 @@ impl RemergeClient {
             debug!("No Finished event received — attempting REST fallback");
             // Give the server a moment to persist the result.
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            // Extract workorder ID from the WS URL (last path segment).
-            if let Some(id_str) = ws_url.rsplit('/').next()
+            // Extract workorder ID from the WS URL.
+            // URL format: ws://host/api/v1/workorders/{id}/progress
+            // The UUID is the second-to-last path segment.
+            let segments: Vec<&str> = ws_url.split('/').collect();
+            if let Some(id_str) = segments.iter().rev().nth(1)
                 && let Ok(id) = id_str.parse::<uuid::Uuid>()
             {
                 final_result = self.fetch_result(id).await.ok();

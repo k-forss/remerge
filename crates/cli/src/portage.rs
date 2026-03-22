@@ -186,12 +186,12 @@ impl PortageReader {
                     Ok(expand_str) => {
                         let found: Vec<String> =
                             expand_str.split_whitespace().map(String::from).collect();
-                        debug!(var, count = found.len(), "Discovered {var} variables");
+                        debug!(var, count = found.len(), "Discovered USE_EXPAND variables");
                         keys.extend(found);
                         any_succeeded = true;
                     }
                     Err(e) => {
-                        debug!(%e, var, "Failed to query {var}");
+                        debug!(%e, var, "Failed to query USE_EXPAND variant");
                     }
                 }
             }

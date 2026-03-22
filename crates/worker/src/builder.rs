@@ -13,6 +13,8 @@ use tracing::info;
 
 use remerge_types::workorder::Workorder;
 
+use crate::portage_setup::{self, RepoSection};
+
 /// Build all packages in the workorder using emerge.
 ///
 /// `emerge_cmd` is either `"emerge"` (native) or `"emerge-<CHOST>"` (cross).
@@ -182,20 +184,29 @@ async fn sync_missing_repos() -> Result<()> {
 /// Returns `true` if a sync-uri requires authentication (SSH, etc.)
 /// and would fail inside an ephemeral worker container.
 fn requires_auth(uri: &str) -> bool {
-    // git@host:path  or  ssh://  or  git+ssh://
-    uri.contains('@') || uri.starts_with("ssh://") || uri.starts_with("git+ssh://")
-}
+    let lower = uri.to_ascii_lowercase();
 
-/// Metadata about a configured repo.
-struct RepoInfo {
-    name: String,
-    location: String,
-    sync_uri: Option<String>,
+    // Explicit SSH scheme URIs.
+    if lower.starts_with("ssh://") || lower.starts_with("git+ssh://") {
+        return true;
+    }
+
+    // scp-like syntax: user@host:path — no scheme present, '@' before ':',
+    // no '/' before '@' (which would indicate a path component in an HTTP URL).
+    if !uri.contains("://")
+        && let Some(at_pos) = uri.find('@')
+        && uri[at_pos + 1..].starts_with(|c: char| c.is_ascii_alphanumeric())
+        && uri[..at_pos].chars().all(|c| c != '/')
+    {
+        return true;
+    }
+
+    false
 }
 
 /// Read `/etc/portage/repos.conf/` and return metadata for all configured
 /// repositories — including sync-uri when present.
-async fn discover_configured_repos() -> Vec<RepoInfo> {
+async fn discover_configured_repos() -> Vec<RepoSection> {
     let conf_path = std::path::Path::new("/etc/portage/repos.conf");
     let mut repos = Vec::new();
 
@@ -205,69 +216,14 @@ async fn discover_configured_repos() -> Vec<RepoInfo> {
         };
         while let Ok(Some(entry)) = dir.next_entry().await {
             if let Ok(content) = tokio::fs::read_to_string(entry.path()).await {
-                repos.extend(parse_repo_sections_full(&content));
+                repos.extend(portage_setup::parse_repo_sections_full(&content));
             }
         }
     } else if conf_path.is_file()
         && let Ok(content) = tokio::fs::read_to_string(conf_path).await
     {
-        repos.extend(parse_repo_sections_full(&content));
+        repos.extend(portage_setup::parse_repo_sections_full(&content));
     }
-
-    repos
-}
-
-/// Parse an INI-style repos.conf file and return full metadata including
-/// sync-uri.  The `[DEFAULT]` section and sections without a `location`
-/// key are skipped.
-fn parse_repo_sections_full(content: &str) -> Vec<RepoInfo> {
-    let mut repos = Vec::new();
-    let mut current_name = String::new();
-    let mut current_location: Option<String> = None;
-    let mut current_sync_uri: Option<String> = None;
-
-    let flush = |name: &str,
-                 location: Option<String>,
-                 sync_uri: Option<String>,
-                 out: &mut Vec<RepoInfo>| {
-        if !name.is_empty()
-            && !name.eq_ignore_ascii_case("DEFAULT")
-            && let Some(loc) = location
-        {
-            out.push(RepoInfo {
-                name: name.to_string(),
-                location: loc,
-                sync_uri,
-            });
-        }
-    };
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            flush(
-                &current_name,
-                current_location.take(),
-                current_sync_uri.take(),
-                &mut repos,
-            );
-            current_name = trimmed[1..trimmed.len() - 1].to_string();
-        } else if let Some((key, value)) = trimmed.split_once('=') {
-            let key = key.trim();
-            let value = value.trim().to_string();
-            if key.eq_ignore_ascii_case("location") {
-                current_location = Some(value);
-            } else if key.eq_ignore_ascii_case("sync-uri") {
-                current_sync_uri = Some(value);
-            }
-        }
-    }
-    flush(
-        &current_name,
-        current_location,
-        current_sync_uri,
-        &mut repos,
-    );
 
     repos
 }
