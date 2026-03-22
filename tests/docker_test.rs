@@ -255,8 +255,12 @@ mod docker_tests {
     /// Gated behind `e2e` — crossdev requires a fully synced portage tree
     /// and is fragile in CI (emerge of sys-devel/crossdev can fail if the
     /// tree snapshot doesn't have all required ebuilds).
+    ///
+    /// Ignored by default — run with `cargo test -- --ignored cross_arch`
+    /// on a machine with a synced Gentoo stage3 image.
     #[cfg(feature = "e2e")]
     #[tokio::test]
+    #[ignore = "crossdev install is fragile in CI — run manually with --ignored"]
     async fn cross_arch_image_build() {
         if !common::server::docker_available() {
             eprintln!("Docker not available — skipping");
