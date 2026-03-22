@@ -944,8 +944,8 @@ async fn ensure_repo_locations_remap_when_skip_sync() {
     );
 
     // The repos.conf file should have been rewritten.
-    let rewritten = std::fs::read_to_string(repos_conf_base.join("custom.conf"))
-        .expect("read rewritten conf");
+    let rewritten =
+        std::fs::read_to_string(repos_conf_base.join("custom.conf")).expect("read rewritten conf");
     let expected_alt = format!("{}", remap_base.join("custom").display());
     assert!(
         rewritten.contains(&expected_alt),
@@ -1052,8 +1052,8 @@ async fn apply_config_orchestration() {
         .expect("apply_config_inner should succeed");
 
     // Verify make.conf was written.
-    let make_conf = std::fs::read_to_string(base.join("make.conf"))
-        .expect("make.conf should exist");
+    let make_conf =
+        std::fs::read_to_string(base.join("make.conf")).expect("make.conf should exist");
     assert!(
         make_conf.contains("CHOST="),
         "make.conf should contain CHOST"

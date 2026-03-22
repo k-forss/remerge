@@ -59,3 +59,22 @@ jobs:
 
       - name: Run integration tests
         run: cargo test --workspace --features integration
+
+  # Smoke test: runs on every PR, covers Phases 1-3 (fast, no Docker).
+  smoke-test:
+    name: Smoke Test (Phases 1-3)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run smoke tests (types + CLI + worker setup)
+        run: |
+          cargo test -p remerge-integration-tests --test types_test
+          cargo test -p remerge-integration-tests --test cli_portage_test
+          cargo test -p remerge-integration-tests --test worker_setup_test
+          cargo test -p remerge-integration-tests --test error_test

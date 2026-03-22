@@ -475,8 +475,8 @@ async fn websocket_progress_stream() {
                 eprintln!("WebSocket error: {e}");
                 break;
             }
-            Ok(None) => break,         // Stream closed.
-            Err(_) => break,           // Timeout.
+            Ok(None) => break, // Stream closed.
+            Err(_) => break,   // Timeout.
         }
     }
 
@@ -587,7 +587,11 @@ async fn workorder_ttl_eviction() {
     ))
     .await
     .expect("get");
-    assert_eq!(resp.status(), 200, "cancelled workorder should still be visible");
+    assert_eq!(
+        resp.status(),
+        200,
+        "cancelled workorder should still be visible"
+    );
 
     // Note: Actually triggering TTL-based eviction would require manipulating
     // timestamps, which isn't possible through the HTTP API. The eviction logic

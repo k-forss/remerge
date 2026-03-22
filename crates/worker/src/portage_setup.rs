@@ -79,10 +79,7 @@ pub async fn apply_config_inner(
 
     set_profile_inner(&config.profile, &repo_locations, &base.join("make.profile")).await?;
 
-    info!(
-        "Portage configuration applied to {}",
-        base.display()
-    );
+    info!("Portage configuration applied to {}", base.display());
     Ok(())
 }
 
@@ -647,8 +644,7 @@ pub async fn ensure_repo_locations_inner(
                 fs::create_dir_all(&alt)
                     .await
                     .with_context(|| format!("Failed to create writable repo dir {alt_str}"))?;
-                rewrite_repo_location_inner(repos_conf_base, filename, &location, &alt_str)
-                    .await?;
+                rewrite_repo_location_inner(repos_conf_base, filename, &location, &alt_str).await?;
                 info!(
                     repo = %name,
                     original = %location,

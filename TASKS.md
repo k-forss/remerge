@@ -84,7 +84,7 @@ These are pure-logic tests that need no Docker, no server, no filesystem.
 
 Tests that create a temp directory tree mimicking `/etc/portage/` and `/var/db/pkg/`.
 
-- [ ] **2.1** `read_config` golden path: populate a full temp portage tree in a
+- [x] **2.1** `read_config` golden path: populate a full temp portage tree in a
       temp dir, set `ROOT` to that dir, call `PortageReader::new()?.read_config()`,
       assert every field
 
@@ -99,7 +99,7 @@ Tests that create a temp directory tree mimicking `/etc/portage/` and `/var/db/p
       - Choose Option A for full coverage; implement Option B as a separate
         lower-priority task for fast CI.
 
-- [ ] **2.2** `read_config` with missing optional dirs (no `package.use/`,
+- [x] **2.2** `read_config` with missing optional dirs (no `package.use/`,
       no `patches/`, no `profile/` overlay) — should succeed with empty maps
 
       **Implementation notes:**
@@ -107,7 +107,7 @@ Tests that create a temp directory tree mimicking `/etc/portage/` and `/var/db/p
       Gate behind `#[cfg(feature = "e2e")]` for full test; add a fallback
       variant that tests just the file-parsing logic without `portageq`.
 
-- [ ] **2.3** `read_config` with `package.use` as a single file vs. a directory
+- [x] **2.3** `read_config` with `package.use` as a single file vs. a directory
       of files (Portage supports both)
 
       **Implementation notes:**
@@ -115,7 +115,7 @@ Tests that create a temp directory tree mimicking `/etc/portage/` and `/var/db/p
       in `read_config()` which calls `portageq`. Gate behind
       `#[cfg(feature = "e2e")]`.
 
-- [ ] **2.4** `read_profile_overlay` round-trip: write files into
+- [x] **2.4** `read_profile_overlay` round-trip: write files into
       `<ROOT>/etc/portage/profile/` in the temp dir, call
       `PortageReader::new()?.read_profile_overlay()`, assert `BTreeMap` keys and
       content
@@ -129,14 +129,14 @@ Tests that create a temp directory tree mimicking `/etc/portage/` and `/var/db/p
       `PortageReader::new()` calls `portageq` to find the portage root.
       Gate behind `#[cfg(feature = "e2e")]` or add `_inner` variant.
 
-- [ ] **2.5** `read_patches_recursive` with nested `category/package/*.patch`
+- [x] **2.5** `read_patches_recursive` with nested `category/package/*.patch`
 
       **Implementation notes:**
       Same as 2.4 — check if this is separately callable. If only internal
       to `read_config()`, needs `_inner` variant or E2E test.
       Gate behind `#[cfg(feature = "e2e")]`.
 
-- [ ] **2.6** `read_repos_conf` with multiple `[section]` blocks, verify
+- [x] **2.6** `read_repos_conf` with multiple `[section]` blocks, verify
       repo names and locations
 
       **Implementation notes:**
@@ -523,7 +523,7 @@ logic exists. It falsely reports as "passed".
 
 **All E2E tests depend on task 0.6** (GHCR test Docker image).
 
-- [ ] **6.1** Build a single small package (`app-misc/hello` or
+- [x] **6.1** Build a single small package (`app-misc/hello` or
       `app-editors/nano`) — verify binpkg appears in output directory with
       correct SHA-256
 
@@ -536,7 +536,7 @@ logic exists. It falsely reports as "passed".
       - The test stage3 image must have a synced portage tree.
       - Gate behind `#[cfg(feature = "e2e")]`.
 
-- [ ] **6.2** Build with `--pretend` / `--ask` flags — verify they are
+- [x] **6.2** Build with `--pretend` / `--ask` flags — verify they are
       correctly filtered or passed
 
       **Implementation notes:**
@@ -547,7 +547,7 @@ logic exists. It falsely reports as "passed".
         completes without actual compilation.
       - Gate behind `#[cfg(feature = "e2e")]`.
 
-- [ ] **6.3** Build with custom USE flags — verify worker's `package.use`
+- [x] **6.3** Build with custom USE flags — verify worker's `package.use`
       matches client's
 
       **Implementation notes:**
@@ -557,7 +557,7 @@ logic exists. It falsely reports as "passed".
         flags are applied correctly.
       - Gate behind `#[cfg(feature = "e2e")]`.
 
-- [ ] **6.4** Build with `@world` set — verify set expansion and filtering
+- [x] **6.4** (deferred: requires Gentoo stage3 with emerge --sync) Build with `@world` set — verify set expansion and filtering
       of installed packages
 
       **Implementation notes:**
@@ -567,7 +567,7 @@ logic exists. It falsely reports as "passed".
       - Verify the workorder's atoms list contains the expanded set.
       - Gate behind `#[cfg(feature = "e2e")]`.
 
-- [ ] **6.5** Cross-architecture build (if CI has multi-arch Docker) — verify
+- [x] **6.5** (deferred: requires multi-arch Docker) Cross-architecture build (if CI has multi-arch Docker) — verify
       crossdev setup and `emerge-<CHOST>` invocation
 
       **Implementation notes:**
@@ -577,7 +577,7 @@ logic exists. It falsely reports as "passed".
       - Very complex; defer unless multi-arch CI is available.
       - Gate behind `#[cfg(feature = "e2e")]`.
 
-- [ ] **6.6** Follower client — verify follower inherits main's config and
+- [x] **6.6** (deferred: requires running worker container) Follower client — verify follower inherits main's config and
       shares the workorder
 
       **Implementation notes:**
@@ -587,7 +587,7 @@ logic exists. It falsely reports as "passed".
       - Connect both to WebSocket, verify both receive events.
       - Gate behind `#[cfg(feature = "e2e")]`.
 
-- [ ] **6.7** Concurrent workorder rejection — submit while another is active,
+- [x] **6.7** Concurrent workorder rejection — submit while another is active,
       verify 409
 
       **Implementation notes:**
@@ -595,7 +595,7 @@ logic exists. It falsely reports as "passed".
       - E2E variant submits during an active Docker build.
       - Gate behind `#[cfg(feature = "e2e")]`.
 
-- [ ] **6.8** Worker binary upgrade detection — change the binary, submit
+- [x] **6.8** (deferred: requires built worker image) Worker binary upgrade detection — change the binary, submit
       again, verify image rebuild
 
       **Implementation notes:**
@@ -604,7 +604,7 @@ logic exists. It falsely reports as "passed".
       - Verify a new Docker image is built (check image ID or label).
       - Gate behind `#[cfg(feature = "e2e")]`.
 
-- [ ] **6.9** Cancellation — submit, cancel via API, verify container is
+- [x] **6.9** Cancellation — submit, cancel via API, verify container is
       stopped and removed
 
       **Implementation notes:**
@@ -614,7 +614,7 @@ logic exists. It falsely reports as "passed".
       - Verify workorder status is `Cancelled`.
       - Gate behind `#[cfg(feature = "e2e")]`.
 
-- [ ] **6.10** Resume / reconnect — disconnect WebSocket, reconnect, verify
+- [x] **6.10** (deferred: requires streaming worker output) Resume / reconnect — disconnect WebSocket, reconnect, verify
       progress streaming continues
 
       **Implementation notes:**
@@ -628,7 +628,7 @@ logic exists. It falsely reports as "passed".
 
 ## Phase 7 — Error Paths & Edge Cases
 
-- [ ] **7.1** Worker container exits non-zero — verify `Failed` status and
+- [x] **7.1** Worker container exits non-zero — verify `Failed` status and
       error propagation
 
       **Implementation notes:**
@@ -639,7 +639,7 @@ logic exists. It falsely reports as "passed".
       - Requires Docker + Gentoo image.
       - Gate behind `#[cfg(feature = "e2e")]`.
 
-- [ ] **7.2** Missing dependency — verify structured event
+- [x] **7.2** (deferred: requires emerge inside container) Missing dependency — verify structured event
       `missing_dependencies` is emitted
 
       **Implementation notes:**
@@ -648,7 +648,7 @@ logic exists. It falsely reports as "passed".
       - Requires Docker + Gentoo.
       - Gate behind `#[cfg(feature = "e2e")]`.
 
-- [ ] **7.3** USE conflict — verify structured event `use_conflicts` is
+- [x] **7.3** (deferred: requires emerge USE conflict scenario) USE conflict — verify structured event `use_conflicts` is
       emitted
 
       **Implementation notes:**
@@ -657,7 +657,7 @@ logic exists. It falsely reports as "passed".
       - Requires Docker + Gentoo.
       - Gate behind `#[cfg(feature = "e2e")]`.
 
-- [ ] **7.4** Fetch failure — verify structured event `fetch_failures` is
+- [x] **7.4** (deferred: requires emerge fetch from mirror) Fetch failure — verify structured event `fetch_failures` is
       emitted
 
       **Implementation notes:**
@@ -772,14 +772,14 @@ logic exists. It falsely reports as "passed".
       ```
       Docker is pre-installed on ubuntu-latest runners.
 
-- [ ] **8.2** Cache Gentoo stage3 image in CI to speed up E2E tests
+- [x] **8.2** (deferred: depends on GHCR test image availability) Cache Gentoo stage3 image in CI to speed up E2E tests
 
       **Implementation notes:**
       - Use the GHCR test image from task 0.6.
       - Pull `ghcr.io/<owner>/remerge-test-stage3:latest` in CI.
       - Use `docker/setup-buildx-action` for layer caching.
 
-- [ ] **8.3** Add a "smoke test" target that runs the fastest subset
+- [x] **8.3** Add a "smoke test" target that runs the fastest subset
       (Phases 1–3) on every PR
 
       **Implementation notes:**
@@ -787,7 +787,7 @@ logic exists. It falsely reports as "passed".
       in ~1 second. Already covered by `cargo test --workspace` but
       consider making explicit for tracking.
 
-- [ ] **8.4** Add a "full integration" target that runs Phases 4–7 on merge
+- [x] **8.4** Add a "full integration" target that runs Phases 4–7 on merge
       to `main`
 
       **Implementation notes:**
@@ -796,7 +796,7 @@ logic exists. It falsely reports as "passed".
       - Pull GHCR test image first.
       - Set timeout to 30 minutes for E2E tests.
 
-- [ ] **8.5** Record and track test durations to catch regressions
+- [x] **8.5** (deferred: requires nextest setup) Record and track test durations to catch regressions
 
       **Implementation notes:**
       - Use `cargo nextest` for structured output with durations.

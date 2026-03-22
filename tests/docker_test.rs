@@ -84,10 +84,7 @@ mod docker_tests {
         let needs = manager
             .image_needs_rebuild("remerge-test-nonexistent:latest")
             .await;
-        assert!(
-            needs,
-            "nonexistent image should need rebuild"
-        );
+        assert!(needs, "nonexistent image should need rebuild");
     }
 
     /// `remove_container` on a nonexistent container returns an error.
@@ -137,11 +134,10 @@ mod docker_tests {
             .await
             .expect("connect");
 
-        let result = manager.remove_image("remerge-test-nonexistent:latest").await;
-        assert!(
-            result.is_err(),
-            "removing nonexistent image should error"
-        );
+        let result = manager
+            .remove_image("remerge-test-nonexistent:latest")
+            .await;
+        assert!(result.is_err(), "removing nonexistent image should error");
     }
 
     /// `stop_container` on a nonexistent container returns an error.

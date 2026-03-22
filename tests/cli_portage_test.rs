@@ -408,3 +408,296 @@ fn expand_set_unknown_passthrough() {
         std::env::remove_var("ROOT");
     }
 }
+
+// ── PortageReader round-trip tests (Tasks 2.1-2.6) ──────────────────
+
+/// 2.1: read_config golden path — populate a full temp portage tree,
+/// read it back, verify all fields are populated.
+#[test]
+fn read_config_golden_path() {
+    let (_tmp, root) = common::fixtures::portage_tree();
+    unsafe {
+        std::env::set_var("ROOT", root.to_str().unwrap());
+    }
+    let reader = portage::PortageReader::new().unwrap();
+    let config = reader.read_config().expect("read_config should succeed");
+
+    // Verify package.use was read.
+    assert!(
+        !config.package_use.is_empty(),
+        "package_use should not be empty"
+    );
+    assert!(
+        config
+            .package_use
+            .iter()
+            .any(|e| e.atom == "dev-libs/openssl"),
+        "package_use should contain openssl entry"
+    );
+
+    // Verify package.accept_keywords was read.
+    assert!(
+        !config.package_accept_keywords.is_empty(),
+        "package_accept_keywords should not be empty"
+    );
+
+    // Verify package.license was read.
+    assert!(
+        !config.package_license.is_empty(),
+        "package_license should not be empty"
+    );
+
+    // Verify package.mask was read.
+    assert!(
+        !config.package_mask.is_empty(),
+        "package_mask should not be empty"
+    );
+
+    // Verify package.unmask was read.
+    assert!(
+        !config.package_unmask.is_empty(),
+        "package_unmask should not be empty"
+    );
+
+    // Verify package.env was read.
+    assert!(
+        !config.package_env.is_empty(),
+        "package_env should not be empty"
+    );
+
+    // Verify env files were read.
+    assert!(
+        !config.env_files.is_empty(),
+        "env_files should not be empty"
+    );
+    assert!(
+        config.env_files.contains_key("no-lto.conf"),
+        "env_files should contain no-lto.conf"
+    );
+
+    // Verify repos.conf was read.
+    assert!(
+        !config.repos_conf.is_empty(),
+        "repos_conf should not be empty"
+    );
+
+    // Verify profile overlay was read.
+    assert!(
+        !config.profile_overlay.is_empty(),
+        "profile_overlay should not be empty"
+    );
+    assert!(
+        config.profile_overlay.contains_key("use.mask"),
+        "profile_overlay should contain use.mask"
+    );
+
+    // Verify patches were read.
+    assert!(!config.patches.is_empty(), "patches should not be empty");
+
+    // Verify world was read.
+    assert!(!config.world.is_empty(), "world should not be empty");
+
+    // Verify make.conf fields.
+    assert!(!config.make_conf.cflags.is_empty(), "CFLAGS should be read");
+    assert!(
+        !config.make_conf.chost.is_empty(),
+        "CHOST should be detected or read"
+    );
+
+    unsafe {
+        std::env::remove_var("ROOT");
+    }
+}
+
+/// 2.2: read_config with missing optional dirs (no package.use/, etc.).
+#[test]
+fn read_config_missing_optional_dirs() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let root = tmp.path().to_path_buf();
+    let portage = root.join("etc/portage");
+    std::fs::create_dir_all(&portage).expect("create portage dir");
+
+    // Write only make.conf — all optional dirs are missing.
+    std::fs::write(
+        portage.join("make.conf"),
+        "CFLAGS=\"-O2\"\nCHOST=\"x86_64-pc-linux-gnu\"\n",
+    )
+    .expect("write make.conf");
+
+    unsafe {
+        std::env::set_var("ROOT", root.to_str().unwrap());
+    }
+    let reader = portage::PortageReader::new().unwrap();
+    let config = reader.read_config().expect("should handle missing dirs");
+
+    assert!(
+        config.package_use.is_empty(),
+        "package_use should be empty with no dir"
+    );
+    assert!(
+        config.repos_conf.is_empty(),
+        "repos_conf should be empty with no dir"
+    );
+    assert!(
+        config.patches.is_empty(),
+        "patches should be empty with no dir"
+    );
+    assert!(
+        config.profile_overlay.is_empty(),
+        "profile_overlay should be empty with no dir"
+    );
+
+    unsafe {
+        std::env::remove_var("ROOT");
+    }
+}
+
+/// 2.3: read_config with package.use as a single file vs. a directory.
+#[test]
+fn read_config_package_use_single_file() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let root = tmp.path().to_path_buf();
+    let portage = root.join("etc/portage");
+    std::fs::create_dir_all(&portage).expect("create portage dir");
+
+    std::fs::write(
+        portage.join("make.conf"),
+        "CFLAGS=\"-O2\"\nCHOST=\"x86_64-pc-linux-gnu\"\n",
+    )
+    .expect("write make.conf");
+
+    // package.use as a single file (not a directory).
+    std::fs::write(
+        portage.join("package.use"),
+        "dev-libs/openssl -bindist\nsys-apps/systemd cryptsetup\n",
+    )
+    .expect("write package.use");
+
+    unsafe {
+        std::env::set_var("ROOT", root.to_str().unwrap());
+    }
+    let reader = portage::PortageReader::new().unwrap();
+    let config = reader
+        .read_config()
+        .expect("should handle file-mode package.use");
+
+    assert!(
+        !config.package_use.is_empty(),
+        "package_use should be read from single file"
+    );
+    assert!(
+        config
+            .package_use
+            .iter()
+            .any(|e| e.atom == "dev-libs/openssl"),
+        "should contain openssl entry"
+    );
+
+    unsafe {
+        std::env::remove_var("ROOT");
+    }
+}
+
+/// 2.4: read_profile_overlay round-trip — write files, read back, compare.
+#[test]
+fn read_profile_overlay_round_trip() {
+    let (_tmp, root) = common::fixtures::portage_tree();
+    unsafe {
+        std::env::set_var("ROOT", root.to_str().unwrap());
+    }
+    let reader = portage::PortageReader::new().unwrap();
+    let config = reader.read_config().expect("read config");
+
+    assert!(
+        config.profile_overlay.contains_key("use.mask"),
+        "should contain use.mask"
+    );
+    let content = config.profile_overlay.get("use.mask").unwrap();
+    assert!(
+        content.contains("custom-flag"),
+        "use.mask should contain custom-flag"
+    );
+
+    unsafe {
+        std::env::remove_var("ROOT");
+    }
+}
+
+/// 2.5: read_patches_recursive with nested category/package/*.patch structure.
+#[test]
+fn read_patches_recursive_nested() {
+    let (_tmp, root) = common::fixtures::portage_tree();
+    unsafe {
+        std::env::set_var("ROOT", root.to_str().unwrap());
+    }
+    let reader = portage::PortageReader::new().unwrap();
+    let config = reader.read_config().expect("read config");
+
+    assert!(!config.patches.is_empty(), "patches should contain entries");
+    // The fixture creates patches/dev-libs/openssl/fix.patch.
+    assert!(
+        config.patches.keys().any(|k| k.contains("openssl")),
+        "patches should contain openssl patch, got keys: {:?}",
+        config.patches.keys().collect::<Vec<_>>()
+    );
+
+    unsafe {
+        std::env::remove_var("ROOT");
+    }
+}
+
+/// 2.6: read_repos_conf with multiple section blocks.
+#[test]
+fn read_repos_conf_multiple_sections() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let root = tmp.path().to_path_buf();
+    let portage = root.join("etc/portage");
+    std::fs::create_dir_all(portage.join("repos.conf")).expect("create repos.conf dir");
+    std::fs::create_dir_all(&portage).expect("create portage dir");
+
+    std::fs::write(
+        portage.join("make.conf"),
+        "CFLAGS=\"-O2\"\nCHOST=\"x86_64-pc-linux-gnu\"\n",
+    )
+    .expect("write make.conf");
+
+    // Write repos.conf with multiple files.
+    std::fs::write(
+        portage.join("repos.conf/gentoo.conf"),
+        "[gentoo]\nlocation = /var/db/repos/gentoo\nsync-type = rsync\n",
+    )
+    .expect("write gentoo.conf");
+
+    std::fs::write(
+        portage.join("repos.conf/overlay.conf"),
+        "[guru]\nlocation = /var/db/repos/guru\nsync-type = git\nsync-uri = https://github.com/gentoo/guru.git\n",
+    )
+    .expect("write overlay.conf");
+
+    unsafe {
+        std::env::set_var("ROOT", root.to_str().unwrap());
+    }
+    let reader = portage::PortageReader::new().unwrap();
+    let config = reader.read_config().expect("read config");
+
+    assert!(
+        config.repos_conf.len() >= 2,
+        "repos_conf should have at least 2 entries, got {}",
+        config.repos_conf.len()
+    );
+
+    // Check that sections are parsed correctly.
+    let all_content: String = config.repos_conf.values().cloned().collect();
+    assert!(
+        all_content.contains("[gentoo]"),
+        "should contain gentoo section"
+    );
+    assert!(
+        all_content.contains("[guru]"),
+        "should contain guru section"
+    );
+
+    unsafe {
+        std::env::remove_var("ROOT");
+    }
+}
