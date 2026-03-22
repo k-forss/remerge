@@ -26,11 +26,7 @@ mod e2e_tests {
     /// and verify binpkg output (or that the build actually ran).
     #[tokio::test]
     async fn build_single_package() {
-        if !common::server::stage3_available() {
-            eprintln!("gentoo/stage3:latest not available — skipping build_single_package");
-            return;
-        }
-        let Some(server) = common::server::TestServer::start().await else {
+        let Some(server) = common::server::TestServer::start_with_queue().await else {
             return;
         };
 
@@ -149,11 +145,7 @@ mod e2e_tests {
     /// --ask should be filtered/rejected (single expected outcome).
     #[tokio::test]
     async fn build_with_pretend_flag() {
-        if !common::server::stage3_available() {
-            eprintln!("gentoo/stage3:latest not available — skipping build_with_pretend_flag");
-            return;
-        }
-        let Some(server) = common::server::TestServer::start().await else {
+        let Some(server) = common::server::TestServer::start_with_queue().await else {
             return;
         };
 
@@ -627,17 +619,7 @@ mod e2e_tests {
             return;
         }
 
-        // Check that the base image is available — skip if not.
-        let docker = bollard::Docker::connect_with_local_defaults()
-            .expect("connect to Docker for pre-check");
-        if docker.inspect_image("gentoo/stage3:latest").await.is_err() {
-            eprintln!(
-                "gentoo/stage3:latest not available — skipping upgrade detection. \
-                 Build with: docker build -f docker/test-stage3.Dockerfile \
-                 -t ghcr.io/k-forss/remerge/test-stage3:latest ."
-            );
-            return;
-        }
+        common::server::ensure_test_stage3();
 
         // Create two different dummy binaries.
         let tmp = tempfile::TempDir::new().expect("temp dir");
@@ -662,6 +644,7 @@ mod e2e_tests {
             binpkg_dir: tmp_binpkg.path().to_path_buf(),
             state_dir: tmp_state.path().to_path_buf(),
             worker_binary: Some(binary_a),
+            worker_base_image: Some(common::server::TEST_STAGE3_IMAGE.to_string()),
             ..Default::default()
         };
         let manager_a = remerge_server::docker::DockerManager::new(&config_a)
@@ -690,6 +673,7 @@ mod e2e_tests {
             binpkg_dir: tmp_binpkg2.path().to_path_buf(),
             state_dir: tmp_state2.path().to_path_buf(),
             worker_binary: Some(binary_b),
+            worker_base_image: Some(common::server::TEST_STAGE3_IMAGE.to_string()),
             ..Default::default()
         };
         let manager_b = remerge_server::docker::DockerManager::new(&config_b)

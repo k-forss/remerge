@@ -115,6 +115,23 @@ pub struct ServerConfig {
     /// Default: 10 GiB.
     #[serde(default = "default_binpkg_disk_warn_bytes")]
     pub binpkg_disk_warn_bytes: u64,
+
+    /// Override the base Docker image used for worker containers.
+    ///
+    /// When set, `generate_dockerfile` uses this image instead of
+    /// `gentoo/stage3:latest`.  This is useful for CI and integration
+    /// tests where a pre-synced image avoids the slow `emerge --sync`
+    /// step.
+    #[serde(default)]
+    pub worker_base_image: Option<String>,
+
+    /// Skip the `emerge --sync` step inside worker containers.
+    ///
+    /// When `true`, the `REMERGE_SKIP_SYNC=1` env var is passed to every
+    /// worker container regardless of `repos_dir`.  Useful for CI and
+    /// integration tests where the base image already has a synced tree.
+    #[serde(default)]
+    pub skip_worker_sync: bool,
 }
 
 fn default_binpkg_dir() -> PathBuf {
@@ -252,6 +269,8 @@ impl Default for ServerConfig {
             log_json: false,
             repos_dir: None,
             binpkg_disk_warn_bytes: default_binpkg_disk_warn_bytes(),
+            worker_base_image: None,
+            skip_worker_sync: false,
         }
     }
 }
@@ -370,6 +389,12 @@ impl ServerConfig {
             && let Ok(n) = v.parse()
         {
             config.binpkg_disk_warn_bytes = n;
+        }
+        if let Ok(v) = std::env::var("REMERGE_WORKER_BASE_IMAGE") {
+            config.worker_base_image = Some(v);
+        }
+        if let Ok(v) = std::env::var("REMERGE_SKIP_WORKER_SYNC") {
+            config.skip_worker_sync = v == "1" || v.eq_ignore_ascii_case("true");
         }
 
         config.validate();

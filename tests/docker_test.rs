@@ -127,8 +127,7 @@ mod docker_tests {
 
     /// 5.3: `build_worker_image` — create a dummy worker binary, build image,
     /// verify it exists and has the `remerge.worker.sha256` label.
-    /// Requires the test stage3 image — build locally if not available:
-    /// `docker build -f docker/test-stage3.Dockerfile -t ghcr.io/k-forss/remerge/test-stage3:latest .`
+    /// Requires the Gentoo stage3 image (pulled automatically if missing).
     #[tokio::test]
     async fn build_worker_image_with_label() {
         if !common::server::docker_available() {
@@ -136,17 +135,10 @@ mod docker_tests {
             return;
         }
 
-        // Check that stage3 base image exists — skip if not available.
+        common::server::ensure_test_stage3();
+
         let docker = bollard::Docker::connect_with_local_defaults()
-            .expect("connect to Docker for pre-check");
-        if docker.inspect_image("gentoo/stage3:latest").await.is_err() {
-            eprintln!(
-                "gentoo/stage3:latest not available — skipping. \
-                 Build with: docker build -f docker/test-stage3.Dockerfile \
-                 -t ghcr.io/k-forss/remerge/test-stage3:latest ."
-            );
-            return;
-        }
+            .expect("connect to Docker for post-build inspection");
 
         // Create a dummy worker binary.
         let tmp_dir = tempfile::TempDir::new().expect("temp dir");
@@ -165,6 +157,7 @@ mod docker_tests {
             binpkg_dir: tmp_binpkg.path().to_path_buf(),
             state_dir: tmp_state.path().to_path_buf(),
             worker_binary: Some(dummy_binary.clone()),
+            worker_base_image: Some(common::server::TEST_STAGE3_IMAGE.to_string()),
             ..Default::default()
         };
 
