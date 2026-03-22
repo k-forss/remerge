@@ -9,6 +9,18 @@ pub fn docker_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Check if the Gentoo stage3 base image is available locally.
+/// E2E tests that perform actual builds need this image.
+pub fn stage3_available() -> bool {
+    std::process::Command::new("docker")
+        .args(["inspect", "--type=image", "gentoo/stage3:latest"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// A test server handle — keeps the server alive for the test duration.
 pub struct TestServer {
     pub port: u16,

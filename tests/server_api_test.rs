@@ -463,9 +463,9 @@ async fn websocket_progress_stream() {
                 if msg.is_text() {
                     received_text = true;
                     let text = msg.into_text().expect("text frame");
-                    // Should be a JSON BuildProgress event.
+                    // Should be a JSON BuildProgress event (serde snake_case).
                     assert!(
-                        text.contains("StatusChanged") || text.contains("Finished"),
+                        text.contains("status_changed") || text.contains("finished"),
                         "text frame should contain status event: {text}"
                     );
                     break;
