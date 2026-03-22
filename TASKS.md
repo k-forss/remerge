@@ -3,891 +3,332 @@
 Actionable tasks for building a comprehensive integration test suite for remerge.
 All items are ordered by dependency (earlier items unblock later ones).
 
+> **Audit performed: every test file was read line-by-line and verified
+> against task requirements. A task is `[x]` ONLY if the test exists,
+> compiles, and has meaningful assertions for what the task describes.
+> Tasks with weak/permissive assertions, missing verification steps,
+> `eprintln` instead of `assert!`, or assertions that accept multiple
+> outcomes (always-pass) are `[ ]`.**
+
 ---
 
 ## Phase 0 — Infrastructure & Scaffolding
 
 - [x] **0.1** Create `tests/` directory at workspace root for integration tests
-- [x] **0.2** Add `tests/common/mod.rs` with shared helpers (free port allocation,
-      temp dir scaffolding, config builders, timeout wrappers)
-- [x] **0.3** Add `tests/common/fixtures.rs` with test data builders:
-  - [x] Minimal `make.conf` (CFLAGS, CHOST, USE, FEATURES)
-  - [x] Sample `package.use`, `package.accept_keywords`, `package.mask`,
-        `package.unmask`, `package.env`, env files
-  - [x] Minimal `repos.conf` (single `[gentoo]` section with a `location`)
-  - [x] Sample `profile/` overlay directory (use.mask)
-  - [x] Sample `patches/` tree (category/package/patch files)
+- [x] **0.2** Add `tests/common/mod.rs` with shared helpers
+- [x] **0.3** Add `tests/common/fixtures.rs` with test data builders
 - [x] **0.4** Add workspace features (`integration`, `e2e`) and dev-dependencies
-      to `Cargo.toml`; created lib.rs for server/worker/CLI crates to expose
-      modules for integration testing
-- [x] **0.5** Create a CI job in `.github/workflows/ci.yml` that runs integration
-      tests on `ubuntu-latest` with Docker available (GitHub-hosted runners
-      have Docker pre-installed)
-
-      **Implementation notes:**
-      - Add an `integration-test` job that runs
-        `cargo test --workspace --features integration` with Docker already
-        available on the runner.
-      - Add a separate `e2e-test` job (manual or merge-to-main only) that
-        pulls `ghcr.io/<owner>/remerge-test-stage3:latest` and runs
-        `cargo test --workspace --features e2e`.
-      - Depend on the new GHCR test image from task 0.6.
-
-- [x] **0.6** Create and publish a remerge integration test Docker image to GHCR
-
-      **Implementation notes:**
-      This is a prerequisite for all Gentoo-specific tests (Phase 2 tasks
-      2.1–2.6, 2.8, Phase 3 tasks 3.1–3.8, 3.13, and all E2E tests).
-
-      Create `docker/test-stage3.Dockerfile` that:
-      1. Starts from `gentoo/stage3:latest`
-      2. Runs `emerge --sync` (or copies a pre-synced portage tree snapshot)
-      3. Installs `portageq` (already in stage3, verify it works)
-      4. Installs `cpuid2cpuflags` (for CPU flag detection tests)
-      5. Creates a minimal `/var/db/pkg` tree with a few known packages
-         for `is_installed` tests
-      6. Creates a minimal portage tree layout in `/var/db/repos/gentoo`
-         with profiles and a few ebuilds
-      7. Tags as `ghcr.io/<owner>/remerge-test-stage3:latest`
-
-      Add a GitHub Actions workflow `docker/publish-test-image.yml` that:
-      - Triggers on changes to `docker/test-stage3.Dockerfile` or manual
-        dispatch
-      - Builds and pushes to GHCR with `packages: write` permission
-      - Caches layers to speed up rebuilds
-
-      Tests that need this image should use `#[cfg(feature = "e2e")]` or
-      check for the image availability and skip gracefully.
+- [x] **0.5** Create CI job in `.github/workflows/ci.yml` for integration tests
+- [x] **0.6** Create and publish remerge integration test Docker image to GHCR
 
 ---
 
 ## Phase 1 — Types & Validation (no I/O)
 
-These are pure-logic tests that need no Docker, no server, no filesystem.
-
-- [x] **1.1** `PortageConfig` round-trip: construct → serialize → deserialize →
-      assert equality (covers serde defaults like `profile_overlay`,
-      `use_flags_resolved`)
-- [x] **1.2** `Workorder` round-trip: all status transitions
-      (`Pending → Provisioning → Building → Completed/Failed/Cancelled`)
-- [x] **1.3** `validate_atom` exhaustive: all legal operator/category/name/version
-      combinations vs. all rejection classes (shell injection, empty parts,
-      unqualified + versioned)
-- [x] **1.4** `MakeConf` field coverage: every `extra_vars` key, empty USE,
-      empty FEATURES, `use_flags_resolved = true` vs `false` behaviour
-- [x] **1.5** `ClientRole` / `AuthMode` `Display` + `FromStr` round-trips
-- [x] **1.6** `WorkorderResult` with mixed built/failed packages, SHA-256 hashes
+- [x] **1.1** `PortageConfig` round-trip — `types_test.rs::portage_config_full_roundtrip`
+- [x] **1.2** `Workorder` round-trip — `types_test.rs::workorder_status_all_variants_roundtrip`
+- [x] **1.3** `validate_atom` exhaustive — `types_test.rs` 12 atom tests
+- [x] **1.4** `MakeConf` field coverage — `types_test.rs::make_conf_defaults`
+- [x] **1.5** `ClientRole`/`AuthMode` round-trips — `types_test.rs` 4 tests
+- [x] **1.6** `WorkorderResult` — `types_test.rs::workorder_result_roundtrip`
 
 ---
 
 ## Phase 2 — CLI Portage Reader (filesystem, no network)
 
-Tests that create a temp directory tree mimicking `/etc/portage/` and `/var/db/pkg/`.
-
-- [x] **2.1** `read_config` golden path: populate a full temp portage tree in a
-      temp dir, set `ROOT` to that dir, call `PortageReader::new()?.read_config()`,
-      assert every field
-
-      **Implementation notes:**
-      - `read_config()` calls `portageq envvar USE` and other `portageq`
-        commands internally. These are not available on non-Gentoo hosts.
-      - **Option A (preferred):** Run this test inside the GHCR test image
-        from task 0.6 using `docker run`. Gate behind `#[cfg(feature = "e2e")]`.
-      - **Option B:** Accept that `portageq` falls back gracefully (the code
-        has fallback paths when `portageq` fails) and test only the
-        fallback-path behaviour on non-Gentoo hosts. This tests a subset.
-      - Choose Option A for full coverage; implement Option B as a separate
-        lower-priority task for fast CI.
-
-- [x] **2.2** `read_config` with missing optional dirs (no `package.use/`,
-      no `patches/`, no `profile/` overlay) — should succeed with empty maps
-
-      **Implementation notes:**
-      Same constraints as 2.1 — requires `portageq` or fallback testing.
-      Gate behind `#[cfg(feature = "e2e")]` for full test; add a fallback
-      variant that tests just the file-parsing logic without `portageq`.
-
-- [x] **2.3** `read_config` with `package.use` as a single file vs. a directory
-      of files (Portage supports both)
-
-      **Implementation notes:**
-      Same constraints as 2.1. The file-vs-directory distinction is handled
-      in `read_config()` which calls `portageq`. Gate behind
-      `#[cfg(feature = "e2e")]`.
-
-- [x] **2.4** `read_profile_overlay` round-trip: write files into
-      `<ROOT>/etc/portage/profile/` in the temp dir, call
-      `PortageReader::new()?.read_profile_overlay()`, assert `BTreeMap` keys and
-      content
-
-      **Implementation notes:**
-      `read_profile_overlay()` is called from within `read_config()`.
-      Check if it's a separate `pub` method or only called internally.
-      If internal, either:
-      - Extract to a standalone `pub fn` with a path parameter, OR
-      - Test via `read_config()` inside the GHCR image.
-      `PortageReader::new()` calls `portageq` to find the portage root.
-      Gate behind `#[cfg(feature = "e2e")]` or add `_inner` variant.
-
-- [x] **2.5** `read_patches_recursive` with nested `category/package/*.patch`
-
-      **Implementation notes:**
-      Same as 2.4 — check if this is separately callable. If only internal
-      to `read_config()`, needs `_inner` variant or E2E test.
-      Gate behind `#[cfg(feature = "e2e")]`.
-
-- [x] **2.6** `read_repos_conf` with multiple `[section]` blocks, verify
-      repo names and locations
-
-      **Implementation notes:**
-      Same as 2.4. Gate behind `#[cfg(feature = "e2e")]`.
-
-- [x] **2.7** `is_installed` with version constraints:
-  - [x] `category/pkg` — any version matches
-  - [x] `=category/pkg-1.2.3` — exact match
-  - [x] `=category/pkg-1.2.3-r1` — exact with revision
-  - [x] `>=category/pkg-2.0` — satisfied and unsatisfied
-  - [x] `<=category/pkg-2.0` — satisfied and unsatisfied
-  - [x] `>category/pkg-2.0` — boundary (2.0 should NOT match)
-  - [x] `<category/pkg-2.0` — boundary
-  - [x] `~category/pkg-1.2.3` — any revision
-  - [x] `=category/pkg-1.2*` — glob
-  - [x] `@world` — always returns false
-  - [x] Uninstalled package — returns false
-- [x] **2.8** `expand_set` for `@world` (reads world file) and `@system`
-      (calls `portageq`) — requires portageq
-
-      **Implementation notes:**
-      - `@world` expansion reads `/var/lib/portage/world` — this can be
-        tested with a temp dir on any host by setting ROOT.
-      - `@system` expansion calls `portageq` — requires Gentoo or the
-        GHCR test image.
-      - Split into two tests: `expand_set_world` (no portageq needed,
-        runs in default CI) and `expand_set_system` (needs portageq,
-        gate behind `#[cfg(feature = "e2e")]`).
-
-- [x] **2.9** `split_name_version` edge cases: numeric-only names
-      (`dev-libs/1lib`), multi-hyphen (`x11-libs/gtk+-2.0`), no version
-- [x] **2.10** `compare_versions` edge cases: suffixes (`_alpha`, `_beta`,
-      `_pre`, `_rc`, `_p`), long numeric segments, revision-only differences
+- [x] **2.1** `read_config` golden path — `cli_portage_test.rs::read_config_golden_path`
+- [x] **2.2** Missing optional dirs — `cli_portage_test.rs::read_config_missing_optional_dirs`
+- [x] **2.3** `package.use` as file vs dir — `cli_portage_test.rs::read_config_package_use_single_file`
+- [x] **2.4** `read_profile_overlay` — `cli_portage_test.rs::read_profile_overlay_round_trip`
+- [x] **2.5** `read_patches_recursive` — `cli_portage_test.rs::read_patches_recursive_nested`
+- [x] **2.6** `read_repos_conf` — `cli_portage_test.rs::read_repos_conf_multiple_sections`
+- [x] **2.7** `is_installed` with version constraints — 8 tests covering all operators
+- [x] **2.8** `expand_set` — `cli_portage_test.rs::expand_set_world` + passthrough
+- [x] **2.9** `split_name_version` — 5 tests
+- [x] **2.10** `compare_versions` — 7 tests covering suffixes, revisions, depth
 
 ---
 
 ## Phase 3 — Worker Portage Setup (filesystem, no Docker)
 
-Tests that call `portage_setup` functions against a temp directory.
-
-**Note:** Tasks 3.1–3.8 and 3.13 require writing to hardcoded paths under
-`/etc/portage/` because the production functions (`write_make_conf`,
-`write_package_use`, `write_env_files`, etc.) are **private** and use
-hardcoded absolute paths. To test these without root access:
-
-**Required prerequisite:** Create `_inner` variants (like was done for
-`write_profile_overlay_inner`, `write_patches_inner`, `set_profile_inner`,
-and `build_makeopts_inner`) that accept a base path parameter. Make them
-`pub` for integration testing. This is a minimal visibility change, not a
-mock layer.
-
-- [x] **3.0** Create `_inner` variants for private portage_setup functions
-
-      **Implementation notes:**
-      Add `pub` `_inner` variants for these functions in
-      `crates/worker/src/portage_setup.rs`:
-      - `write_make_conf_inner(base: &Path, config: &PortageConfig, worker_chost: &str, gpg_key: Option<&str>, gpg_home: Option<&str>)`
-      - `write_package_use_inner(base: &Path, config: &PortageConfig)`
-      - `write_package_accept_keywords_inner(base: &Path, config: &PortageConfig)`
-      - `write_package_license_inner(base: &Path, config: &PortageConfig)`
-      - `write_package_mask_inner(base: &Path, config: &PortageConfig)`
-      - `write_package_unmask_inner(base: &Path, config: &PortageConfig)`
-      - `write_package_env_inner(base: &Path, config: &PortageConfig)`
-      - `write_env_files_inner(base: &Path, config: &PortageConfig)`
-      - `write_repos_conf_inner(base: &Path, config: &PortageConfig, repos_dir: Option<&Path>)`
-
-      Each `_inner` variant writes files relative to `base` instead of
-      `/etc/portage/`. The existing functions become thin wrappers:
-      ```rust
-      async fn write_make_conf(...) -> Result<()> {
-          write_make_conf_inner(Path::new("/etc/portage"), ...).await
-      }
-      ```
-
-      Follow the exact pattern already established by:
-      - `write_profile_overlay` → `write_profile_overlay_inner`
-      - `write_patches` → `write_patches_inner`
-      - `set_profile` → `set_profile_inner`
-      - `build_makeopts` → `build_makeopts_inner`
-
-- [x] **3.1** `write_make_conf` golden path: provide a `MakeConf`, assert
-      generated file content line-by-line
-
-      **Implementation notes:**
-      Depends on task 3.0 (`write_make_conf_inner`). Use a temp dir as
-      base path. Assert CHOST, CFLAGS, CXXFLAGS, LDFLAGS, MAKEOPTS, USE,
-      FEATURES, ACCEPT_LICENSE, ACCEPT_KEYWORDS, CPU_FLAGS, USE_EXPAND,
-      extra vars, PKGDIR lines are all present and correct.
-
-- [x] **3.2** `write_make_conf` with `use_flags_resolved = true` — USE line
-      must start with `-* `
-
-      **Implementation notes:**
-      Depends on task 3.0. Set `make_conf.use_flags_resolved = true`,
-      verify the output contains `USE="-* flag1 flag2"`.
-
-- [x] **3.3** `write_make_conf` with `use_flags_resolved = false` — no `-*`
-      prefix
-
-      **Implementation notes:**
-      Depends on task 3.0. Set `make_conf.use_flags_resolved = false`,
-      verify the output does NOT contain `-*`.
-
-- [x] **3.4** `write_make_conf` with USE_EXPAND flags — must appear as
-      separate variables, not inside USE
-
-      **Implementation notes:**
-      Depends on task 3.0. Populate `make_conf.use_expand` with
-      `VIDEO_CARDS: ["intel"]` and `INPUT_DEVICES: ["libinput"]`,
-      verify output has `VIDEO_CARDS="intel"` and
-      `INPUT_DEVICES="libinput"` as separate lines.
-
-- [x] **3.5** `write_package_config` for each config type (use, keywords,
-      license, mask, unmask, env) — both single-entry and multi-entry
-
-      **Implementation notes:**
-      Depends on task 3.0. Test each `write_package_*_inner` function.
-      For each: create a temp dir, call the function, read the written
-      file, assert content matches expected format:
-      - `package.use/remerge`: `atom flag1 flag2\n`
-      - `package.accept_keywords/remerge`: `atom ~amd64\n`
-      - `package.license/remerge`: `atom license-name\n`
-      - `package.mask/remerge`: `atom\n`
-      - `package.unmask/remerge`: `atom\n`
-      - `package.env/remerge`: `atom env-file.conf\n`
-
-- [x] **3.6** `write_env_files` — write, verify content and permissions
-
-      **Implementation notes:**
-      Depends on task 3.0 (`write_env_files_inner`). Write multiple env
-      files, verify they appear in `base/env/`, verify content matches,
-      verify invalid filenames (containing `/` or `..`) are skipped.
-
-- [x] **3.7** `write_repos_conf` with server `repos_dir` bind-mount remapping
-      (locations must be rewritten to `/var/db/repos/<name>`)
-
-      **Audit status (verified):** PROPERLY IMPLEMENTED — the remapping
-      logic was extracted into `ensure_repo_locations_inner(config,
-      repos_base, repos_conf_base, remap_base)` (line 577 of
-      `portage_setup.rs`) with 4 tests in `worker_setup_test.rs`:
-      1. `ensure_repo_locations_bind_mount_symlink` — symlink created ✅
-      2. `ensure_repo_locations_remap_when_skip_sync` — REMERGE_SKIP_SYNC
-         triggers remap + location rewrite ✅
-      3. `ensure_repo_locations_create_empty_dir` — empty dir for
-         non-bind-mount repos ✅
-      4. `ensure_repo_locations_rejects_traversal` — path traversal
-         returns error ✅
-
-      Also `rewrite_repo_location_inner` (line 674) was extracted.
-
-- [x] **3.8** `write_repos_conf` without server repos_dir — locations
-      preserved as-is
-
-      **Implementation notes:**
-      Depends on task 3.0 (`write_repos_conf_inner`). Pass `None` for
-      repos_dir and verify that `location =` lines are preserved.
-
-- [x] **3.9** `set_profile` — creates symlink pointing to the correct repo's
-      `profiles/<profile>` path; tested via `set_profile_inner` with temp dirs
-- [x] **3.10** `write_profile_overlay` — writes files to temp dir,
-      rejects path traversal (`..`), rejects absolute paths; tested via
-      `write_profile_overlay_inner`
-- [x] **3.11** `write_patches` — writes files to temp dir, creates intermediate
-      category/package dirs, rejects path traversal; tested via
-      `write_patches_inner`
-- [x] **3.12** `build_makeopts` — server env REMERGE_PARALLEL_JOBS and
-      REMERGE_LOAD_AVERAGE override client MAKEOPTS; absent env falls back
-      to client MAKEOPTS; tested via `build_makeopts_inner`
-- [x] **3.13** `apply_config` orchestration — call with a full `PortageConfig`
-      and assert that all files are present under the temp root
-
-      **Implementation notes:**
-      - `apply_config()` calls all the private `write_*` functions which
-        write to hardcoded `/etc/portage/` paths.
-      - After task 3.0 is complete, create an `apply_config_inner` that
-        takes a base path, or test this inside the GHCR Docker image.
-      - **Recommended:** Gate behind `#[cfg(feature = "e2e")]` and run
-        inside the test container where root writes are safe.
+- [x] **3.0** Create `_inner` variants — all pub _inner functions exist
+- [x] **3.1** `write_make_conf` golden path — 15 assertions
+- [x] **3.2** `use_flags_resolved = true` — `-*` prefix verified
+- [x] **3.3** `use_flags_resolved = false` — no `-*` prefix
+- [x] **3.4** USE_EXPAND flags as separate variables
+- [x] **3.5** `write_package_config` for all types — 6 tests
+- [x] **3.6** `write_env_files` — creates files, skips invalid
+- [x] **3.7** `write_repos_conf` with remapping — 4 ensure_repo_locations tests
+- [x] **3.8** `write_repos_conf` without remapping — 3 tests
+- [x] **3.9** `set_profile` symlink — 3 tests
+- [x] **3.10** `write_profile_overlay` — 4 tests incl. traversal rejection
+- [x] **3.11** `write_patches` — creates structure, rejects traversal
+- [x] **3.12** `build_makeopts` — 3 tests (no override, override, partial)
+- [x] **3.13** `apply_config` orchestration — 12 assertions
 
 ---
 
 ## Phase 4 — Server Unit-level (in-process, with Docker)
 
-Tests that spin up the axum app in-process. Require Docker for AppState
-initialization but do not run builds — they test HTTP API responses only.
-Tests skip gracefully when Docker is unavailable.
+All behind `#[cfg(feature = "integration")]`.
 
-**Audit note:** All Phase 4 tests currently skip silently when Docker is
-unavailable — they `return` early with `eprintln`. In CI without Docker,
-they report as "passed" despite not actually running. This must be fixed.
-
-- [x] **4.0** Fix Phase 4 test skip behavior
-
-      **Implementation notes:**
-      Replace the `if !require_docker() { return; }` pattern with a
-      strategy that makes skipped tests visible:
-      - **Option A (recommended):** Keep the skip pattern but ensure the
-        CI `integration-test` job (task 0.5) has Docker and counts test
-        executions. Add a test that asserts Docker IS available when the
-        `integration` feature is enabled:
-        ```rust
-        #[cfg(feature = "integration")]
-        #[test]
-        fn docker_must_be_available() {
-            assert!(docker_available(), "Docker required for integration tests");
-        }
-        ```
-      - **Option B:** Use `#[ignore]` on all Docker-dependent tests and
-        run with `--include-ignored` in CI.
-      - Move all server API tests behind `#[cfg(feature = "integration")]`
-        so they are only compiled when Docker is expected to be present.
-
-- [x] **4.1** `POST /api/v1/workorders` — valid submission returns 200 +
-      workorder ID
-- [x] **4.2** `POST /api/v1/workorders` — invalid atoms rejected (400)
-- [x] **4.3** `POST /api/v1/workorders` — duplicate active workorder rejected
-      (409)
-- [x] **4.4** `GET /api/v1/workorders/:id` — returns workorder with correct
-      status
-- [x] **4.5** `GET /api/v1/workorders` — returns list with at least one entry
-- [x] **4.6** `DELETE /api/v1/workorders/:id` — transitions to Cancelled
-- [x] **4.7** `GET /api/v1/health` — returns 200 with status "ok"
-- [x] **4.8** `GET /api/v1/info` — returns server version, auth mode,
-      binhost URL
-- [x] **4.9** WebSocket `/api/v1/workorders/:id/progress` — connects,
-      receives text events, binary PTY frames
-
-      **Implementation notes:**
-      - Add `tokio-tungstenite` to dev-dependencies (already in workspace).
-      - Submit a workorder, then connect to the WebSocket URL from the
-        `SubmitWorkorderResponse.progress_ws_url`.
-      - Verify WebSocket upgrade succeeds (101).
-      - Cancel the workorder to trigger a `StatusChanged` event.
-      - Read frames with a timeout, verify a text frame containing
-        the status change is received.
-      - Requires Docker. Gate with `require_docker()`.
-
-- [x] **4.10** Auth enforcement: `None` mode allows all, `Mtls` mode
-      rejects missing cert, `Mixed` mode enforces main vs follower rules
-
-      **Implementation notes:**
-      - `None` mode is already implicitly tested by all other Phase 4
-        tests (the default config uses `AuthMode::None`).
-      - For `Mtls`/`Mixed` mode: create a separate `TestServer` variant
-        that accepts a custom `ServerConfig`. Set `auth.mode = Mtls`.
-        Submit a request without the cert header, assert 401/403.
-      - The `auth.rs` module already has 14 unit tests covering the
-        logic. These integration tests verify the axum middleware.
-      - Requires Docker. Gate with `require_docker()`.
-
-- [x] **4.11** Client registry: follower registration requires existing main
-- [x] **4.12** Config diff detection: same config → empty diff, changed
-      package.use → `portage_changed = true`
-
-      **Implementation notes:**
-      - The `registry.rs` already has 7 unit tests covering diff logic.
-      - For integration: submit from client A, then submit again from
-        client A with changed USE flags. The server should detect the
-        config change internally.
-      - `portage_changed` is not surfaced in any HTTP API response; it is
-        internal to the server's `ClientRegistry`.  The 7 unit tests in
-        `crates/server/src/registry.rs` comprehensively cover diff
-        detection (new client, same config, changed USE flags, active
-        workorder, follower scenarios).  No additional integration test
-        is needed.
-
-- [x] **4.13** Metrics endpoint (`/metrics`) returns Prometheus text format
-- [x] **4.14** GET /api/v1/workorders/{nonexistent} returns 404
+- [x] **4.0** Fix skip behavior — sentinel test asserts Docker available
+- [x] **4.1** Valid submission returns 200 — `submit_workorder_valid`
+- [x] **4.2** Invalid atoms returns 400 — `submit_workorder_invalid_atoms`
+- [x] **4.3** Duplicate active returns 409 — `submit_workorder_duplicate_active`
+- [x] **4.4** GET workorder returns details — `get_workorder`
+- [x] **4.5** List workorders — `list_workorders`
+- [x] **4.6** Cancel workorder — `cancel_workorder`
+- [x] **4.7** Health endpoint — `health_endpoint`
+- [x] **4.8** Info endpoint — `info_endpoint`
+- [x] **4.9** WebSocket progress — `websocket_progress_stream`
+- [x] **4.10** Auth enforcement — `auth_mtls_rejects_without_cert`
+- [x] **4.11** Follower without main — `follower_without_main_rejected`
+- [x] **4.12** Config diff — unit tests in `registry.rs`
+- [x] **4.13** Metrics — `metrics_endpoint`
+- [x] **4.14** Nonexistent workorder 404 — `get_nonexistent_workorder`
 
 ---
 
 ## Phase 5 — Docker Integration (requires Docker daemon)
 
-These tests need a running Docker daemon. Gate behind
-`#[cfg(feature = "integration")]`.
+Behind `#[cfg(feature = "integration")]`.
 
-- [x] **5.1** `DockerManager::new` — connects to local Docker socket
+- [x] **5.1** `DockerManager::new` — `docker_manager_connects`
+- [x] **5.2** `image_tag` — `image_tag_from_system_identity`
+- [ ] **5.3** `build_worker_image` — verify image + sha256 label
 
-      **Audit note:** The current `docker_availability_check` test is a
-      no-op — it always passes regardless of Docker status. The
-      `docker_manager_connects` test does work correctly. Remove
-      or replace `docker_availability_check`.
+      **Defect:** `docker_test.rs::build_worker_image_with_label` accepts
+      BOTH success and error outcomes. On success it checks
+      `image_needs_rebuild` but does NOT inspect for the sha256 label
+      directly. On error it just checks error message mentions "stage3"
+      and passes. **The test always passes regardless of outcome.**
 
-      **Implementation notes:**
-      - Remove the no-op `docker_availability_check` test.
-      - The `docker_manager_connects` test is the actual implementation
-        and works correctly. Verify it returns `Ok`.
+      **To fix:**
+      1. Build stage3 locally: `docker build -f docker/test-stage3.Dockerfile -t ghcr.io/k-forss/remerge/test-stage3:latest .`
+      2. Add `bollard` to dev-deps for image inspection.
+      3. On success: use bollard to inspect image, assert
+         `remerge.worker.sha256` label exists and is non-empty.
+      4. Remove the error-message-matching path that silently passes.
+         If stage3 is missing, skip explicitly (don't pretend to pass).
+      5. Clean up image in drop guard.
 
-- [x] **5.2** `image_tag` derivation from `SystemId` — verify format
-- [x] **5.3** `build_worker_image` — builds an image, verify it exists via
-      Docker API, verify `remerge.worker.sha256` label
+- [x] **5.4** `needs_rebuild` — `needs_rebuild_nonexistent_image`
+- [ ] **5.5** `start_worker` — container runs with correct env/mounts
 
-      **Audit status:** NOT IMPLEMENTED — no test exists.
+      **Defect:** `docker_test.rs::start_worker_container` accepts both
+      success and error. On success only checks `!id.is_empty()`. On
+      error accepts "No such image" and passes. **Does NOT verify env
+      vars or mounts.** Depends on 5.3.
 
-      **Implementation notes:**
-      - Build the stage3 image locally first (see `docker/test-stage3.Dockerfile`).
-      - `build_worker_image(&self, sys: &SystemIdentity, tag: &str)`
-        builds a Docker image using an internal Dockerfile that COPYs
-        the worker binary into a Gentoo stage3 base image.
-      - Requires `config.worker_binary` to point to a valid ELF binary.
-      - For testing: create a dummy binary (e.g., a small shell script
-        or a `#!/bin/true`), configure `ServerConfig.worker_binary`.
-      - After build, use `bollard` inspect to verify the image exists
-        and has the `remerge.worker.sha256` label.
-      - Clean up the test image with `remove_image()` in a drop guard.
-      - Gate behind `#[cfg(feature = "integration")]`.
-      - This test will be slow (~30s) due to Docker image building.
-      - If the test fails due to production code bugs, mark `[x]` and
-        add a "Known failure:" note.
+      **To fix:**
+      1. Depends on 5.3 building a valid image.
+      2. On success: use bollard to inspect container, assert
+         `REMERGE_WORKORDER` env var is set, assert binpkg mount exists.
+      3. Stop and remove container after inspection.
 
-- [x] **5.4** `needs_rebuild` — returns `false` for freshly-built image,
-      `true` after worker binary changes
+- [x] **5.6** Container cleanup — remove/stop error tests
+- [ ] **5.7** Image eviction — cleanup preserves newest, removes older
 
-      **Implementation notes:**
-      - Depends on 5.3 (need to build an image first).
-      - `image_needs_rebuild(&self, tag: &str) -> bool` checks the
-        `remerge.worker.sha256` label on the image against the current
-        binary hash.
-      - Build image, call `image_needs_rebuild`, assert `false`.
-      - Change the `worker_binary` path to a different binary (or
-        modify the existing one), call again, assert `true`.
-      - Gate behind `#[cfg(feature = "integration")]`.
+      **Defect:** `docker_test.rs::image_last_used_tracking` only tests
+      HashMap insert/read/compare. It does NOT test any eviction logic.
+      It just proves you can use a HashMap.
 
-- [x] **5.5** `start_worker` — container starts, env vars are set, mounts
-      are present
-
-      **Audit status:** NOT IMPLEMENTED — no test exists. Depends on 5.3.
-
-      **Implementation notes:**
-      - `start_worker(&self, container_name: &str, image_tag: &str, ...)`
-        creates and starts a container.
-      - Requires a valid worker image (implement after 5.3).
-      - After starting, inspect the container with `bollard`:
-        - Verify `REMERGE_WORKORDER` env var is set.
-        - Verify the binpkg mount is present.
-      - Stop and remove the container after inspection.
-      - Gate behind `#[cfg(feature = "integration")]`.
-
-- [x] **5.6** Container cleanup — `remove_container` removes the container
-
-      **Implementation notes:**
-      - Create and start a test container, stop it.
-      - Call `remove_container(container_id)`.
-      - Use `bollard` to verify the container no longer exists.
-      - Gate behind `#[cfg(feature = "integration")]`.
-
-- [x] **5.7** Image eviction — `cleanup_idle_images` preserves the newest
-      image per CHOST+profile group, removes older ones
-
-      **Audit status:** NOT IMPLEMENTED — no test exists.
-
-      **Implementation notes:**
-      - Check if there is a public `cleanup_idle_images` or equivalent
-        method. Search for it in `docker.rs`.
-      - If it's part of a background task, may need to extract the logic
-        into a testable function.
-      - Create multiple test images with different tags, set different
-        `image_last_used` timestamps in `AppState`.
-      - Run eviction, verify only the newest per group survives.
-      - Gate behind `#[cfg(feature = "integration")]`.
+      **To fix:**
+      1. The eviction loop is in `main.rs` (~L219). Extract into testable
+         `pub` function, or call the loop logic directly.
+      2. Create real test images, set timestamps, run eviction, verify
+         the older image was actually removed from Docker.
+      3. If extraction is too invasive, test the `image_last_used` map
+         combined with `remove_image` on a real image to prove the
+         complete flow.
 
 ---
 
 ## Phase 6 — End-to-End (CLI → Server → Worker → binpkg)
 
-Full pipeline tests. Require Docker, a Gentoo stage3 image, and network
-access (for `emerge --sync`). These are slow and should be gated behind
-`#[cfg(feature = "e2e")]` or run only in a dedicated CI job.
+Behind `#[cfg(feature = "e2e")]`. Build stage3 locally first:
+`docker build -f docker/test-stage3.Dockerfile -t ghcr.io/k-forss/remerge/test-stage3:latest .`
 
-**Audit note:** The current `e2e_test.rs` contains only a placeholder
-function with `eprintln!("...")` and an early return. No actual E2E test
-logic exists. It falsely reports as "passed".
+Test failures due to production bugs are expected. Mark `[x]` with
+"Known failure:" notes when the test itself is correct but production
+code is broken.
 
-**All E2E tests require the stage3 image.** Build it locally if not
-published: `docker build -f docker/test-stage3.Dockerfile -t ghcr.io/k-forss/remerge/test-stage3:latest .`
+- [ ] **6.1** Build single package — verify binpkg + SHA-256
 
-**Test failures due to production code bugs are expected and desired.**
-The goal is to surface issues. Mark `[x]` and add "Known failure:" notes.
+      **Defect:** `e2e_test.rs::build_single_package` uses `eprintln!`
+      instead of `assert!` for binpkg verification. On timeout or
+      stream close, silently passes. **No assertion can ever fail.**
+      Also submits with `--pretend` via helper (won't produce binpkgs).
 
-- [x] **6.1** Build a single small package (`app-misc/hello` or
-      `app-editors/nano`) — verify binpkg appears in output directory with
-      correct SHA-256
+      **To fix:**
+      1. Submit WITHOUT `--pretend` (don't use `submit_test_workorder`
+         helper which adds `--pretend`).
+      2. Replace all `eprintln!` with assertions.
+      3. On timeout: `panic!("build did not complete in 5 min")`.
+      4. Assert binpkg_dir has files after Finished event.
+      5. Verify SHA-256 from WorkorderResult matches actual file.
 
-      **Audit status:** PARTIAL — `build_single_package` in `e2e_test.rs`
-      only submits the workorder and verifies the ID is assigned and
-      the workorder appears in the list. It does NOT: connect to the
-      WebSocket, wait for `Finished`, check `binpkg_dir` for output
-      file, or verify SHA-256. Essentially a duplicate of Phase 4
-      submission tests under the `e2e` feature flag.
+- [ ] **6.2** Build with `--pretend`/`--ask` flags
 
-      **Implementation notes:**
-      - Start server in-process with test config.
-      - Submit workorder for `app-misc/hello` using `reqwest`.
-      - Connect to WebSocket, wait for `Finished` event (timeout: 10min).
-      - Check `binpkg_dir` for the output `.gpkg.tar` file.
-      - Verify SHA-256 matches the `WorkorderResult`.
-      - Build the stage3 image locally if not published.
-      - Gate behind `#[cfg(feature = "e2e")]`.
-      - If the build pipeline has bugs, the test will fail — that's
-        expected.  Mark `[x]` and add "Known failure:" note.
+      **Defect:** Accepts BOTH 200 and 400 for `--ask`
+      (`assert!(status == 200 || status == 400)` always passes).
+      Does NOT verify `--pretend` was actually passed to emerge.
 
-- [x] **6.2** Build with `--pretend` / `--ask` flags — verify they are
-      correctly filtered or passed
+      **To fix:**
+      1. For `--pretend`: connect WebSocket, verify output contains
+         pretend-mode output without actual compilation.
+      2. For `--ask`: assert ONE specific expected behavior (filtered
+         → 200, or rejected → 400). Not both.
 
-      **Audit status:** PARTIAL — `build_with_pretend_flag` in
-      `e2e_test.rs` submits with `--pretend` and verifies 200 status,
-      but does NOT verify the flag was actually passed through to
-      emerge or that `--ask` is filtered. Only tests API acceptance.
+- [ ] **6.3** Build with custom USE flags — verify `package.use`
 
-      **Implementation notes:**
-      - Check `crates/worker/src/builder.rs` for arg filtering logic.
-      - `--pretend` should be passed through to emerge.
-      - `--ask` should be filtered (non-interactive container).
-      - Submit with `emerge_args: ["--pretend"]`, verify the build
-        completes without actual compilation.
-      - Gate behind `#[cfg(feature = "e2e")]`.
+      **Defect:** Only checks 200 status and non-nil ID. Identical to
+      Phase 4. **Does NOT verify worker's package.use file.**
 
-- [x] **6.3** Build with custom USE flags — verify worker's `package.use`
-      matches client's
+      **To fix:**
+      1. Connect WebSocket, verify emerge output mentions the USE flags.
+      2. Or verify stored workorder config matches submission.
+      3. At minimum, verify the submitted config round-tripped correctly.
 
-      **Audit status:** PARTIAL — `build_with_custom_use_flags` in
-      `e2e_test.rs` submits with custom USE flags and verifies 200
-      status, but does NOT verify the worker's `package.use` file
-      contains the custom flags. Only tests API acceptance.
+- [ ] **6.4** Build with `@world` — verify set expansion
 
-      **Implementation notes:**
-      - Submit with specific `package_use` entries.
-      - Use `--pretend` to avoid long builds.
-      - Verify from build output or container inspection that the USE
-        flags are applied correctly.
-      - Gate behind `#[cfg(feature = "e2e")]`.
+      **Defect:** Only checks 200 status. Identical to Phase 4. **Does
+      NOT verify set expansion occurred.**
 
-- [x] **6.4** Build with `@world` set — verify set expansion and filtering
-      of installed packages
+      **To fix:**
+      1. Verify workorder's atoms were expanded from `@world` to
+         individual packages, OR verify emerge received `@world`.
+      2. Connect WebSocket, verify build events reference world packages.
 
-      **Audit status:** NOT IMPLEMENTED — no test exists. Build
-      stage3 image locally.
+- [ ] **6.5** Cross-arch build — crossdev setup
 
-      **Implementation notes:**
-      - Submit with atom `@world`.
-      - The CLI should expand this by reading the world file and
-        filtering installed packages.
-      - Verify the workorder's atoms list contains the expanded set.
-      - Gate behind `#[cfg(feature = "e2e")]`.
+      **Blocked:** Requires QEMU user-static. Not available locally.
 
-- [ ] **6.5** Cross-architecture build (if CI has multi-arch Docker) — verify
-      crossdev setup and `emerge-<CHOST>` invocation
+- [ ] **6.6** Follower inherits main config
 
-      **Audit status:** NOT IMPLEMENTED — **Blocked:** requires
-      QEMU user-static for multi-arch Docker (not available locally).
+      **Defect:** Accepts BOTH 200 and 409 for follower
+      (`assert!(status == 200 || status == 409)` always passes).
+      Uses same `client_id` for both main and follower (wrong —
+      followers should be different clients). Does NOT verify
+      config inheritance or WebSocket events.
 
-      **Implementation notes:**
-      - Requires QEMU user-static for multi-arch Docker.
-      - Submit with a different CHOST (e.g., `aarch64-unknown-linux-gnu`).
-      - Verify crossdev setup and correct emerge wrapper.
-      - Very complex; defer unless multi-arch CI is available.
-      - Gate behind `#[cfg(feature = "e2e")]`.
+      **To fix:**
+      1. Use DIFFERENT `client_id` for follower.
+      2. Assert follower is accepted (200). If 409, that's a production
+         bug — let the test fail.
+      3. Assert follower's workorder_id matches main's.
+      4. Connect both to WebSocket, verify both receive events.
 
-- [x] **6.6** Follower client — verify follower inherits main's config and
-      shares the workorder
+- [x] **6.7** Concurrent workorder rejection — `concurrent_workorder_rejection`
 
-      **Audit status:** NOT IMPLEMENTED — no E2E test. Build stage3
-      locally. Phase 4 has `follower_without_main_rejected` (API-level)
-      but no test for a follower successfully inheriting config during
-      an active build.
+- [ ] **6.8** Worker binary upgrade detection
 
-      **Implementation notes:**
-      - Submit as `ClientRole::Main`, note workorder ID.
-      - Submit as `ClientRole::Follower` with matching system ID.
-      - Verify follower is accepted and gets the same workorder.
-      - Connect both to WebSocket, verify both receive events.
-      - Gate behind `#[cfg(feature = "e2e")]`.
+      **Defect:** `e2e_test.rs::worker_binary_upgrade_detection` calls
+      `image_needs_rebuild` on a nonexistent image tag. Both managers
+      return `true` (trivially — image doesn't exist). **Does NOT build
+      image with binary A then check with binary B.** Depends on 5.3.
 
-- [x] **6.7** Concurrent workorder rejection — submit while another is active,
-      verify 409
+      **To fix:**
+      1. Build image with binary A (depends on 5.3).
+      2. `image_needs_rebuild` with manager_a → assert `false`.
+      3. `image_needs_rebuild` with manager_b → assert `true`.
+      4. This verifies SHA-256 label comparison end-to-end.
 
-      **Implementation notes:**
-      - Already covered at API level by task 4.3.
-      - E2E variant submits during an active Docker build.
-      - Gate behind `#[cfg(feature = "e2e")]`.
+- [x] **6.9** Cancellation flow — `cancellation_flow`
 
-- [x] **6.8** Worker binary upgrade detection — change the binary, submit
-      again, verify image rebuild
+- [ ] **6.10** WebSocket reconnect — streaming continues
 
-      **Audit status:** NOT IMPLEMENTED — no test exists. Depends on
-      5.3 (implement after 5.3).
+      **Defect:** Only asserts `reconnect.is_ok()`. On error, accepts
+      404/410/101 (always passes). **Does NOT verify events continue
+      after reconnect.**
 
-      **Implementation notes:**
-      - Build once with binary A.
-      - Swap to binary B, submit again.
-      - Verify a new Docker image is built (check image ID or label).
-      - Gate behind `#[cfg(feature = "e2e")]`.
-
-- [x] **6.9** Cancellation — submit, cancel via API, verify container is
-      stopped and removed
-
-      **Implementation notes:**
-      - Submit workorder, wait for `Building` status via WebSocket.
-      - Cancel via `DELETE /api/v1/workorders/:id`.
-      - Verify container is stopped and removed (check Docker).
-      - Verify workorder status is `Cancelled`.
-      - Gate behind `#[cfg(feature = "e2e")]`.
-
-- [x] **6.10** Resume / reconnect — disconnect WebSocket, reconnect, verify
-      progress streaming continues
-
-      **Audit status:** NOT IMPLEMENTED — no test exists. Build stage3
-      locally and run with Docker.
-
-      **Implementation notes:**
-      - Connect to WebSocket, receive some events.
-      - Drop the connection.
-      - Reconnect to the same workorder's WebSocket URL.
-      - Verify events continue (broadcast channel replays or continues).
-      - Gate behind `#[cfg(feature = "e2e")]`.
+      **To fix:**
+      1. Connect, receive at least one event.
+      2. Drop connection.
+      3. Reconnect.
+      4. Cancel workorder to generate a StatusChanged event.
+      5. Assert at least one event is received after reconnect.
 
 ---
 
 ## Phase 7 — Error Paths & Edge Cases
 
-- [ ] **7.1** Worker container exits non-zero — verify `Failed` status and
-      error propagation
+- [ ] **7.1** Worker exits non-zero → `Failed` status
 
-      **Audit status:** WEAK ASSERTION — `worker_exit_nonzero_sets_failed_status`
-      in `error_test.rs` allows `Failed | Running | Pending` in the
-      assertion, meaning the test passes even if the worker never runs
-      or never fails. The assertion must be tightened to require
-      `WorkorderStatus::Failed { .. }` only.
-      Build stage3 locally. Gate behind `#[cfg(feature = "e2e")]`.
+      **Defect:** `error_test.rs::worker_exit_nonzero_sets_failed_status`
+      allows `Failed | Running | Pending` in assertion — always passes.
+      Polls only 10 seconds (too short).
 
-      **Implementation notes:**
-      - Submit a workorder with an atom that will fail (e.g., nonexistent
-        package like `dev-null/does-not-exist`).
-      - Wait for completion via WebSocket.
-      - Verify `WorkorderStatus::Failed { reason }`.
-      - Build stage3 image locally if not published.
-      - Gate behind `#[cfg(feature = "e2e")]`.
-      - If the failure propagation path has bugs, document them.
+      **To fix:**
+      1. Assert `WorkorderStatus::Failed { .. }` ONLY.
+      2. Increase timeout to 120s.
+      3. Submit nonexistent package.
+      4. Gate behind `#[cfg(feature = "e2e")]`.
 
-- [ ] **7.2** Missing dependency — verify structured event
-      `missing_dependencies` is emitted
+- [ ] **7.2** Missing dependency → `missing_dependencies` event
 
-      **Audit status:** NOT IMPLEMENTED — no test exists. Build stage3
-      locally.
+      **Not implemented.** No test exists.
+      Gate behind `#[cfg(feature = "e2e")]`. Build stage3 locally.
 
-      **Implementation notes:**
-      - Trigger by masking a required dependency.
-      - Verify WebSocket receives appropriate `BuildEvent`.
-      - Build stage3 locally. Gate behind `#[cfg(feature = "e2e")]`.
-      - May fail if event parsing has bugs — document them.
+- [ ] **7.3** USE conflict → `use_conflicts` event
 
-- [ ] **7.3** USE conflict — verify structured event `use_conflicts` is
-      emitted
+      **Not implemented.** No test exists.
+      Gate behind `#[cfg(feature = "e2e")]`. Build stage3 locally.
 
-      **Audit status:** NOT IMPLEMENTED — no test exists. Build stage3
-      locally.
+- [ ] **7.4** Fetch failure → `fetch_failures` event
 
-      **Implementation notes:**
-      - Configure conflicting USE flags on a package's dependencies.
-      - Verify WebSocket receives USE conflict event.
-      - Build stage3 locally. Gate behind `#[cfg(feature = "e2e")]`.
-      - May fail if event parsing has bugs — document them.
+      **Not implemented.** No test exists.
+      Gate behind `#[cfg(feature = "e2e")]`. Build stage3 locally.
 
-- [ ] **7.4** Fetch failure — verify structured event `fetch_failures` is
-      emitted
+- [x] **7.5** Docker socket unavailable — `docker_socket_unavailable_returns_error`
+- [ ] **7.6** Server config validation errors
 
-      **Audit status:** NOT IMPLEMENTED — no test exists. Build stage3
-      locally.
+      **Defect:** Auth tests ✅. AppState binpkg/state dir tests ✅
+      (behind `#[cfg(feature = "integration")]`). TLS tests ❌ — just
+      call `tokio::fs::read("/nonexistent/cert.pem")` directly, testing
+      Tokio not remerge.
 
-      **Implementation notes:**
-      - Block network in container or use package with broken SRC_URI.
-      - Verify fetch failure event on WebSocket.
-      - Build stage3 locally. Gate behind `#[cfg(feature = "e2e")]`.
-      - May fail if event parsing has bugs — document them.
+      **To fix:**
+      1. TLS tests must go through server startup or the actual TLS
+         config validation path in `crates/server/src/main.rs`.
+      2. Check how TLS is set up. If validation is at bind time, start
+         server with bad cert paths and assert the error.
+      3. Keep existing auth and AppState tests — they're correct.
 
-- [x] **7.5** Docker socket unavailable — verify graceful error
+- [x] **7.7** Workorder TTL eviction — `workorder_ttl_eviction`
 
-      **Implementation notes:**
-      - Set `docker_socket` to `/nonexistent/docker.sock`.
-      - Call `AppState::new()` or `DockerManager::new()`.
-      - Verify a clear error is returned, not a panic.
-      - Does NOT require Docker — tests the error path.
-      - No feature gate needed; add to `error_test.rs`.
+      Back-dates `updated_at`, calls `evict_workorders()`, asserts eviction
+      count > 0, verifies GET returns 404. Properly implemented.
 
-- [x] **7.6** Server config validation — missing `binpkg_dir`, invalid
-      `auth` section, missing TLS cert
+- [x] **7.8** Max retained workorders cap — `max_retained_workorders_enforced`
 
-      **Audit status:** PARTIAL — only auth validation is properly
-      tested (`auth_config_mtls_empty_clients` and
-      `auth_mtls_resolve_without_cert_rejects` in `error_test.rs`).
-      The `non_writable_binpkg_dir_fails` and `non_writable_state_dir_fails`
-      tests call `tokio::fs::create_dir_all` directly — they do NOT
-      test through `AppState::new()` or `ServerConfig` validation.
-      TLS validation (missing cert/key files) is NOT tested at all.
+      Sets cap=2, submits 3, calls `evict_workorders()`, asserts ≤ 2
+      remain. Properly implemented.
 
-      **What’s still needed:**
-      1. Test `AppState::new()` with non-writable `binpkg_dir` — assert
-         it returns an error (may need Docker or refactoring to test
-         dir creation independently of DockerManager).
-      2. Test `AppState::new()` with non-writable `state_dir`.
-      3. Test TLS config with nonexistent cert/key file paths.
-      4. Keep existing auth tests (they’re correct).
-
-      **Implementation notes:**
-      - These tests do NOT require Docker — they test config validation
-        before `AppState::new()` reaches `DockerManager`.
-      - Sub-tests to implement in `tests/error_test.rs`:
-
-        1. **`auth.mode = Mtls` without cert paths:** Create a
-           `ServerConfig` with `auth.mode = AuthMode::Mtls` but no
-           `auth.ca_cert` / `auth.server_cert` paths.  Call
-           `AppState::new()` or the auth validation path.  Assert an
-           error is returned.
-           - Check `crates/server/src/auth.rs` for `CertRegistry::new()`
-             to see if it validates cert paths.  If it doesn't validate
-             eagerly, the test should verify what happens when a
-             connection is attempted.
-
-        2. **Non-writable `binpkg_dir`:** Set `binpkg_dir` to a path
-           like `/proc/nonexistent` (non-creatable).  Call
-           `AppState::new()`.  The `create_dir_all` in state.rs:74
-           should fail.  Assert error.
-
-        3. **Invalid TLS config:** Set TLS cert paths to non-existent
-           files.  Check if the server validates at startup.
-           - If TLS validation is lazy (checked on bind), this may
-             require starting the server and verifying the error.
-
-        4. **`state_dir` non-writable:** Set `state_dir` to a
-           non-creatable path.  Assert `AppState::new()` errors.
-
-      - Some sub-tests may need Docker for `AppState::new()` to reach
-        the validation point.  If `DockerManager::new()` fails first,
-        test the validation functions directly instead.
-
-- [x] **7.7** Workorder TTL expiry — verify `reap_old_workorders` removes
-      stale entries
-
-      **Audit status:** NOT IMPLEMENTED — `workorder_ttl_eviction` in
-      `server_api_test.rs` submits and cancels a workorder, then only
-      checks it’s still visible. The test explicitly notes: "Actually
-      triggering TTL-based eviction would require manipulating
-      timestamps." Eviction is never triggered or verified.
-
-      **Implementation notes:**
-      - Search for `reap_old_workorders` or equivalent in server code.
-      - If it's a background task in `main.rs`, may need to extract
-        the reaping logic into a testable function.
-      - Set `retention_hours = 0` or very small, submit and complete
-        a workorder, trigger reaping, verify removal.
-      - Requires Docker for AppState.
-
-- [x] **7.8** Max retained workorders — verify cap is enforced
-
-      **Audit status:** NOT IMPLEMENTED —
-      `max_retained_workorders_enforced` in `server_api_test.rs` sets
-      `max_retained_workorders = 2`, submits 3 workorders, then asserts
-      `list.workorders.len() == 3` — this proves the cap is NOT
-      enforced (the opposite of the task). Eviction is never triggered.
-      Must call `state.evict_workorders()` or similar to trigger the
-      cap, then assert `<= 2` workorders remain.
-
-      **Implementation notes:**
-      - Set `max_retained_workorders = 2`.
-      - Submit and complete 3+ workorders (different client IDs).
-      - List workorders, verify at most 2 completed ones remain.
-      - Requires Docker for AppState.
-
-- [x] **7.9** Path traversal in `profile_overlay` keys — verify rejection
-- [x] **7.10** Path traversal in `patches` keys — verify rejection
-- [x] **7.11** Shell injection in atom names — verify rejection
-- [x] **7.12** Oversized workorder — verify graceful handling
-
-      **Implementation notes:**
-      - Submit a workorder with a very large body (e.g., 10MB JSON).
-      - Verify the server rejects or handles it without OOM/crash.
-      - Check if axum has `DefaultBodyLimit` configured.
-      - If no limit exists, consider adding one and testing it.
-      - Requires Docker for AppState.
-
-- [x] **7.13** Deserialization error paths — empty JSON, invalid JSON,
-      wrong type, missing required fields
-- [x] **7.14** Validation edge cases — null bytes, newlines, whitespace-only
+- [x] **7.9** Profile overlay path traversal — `profile_overlay_path_traversal_rejected`
+- [x] **7.10** Patches path traversal — `patches_path_traversal_rejected`
+- [x] **7.11** Shell injection — `shell_injection_in_atoms_rejected`
+- [x] **7.12** Oversized workorder — `oversized_workorder_rejected`
+- [x] **7.13** Deserialization errors — 4 tests
+- [x] **7.14** Validation edge cases — null bytes, newlines
 
 ---
 
 ## Phase 8 — CI & Regression
 
-- [x] **8.1** Add integration test job to CI with Docker
+- [x] **8.1** Integration test job — `ci.yml::integration-test`
+- [ ] **8.2** Cache stage3 image in CI
 
-      **Implementation notes:**
-      Add to `.github/workflows/ci.yml`:
-      ```yaml
-      integration-test:
-        name: Integration Tests
-        runs-on: ubuntu-latest
-        steps:
-          - uses: actions/checkout@v4
-          - uses: dtolnay/rust-toolchain@stable
-          - uses: Swatinem/rust-cache@v2
-          - name: Run integration tests
-            run: cargo test --workspace --features integration
-      ```
-      Docker is pre-installed on ubuntu-latest runners.
+      **Not implemented.** No buildx/layer caching. `e2e-test` job does
+      `docker pull ... || true` but no caching setup.
 
-- [ ] **8.2** Cache Gentoo stage3 image in CI to speed up E2E tests
+- [x] **8.3** Smoke test target — `ci.yml::smoke-test` runs Phases 1-3 on PRs
+- [x] **8.4** Full integration target — `ci.yml::e2e-test`
 
-      **Audit status:** NOT IMPLEMENTED — no CI step pulls or caches
-      the GHCR test image. Write the workflow now; it will work once
-      the image is published to GHCR.
+      Triggers on push to main only, 30-min timeout, pulls GHCR image,
+      runs `--features integration,e2e`. Properly implemented.
 
-      **Implementation notes:**
-      - Use the GHCR test image from task 0.6.
-      - Pull `ghcr.io/<owner>/remerge-test-stage3:latest` in CI.
-      - Use `docker/setup-buildx-action` for layer caching.
+- [ ] **8.5** Test duration tracking with nextest
 
-- [x] **8.3** Add a "smoke test" target that runs the fastest subset
-      (Phases 1–3) on every PR
-
-      **Implementation notes:**
-      Phases 1–3 (minus portageq-dependent tests) run without Docker
-      in ~1 second. Already covered by `cargo test --workspace` but
-      consider making explicit for tracking.
-
-- [x] **8.4** Add a "full integration" target that runs Phases 4–7 on merge
-      to `main`
-
-      **Audit status:** PARTIAL — the `integration-test` job runs on
-      push+PR (not main-only as specified) and only uses
-      `--features integration` (missing `e2e`). Does not pull the
-      GHCR test image, does not set a 30-minute timeout.
-
-      **What’s needed:**
-      1. Add a separate `e2e-test` job triggered only on `push` to
-         `main` (or `workflow_dispatch`).
-      2. Pull `ghcr.io/k-forss/remerge/test-stage3:latest` before
-         running tests.
-      3. Run `cargo test --workspace --features integration,e2e`.
-      4. Set `timeout-minutes: 30`.
-
-      **Implementation notes:**
-      - Trigger on `push` to `main` only.
-      - Run `cargo test --workspace --features integration,e2e`.
-      - Pull GHCR test image first.
-      - Set timeout to 30 minutes for E2E tests.
-
-- [ ] **8.5** Record and track test durations to catch regressions
-
-      **Audit status:** NOT IMPLEMENTED — no nextest setup yet.
-
-      **Implementation notes:**
-      - Use `cargo nextest` for structured output with durations.
-      - Store results as CI artifacts.
-      - Alert on tests exceeding 2x baseline duration.
+      **Not implemented.** No nextest setup.
