@@ -9,19 +9,6 @@ mod common;
 mod docker_tests {
     use super::common;
 
-    /// Verify Docker availability check works.
-    #[test]
-    fn docker_availability_check() {
-        let available = common::server::docker_available();
-        if !available {
-            eprintln!(
-                "Docker is not available. Phase 5 tests will be skipped. \
-                 Install and start Docker to run these tests."
-            );
-        }
-        // This test always passes — it just reports Docker status.
-    }
-
     /// DockerManager can connect to local Docker socket.
     #[tokio::test]
     async fn docker_manager_connects() {

@@ -5,7 +5,577 @@
 
 mod common;
 
+use remerge_types::portage::*;
 use remerge_worker::portage_setup;
+
+// ── write_make_conf ─────────────────────────────────────────────────
+
+/// Full golden-path test: write a make.conf with every field populated
+/// and verify each expected line is present.
+#[tokio::test]
+async fn write_make_conf_golden_path() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    let config = common::fixtures::full_portage_config();
+    portage_setup::write_make_conf_inner(&base, &config, "x86_64-pc-linux-gnu", None, None)
+        .await
+        .expect("write_make_conf_inner");
+
+    let content = std::fs::read_to_string(base.join("make.conf")).unwrap();
+    assert!(
+        content.contains("CHOST=\"x86_64-pc-linux-gnu\""),
+        "must have CHOST"
+    );
+    assert!(content.contains("CFLAGS=\""), "must have CFLAGS");
+    assert!(content.contains("CXXFLAGS=\""), "must have CXXFLAGS");
+    assert!(content.contains("LDFLAGS=\""), "must have LDFLAGS");
+    assert!(content.contains("MAKEOPTS=\""), "must have MAKEOPTS");
+    assert!(content.contains("USE=\""), "must have USE");
+    assert!(
+        content.contains("ACCEPT_LICENSE=\""),
+        "must have ACCEPT_LICENSE"
+    );
+    assert!(
+        content.contains("ACCEPT_KEYWORDS=\""),
+        "must have ACCEPT_KEYWORDS"
+    );
+    assert!(content.contains("FEATURES=\""), "must have FEATURES");
+    assert!(
+        content.contains("EMERGE_DEFAULT_OPTS=\""),
+        "must have EMERGE_DEFAULT_OPTS"
+    );
+    assert!(content.contains("CPU_FLAGS_X86=\""), "must have CPU_FLAGS");
+    assert!(
+        content.contains("VIDEO_CARDS=\""),
+        "must have USE_EXPAND VIDEO_CARDS"
+    );
+    assert!(
+        content.contains("INPUT_DEVICES=\""),
+        "must have USE_EXPAND INPUT_DEVICES"
+    );
+    assert!(content.contains("GENTOO_MIRRORS=\""), "must have extra var");
+    assert!(
+        content.contains("PKGDIR=\"/var/cache/binpkgs\""),
+        "must have PKGDIR"
+    );
+}
+
+/// use_flags_resolved = true → USE line must start with `-*`.
+#[tokio::test]
+async fn write_make_conf_use_flags_resolved() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    let mut config = common::fixtures::minimal_portage_config();
+    config.make_conf.use_flags = vec!["X".into(), "wayland".into()];
+    config.make_conf.use_flags_resolved = true;
+
+    portage_setup::write_make_conf_inner(&base, &config, "x86_64-pc-linux-gnu", None, None)
+        .await
+        .expect("write_make_conf_inner");
+
+    let content = std::fs::read_to_string(base.join("make.conf")).unwrap();
+    assert!(
+        content.contains("USE=\"-* X wayland\""),
+        "resolved USE flags must start with -*, got:\n{content}"
+    );
+}
+
+/// use_flags_resolved = false → USE line must NOT have `-*` prefix.
+#[tokio::test]
+async fn write_make_conf_use_flags_unresolved() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    let mut config = common::fixtures::minimal_portage_config();
+    config.make_conf.use_flags = vec!["X".into(), "wayland".into()];
+    config.make_conf.use_flags_resolved = false;
+
+    portage_setup::write_make_conf_inner(&base, &config, "x86_64-pc-linux-gnu", None, None)
+        .await
+        .expect("write_make_conf_inner");
+
+    let content = std::fs::read_to_string(base.join("make.conf")).unwrap();
+    assert!(
+        content.contains("USE=\"X wayland\""),
+        "unresolved USE flags must not have -* prefix"
+    );
+    // Verify that the USE line itself doesn't have the -* prefix
+    // (other lines like ACCEPT_LICENSE may legitimately contain -*)
+    for line in content.lines() {
+        if line.starts_with("USE=") {
+            assert!(
+                !line.contains("-*"),
+                "USE line must not contain -* when unresolved, got: {line}"
+            );
+        }
+    }
+}
+
+/// USE_EXPAND flags appear as separate variables, not inside USE.
+#[tokio::test]
+async fn write_make_conf_use_expand() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    let mut config = common::fixtures::minimal_portage_config();
+    config
+        .make_conf
+        .use_expand
+        .insert("VIDEO_CARDS".into(), vec!["intel".into()]);
+    config
+        .make_conf
+        .use_expand
+        .insert("INPUT_DEVICES".into(), vec!["libinput".into()]);
+
+    portage_setup::write_make_conf_inner(&base, &config, "x86_64-pc-linux-gnu", None, None)
+        .await
+        .expect("write_make_conf_inner");
+
+    let content = std::fs::read_to_string(base.join("make.conf")).unwrap();
+    assert!(
+        content.contains("INPUT_DEVICES=\"libinput\""),
+        "must have INPUT_DEVICES as separate line"
+    );
+    assert!(
+        content.contains("VIDEO_CARDS=\"intel\""),
+        "must have VIDEO_CARDS as separate line"
+    );
+}
+
+/// Cross-compilation sets CBUILD when worker arch differs from target.
+#[tokio::test]
+async fn write_make_conf_cross_compile() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    let mut config = common::fixtures::minimal_portage_config();
+    config.make_conf.chost = "aarch64-unknown-linux-gnu".into();
+
+    portage_setup::write_make_conf_inner(&base, &config, "x86_64-pc-linux-gnu", None, None)
+        .await
+        .expect("write_make_conf_inner");
+
+    let content = std::fs::read_to_string(base.join("make.conf")).unwrap();
+    assert!(
+        content.contains("CHOST=\"aarch64-unknown-linux-gnu\""),
+        "must have target CHOST"
+    );
+    assert!(
+        content.contains("CBUILD=\"x86_64-pc-linux-gnu\""),
+        "must have CBUILD for cross-compilation"
+    );
+}
+
+/// GPG signing config adds signing-related FEATURES and variables.
+#[tokio::test]
+async fn write_make_conf_gpg_signing() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    let config = common::fixtures::minimal_portage_config();
+    portage_setup::write_make_conf_inner(
+        &base,
+        &config,
+        "x86_64-pc-linux-gnu",
+        Some("0xABCD1234"),
+        Some("/var/gnupg"),
+    )
+    .await
+    .expect("write_make_conf_inner");
+
+    let content = std::fs::read_to_string(base.join("make.conf")).unwrap();
+    assert!(
+        content.contains("BINPKG_FORMAT=\"gpkg\""),
+        "must have BINPKG_FORMAT"
+    );
+    assert!(
+        content.contains("BINPKG_GPG_SIGNING_KEY=\"0xABCD1234\""),
+        "must have signing key"
+    );
+    assert!(
+        content.contains("BINPKG_GPG_SIGNING_GPG_HOME=\"/var/gnupg\""),
+        "must have GPG home"
+    );
+    assert!(
+        content.contains("binpkg-signing"),
+        "FEATURES must include binpkg-signing"
+    );
+}
+
+/// ccache and distcc FEATURES are stripped.
+#[tokio::test]
+async fn write_make_conf_strips_ccache_distcc() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    let mut config = common::fixtures::minimal_portage_config();
+    config.make_conf.features = vec![
+        "buildpkg".into(),
+        "ccache".into(),
+        "distcc".into(),
+        "noclean".into(),
+    ];
+
+    portage_setup::write_make_conf_inner(&base, &config, "x86_64-pc-linux-gnu", None, None)
+        .await
+        .expect("write_make_conf_inner");
+
+    let content = std::fs::read_to_string(base.join("make.conf")).unwrap();
+    assert!(!content.contains("ccache"), "ccache should be stripped");
+    assert!(!content.contains("distcc"), "distcc should be stripped");
+    assert!(content.contains("buildpkg"), "buildpkg should remain");
+    assert!(content.contains("noclean"), "noclean should remain");
+}
+
+/// Empty features list gets defaults (buildpkg + noclean).
+#[tokio::test]
+async fn write_make_conf_empty_features_defaults() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    let mut config = common::fixtures::minimal_portage_config();
+    config.make_conf.features = vec![];
+
+    portage_setup::write_make_conf_inner(&base, &config, "x86_64-pc-linux-gnu", None, None)
+        .await
+        .expect("write_make_conf_inner");
+
+    let content = std::fs::read_to_string(base.join("make.conf")).unwrap();
+    assert!(content.contains("buildpkg"), "must have buildpkg default");
+    assert!(content.contains("noclean"), "must have noclean default");
+}
+
+// ── write_package_use ───────────────────────────────────────────────
+
+/// Write package.use entries and verify content.
+#[tokio::test]
+async fn write_package_use_creates_file() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    let config = common::fixtures::full_portage_config();
+    portage_setup::write_package_use_inner(&base, &config)
+        .await
+        .expect("write_package_use_inner");
+
+    let content = std::fs::read_to_string(base.join("package.use/remerge")).unwrap();
+    assert!(
+        content.contains("dev-libs/openssl -bindist"),
+        "must have openssl entry"
+    );
+    assert!(
+        content.contains("sys-apps/systemd cryptsetup"),
+        "must have systemd entry"
+    );
+}
+
+/// Empty package_use is a no-op (no file created).
+#[tokio::test]
+async fn write_package_use_empty_noop() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    let config = common::fixtures::minimal_portage_config();
+    portage_setup::write_package_use_inner(&base, &config)
+        .await
+        .expect("empty should succeed");
+
+    assert!(
+        !base.join("package.use/remerge").exists(),
+        "no file for empty config"
+    );
+}
+
+// ── write_package_accept_keywords ───────────────────────────────────
+
+/// Write package.accept_keywords entries and verify content.
+#[tokio::test]
+async fn write_package_accept_keywords_creates_file() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    let config = common::fixtures::full_portage_config();
+    portage_setup::write_package_accept_keywords_inner(&base, &config)
+        .await
+        .expect("write_package_accept_keywords_inner");
+
+    let content = std::fs::read_to_string(base.join("package.accept_keywords/remerge")).unwrap();
+    assert!(
+        content.contains("sys-kernel/gentoo-sources ~amd64"),
+        "must have keywords entry"
+    );
+}
+
+/// Empty package_accept_keywords is a no-op.
+#[tokio::test]
+async fn write_package_accept_keywords_empty_noop() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    let config = common::fixtures::minimal_portage_config();
+    portage_setup::write_package_accept_keywords_inner(&base, &config)
+        .await
+        .expect("empty should succeed");
+
+    assert!(!base.join("package.accept_keywords/remerge").exists());
+}
+
+// ── write_package_license ───────────────────────────────────────────
+
+/// Write package.license entries and verify content.
+#[tokio::test]
+async fn write_package_license_creates_file() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    let config = common::fixtures::full_portage_config();
+    portage_setup::write_package_license_inner(&base, &config)
+        .await
+        .expect("write_package_license_inner");
+
+    let content = std::fs::read_to_string(base.join("package.license/remerge")).unwrap();
+    assert!(
+        content.contains("sys-kernel/linux-firmware linux-fw-redistributable"),
+        "must have license entry"
+    );
+}
+
+// ── write_package_mask ──────────────────────────────────────────────
+
+/// Write package.mask entries and verify content.
+#[tokio::test]
+async fn write_package_mask_creates_file() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    let config = common::fixtures::full_portage_config();
+    portage_setup::write_package_mask_inner(&base, &config)
+        .await
+        .expect("write_package_mask_inner");
+
+    let content = std::fs::read_to_string(base.join("package.mask/remerge")).unwrap();
+    assert!(
+        content.contains(">=dev-libs/foo-2.0"),
+        "must have mask entry"
+    );
+}
+
+// ── write_package_unmask ────────────────────────────────────────────
+
+/// Write package.unmask entries and verify content.
+#[tokio::test]
+async fn write_package_unmask_creates_file() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    let config = common::fixtures::full_portage_config();
+    portage_setup::write_package_unmask_inner(&base, &config)
+        .await
+        .expect("write_package_unmask_inner");
+
+    let content = std::fs::read_to_string(base.join("package.unmask/remerge")).unwrap();
+    assert!(
+        content.contains("=dev-libs/bar-1.5"),
+        "must have unmask entry"
+    );
+}
+
+// ── write_package_env ───────────────────────────────────────────────
+
+/// Write package.env entries and verify content.
+#[tokio::test]
+async fn write_package_env_creates_file() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    let config = common::fixtures::full_portage_config();
+    portage_setup::write_package_env_inner(&base, &config)
+        .await
+        .expect("write_package_env_inner");
+
+    let content = std::fs::read_to_string(base.join("package.env/remerge")).unwrap();
+    assert!(
+        content.contains("dev-qt/qtwebengine no-lto.conf"),
+        "must have env entry"
+    );
+}
+
+/// Invalid env_file entries are filtered out.
+#[tokio::test]
+async fn write_package_env_filters_invalid() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    let mut config = common::fixtures::minimal_portage_config();
+    config.package_env = vec![
+        PackageEnvEntry {
+            atom: "dev-libs/valid".into(),
+            env_file: "valid.conf".into(),
+        },
+        PackageEnvEntry {
+            atom: "dev-libs/bad-slash".into(),
+            env_file: "../escape.conf".into(),
+        },
+        PackageEnvEntry {
+            atom: "dev-libs/bad-empty".into(),
+            env_file: "".into(),
+        },
+    ];
+
+    portage_setup::write_package_env_inner(&base, &config)
+        .await
+        .expect("write_package_env_inner");
+
+    let content = std::fs::read_to_string(base.join("package.env/remerge")).unwrap();
+    assert!(
+        content.contains("dev-libs/valid valid.conf"),
+        "valid entry present"
+    );
+    assert!(!content.contains("escape"), "invalid entry filtered");
+    assert!(!content.contains("bad-empty"), "empty env_file filtered");
+}
+
+// ── write_env_files ─────────────────────────────────────────────────
+
+/// Write env files and verify content.
+#[tokio::test]
+async fn write_env_files_creates_files() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    let config = common::fixtures::full_portage_config();
+    portage_setup::write_env_files_inner(&base, &config)
+        .await
+        .expect("write_env_files_inner");
+
+    let content = std::fs::read_to_string(base.join("env/no-lto.conf")).unwrap();
+    assert!(content.contains("-fno-lto"), "must have env file content");
+}
+
+/// Invalid env filenames are skipped.
+#[tokio::test]
+async fn write_env_files_skips_invalid() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    let mut config = common::fixtures::minimal_portage_config();
+    config
+        .env_files
+        .insert("valid.conf".into(), "content".into());
+    config
+        .env_files
+        .insert("../escape.conf".into(), "evil".into());
+    config
+        .env_files
+        .insert("sub/dir.conf".into(), "evil".into());
+    config.env_files.insert("".into(), "evil".into());
+
+    portage_setup::write_env_files_inner(&base, &config)
+        .await
+        .expect("write_env_files_inner");
+
+    assert!(
+        base.join("env/valid.conf").exists(),
+        "valid file should exist"
+    );
+    assert!(
+        !base.join("env/../escape.conf").exists(),
+        "traversal should be skipped"
+    );
+    assert!(
+        !tmp.path().join("escape.conf").exists(),
+        "traversal should not escape"
+    );
+}
+
+// ── write_repos_conf ────────────────────────────────────────────────
+
+/// Write repos.conf files and verify content.
+#[tokio::test]
+async fn write_repos_conf_creates_files() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    let config = common::fixtures::full_portage_config();
+    portage_setup::write_repos_conf_inner(&base, &config)
+        .await
+        .expect("write_repos_conf_inner");
+
+    let content = std::fs::read_to_string(base.join("repos.conf/gentoo.conf")).unwrap();
+    assert!(content.contains("[gentoo]"), "must have gentoo section");
+    assert!(
+        content.contains("location = /var/db/repos/gentoo"),
+        "must have location"
+    );
+}
+
+/// Empty repos_conf is a no-op (no directory created).
+#[tokio::test]
+async fn write_repos_conf_empty_noop() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    let config = common::fixtures::minimal_portage_config();
+    portage_setup::write_repos_conf_inner(&base, &config)
+        .await
+        .expect("empty should succeed");
+
+    assert!(!base.join("repos.conf").exists(), "no dir for empty config");
+}
+
+/// Invalid repos.conf filenames are skipped.
+#[tokio::test]
+async fn write_repos_conf_skips_invalid_filenames() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    let mut config = common::fixtures::minimal_portage_config();
+    config
+        .repos_conf
+        .insert("valid.conf".into(), "[test]\nlocation = /tmp\n".into());
+    config
+        .repos_conf
+        .insert("../escape.conf".into(), "[evil]\nlocation = /tmp\n".into());
+
+    portage_setup::write_repos_conf_inner(&base, &config)
+        .await
+        .expect("write_repos_conf_inner");
+
+    assert!(
+        base.join("repos.conf/valid.conf").exists(),
+        "valid file created"
+    );
+    assert!(
+        !tmp.path().join("escape.conf").exists(),
+        "traversal skipped"
+    );
+}
+
+/// Multiple repos.conf files are all written.
+#[tokio::test]
+async fn write_repos_conf_multiple_files() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    let mut config = common::fixtures::minimal_portage_config();
+    config.repos_conf.insert(
+        "gentoo.conf".into(),
+        "[gentoo]\nlocation = /var/db/repos/gentoo\n".into(),
+    );
+    config.repos_conf.insert(
+        "custom.conf".into(),
+        "[custom]\nlocation = /var/db/repos/custom\n".into(),
+    );
+
+    portage_setup::write_repos_conf_inner(&base, &config)
+        .await
+        .expect("write_repos_conf_inner");
+
+    assert!(base.join("repos.conf/gentoo.conf").exists());
+    assert!(base.join("repos.conf/custom.conf").exists());
+}
 
 // ── write_profile_overlay ───────────────────────────────────────────
 

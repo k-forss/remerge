@@ -361,3 +361,50 @@ fn fixture_vdb_tree() {
     assert!(root.join("var/db/pkg/dev-libs/openssl-3.1.0").is_dir());
     assert!(root.join("var/db/pkg/sys-apps/systemd-254").is_dir());
 }
+
+// ── expand_set ──────────────────────────────────────────────────────
+
+/// @world expansion reads the world file — no portageq needed.
+#[test]
+fn expand_set_world() {
+    let (_tmp, root) = common::fixtures::portage_tree();
+    // Safety: tests run with --test-threads=1 or in separate processes,
+    // but we still need unsafe for set_var in edition 2024.
+    unsafe {
+        std::env::set_var("ROOT", root.to_str().unwrap());
+    }
+    let reader = portage::PortageReader::new().unwrap();
+    let atoms = reader.expand_set("@world");
+    assert!(!atoms.is_empty(), "world set should expand");
+    // The portage_tree fixture writes dev-libs/openssl, sys-apps/systemd, app-misc/screen
+    assert!(
+        atoms.contains(&"dev-libs/openssl".to_string()),
+        "world should contain dev-libs/openssl, got: {atoms:?}"
+    );
+    assert!(
+        atoms.contains(&"sys-apps/systemd".to_string()),
+        "world should contain sys-apps/systemd"
+    );
+    unsafe {
+        std::env::remove_var("ROOT");
+    }
+}
+
+/// Unknown set names are passed through unchanged.
+#[test]
+fn expand_set_unknown_passthrough() {
+    let (_tmp, root) = common::fixtures::portage_tree();
+    unsafe {
+        std::env::set_var("ROOT", root.to_str().unwrap());
+    }
+    let reader = portage::PortageReader::new().unwrap();
+    let atoms = reader.expand_set("@custom-set");
+    assert_eq!(
+        atoms,
+        vec!["@custom-set"],
+        "unknown set should pass through"
+    );
+    unsafe {
+        std::env::remove_var("ROOT");
+    }
+}

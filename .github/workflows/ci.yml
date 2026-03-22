@@ -45,3 +45,17 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace
+
+  integration-test:
+    name: Integration Test
+    runs-on: ubuntu-latest
+    needs: [check, test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run integration tests
+        run: cargo test --workspace --features integration

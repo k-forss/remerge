@@ -1,13 +1,27 @@
 //! Phase 4 — Server API tests (in-process HTTP).
 //!
 //! Tests the axum HTTP API. Requires Docker to be available.
-//! Tests skip gracefully when Docker is not present.
+//! Tests are gated behind the `integration` feature flag to prevent
+//! silent skipping in default CI. When run without Docker, each test
+//! skips with an explicit message.
 
 mod common;
 
+#[cfg(feature = "integration")]
 use remerge_types::api::*;
 
+/// Sentinel: Docker must be available when running integration tests.
+#[cfg(feature = "integration")]
+#[test]
+fn docker_must_be_available_for_integration() {
+    assert!(
+        common::server::docker_available(),
+        "Docker is required for integration tests but was not found"
+    );
+}
+
 /// Helper to skip tests when Docker is not available.
+#[cfg(feature = "integration")]
 fn require_docker() -> bool {
     if !common::server::docker_available() {
         eprintln!("Docker not available — skipping server API test");
@@ -18,6 +32,7 @@ fn require_docker() -> bool {
 }
 
 /// GET /api/v1/health returns 200 with status "ok".
+#[cfg(feature = "integration")]
 #[tokio::test]
 async fn health_endpoint() {
     if !require_docker() {
@@ -38,6 +53,7 @@ async fn health_endpoint() {
 }
 
 /// GET /api/v1/info returns server info with version and auth_mode.
+#[cfg(feature = "integration")]
 #[tokio::test]
 async fn info_endpoint() {
     if !require_docker() {
@@ -59,6 +75,7 @@ async fn info_endpoint() {
 }
 
 /// GET /metrics returns Prometheus-formatted text with remerge_ prefix.
+#[cfg(feature = "integration")]
 #[tokio::test]
 async fn metrics_endpoint() {
     if !require_docker() {
@@ -85,6 +102,7 @@ async fn metrics_endpoint() {
 }
 
 /// POST /api/v1/workorders with valid atoms returns 200 and workorder ID.
+#[cfg(feature = "integration")]
 #[tokio::test]
 async fn submit_workorder_valid() {
     if !require_docker() {
@@ -124,6 +142,7 @@ async fn submit_workorder_valid() {
 }
 
 /// POST /api/v1/workorders with shell injection in atoms returns 400.
+#[cfg(feature = "integration")]
 #[tokio::test]
 async fn submit_workorder_invalid_atoms() {
     if !require_docker() {
@@ -153,6 +172,7 @@ async fn submit_workorder_invalid_atoms() {
 }
 
 /// POST /api/v1/workorders twice with same client returns 409 (duplicate active).
+#[cfg(feature = "integration")]
 #[tokio::test]
 async fn submit_workorder_duplicate_active() {
     if !require_docker() {
@@ -196,6 +216,7 @@ async fn submit_workorder_duplicate_active() {
 }
 
 /// GET /api/v1/workorders/{id} returns workorder details.
+#[cfg(feature = "integration")]
 #[tokio::test]
 async fn get_workorder() {
     if !require_docker() {
@@ -237,6 +258,7 @@ async fn get_workorder() {
 }
 
 /// GET /api/v1/workorders lists submitted workorders.
+#[cfg(feature = "integration")]
 #[tokio::test]
 async fn list_workorders() {
     if !require_docker() {
@@ -277,6 +299,7 @@ async fn list_workorders() {
 }
 
 /// DELETE /api/v1/workorders/{id} cancels a workorder.
+#[cfg(feature = "integration")]
 #[tokio::test]
 async fn cancel_workorder() {
     if !require_docker() {
@@ -320,6 +343,7 @@ async fn cancel_workorder() {
 }
 
 /// GET /api/v1/workorders/{nonexistent} returns 404.
+#[cfg(feature = "integration")]
 #[tokio::test]
 async fn get_nonexistent_workorder() {
     if !require_docker() {
@@ -340,6 +364,7 @@ async fn get_nonexistent_workorder() {
 }
 
 /// Follower without main client is rejected.
+#[cfg(feature = "integration")]
 #[tokio::test]
 async fn follower_without_main_rejected() {
     if !require_docker() {

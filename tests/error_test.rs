@@ -187,3 +187,98 @@ fn make_conf_defaults_are_sane() {
     assert!(!mc.chost.is_empty(), "CHOST should have a default");
     assert!(!mc.makeopts.is_empty(), "MAKEOPTS should have a default");
 }
+
+// ── Docker socket unavailable ──────────────────────────────────────
+
+/// Docker socket unavailable returns error, not panic.
+#[tokio::test]
+async fn docker_socket_unavailable_returns_error() {
+    let tmp_binpkg = tempfile::TempDir::new().unwrap();
+    let tmp_state = tempfile::TempDir::new().unwrap();
+    let config = remerge_server::config::ServerConfig {
+        binpkg_dir: tmp_binpkg.path().to_path_buf(),
+        state_dir: tmp_state.path().to_path_buf(),
+        docker_socket: "unix:///nonexistent/docker.sock".into(),
+        ..Default::default()
+    };
+    let result = remerge_server::docker::DockerManager::new(&config).await;
+    assert!(result.is_err(), "should error on bad socket");
+}
+
+// ── Server config validation ────────────────────────────────────────
+
+/// ServerConfig with all defaults can be serialized and deserialized.
+#[test]
+fn server_config_default_roundtrip() {
+    let config = remerge_server::config::ServerConfig::default();
+    let json = serde_json::to_string(&config).expect("serialize");
+    let _: remerge_server::config::ServerConfig = serde_json::from_str(&json).expect("deserialize");
+}
+
+/// ServerConfig deserialization from empty object uses defaults.
+#[test]
+fn server_config_empty_object_uses_defaults() {
+    let config: remerge_server::config::ServerConfig =
+        serde_json::from_str("{}").expect("deserialize empty");
+    assert!(
+        !config.docker_socket.is_empty(),
+        "docker_socket should have default"
+    );
+    assert!(
+        !config.binhost_url.is_empty(),
+        "binhost_url should have default"
+    );
+    assert!(config.max_workers > 0, "max_workers should have default");
+}
+
+// ── Env file path traversal ────────────────────────────────────────
+
+/// Env files with path traversal in filenames are rejected.
+#[tokio::test]
+async fn env_files_path_traversal() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    let mut config = common::fixtures::minimal_portage_config();
+    config
+        .env_files
+        .insert("../escape.conf".into(), "evil".into());
+    config.env_files.insert("valid.conf".into(), "ok".into());
+
+    remerge_worker::portage_setup::write_env_files_inner(&base, &config)
+        .await
+        .expect("should handle gracefully");
+
+    assert!(base.join("env/valid.conf").exists(), "valid file written");
+    assert!(
+        !tmp.path().join("escape.conf").exists(),
+        "traversal blocked"
+    );
+}
+
+/// Package.env with invalid env_file names are filtered.
+#[tokio::test]
+async fn package_env_invalid_entries_filtered() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    let mut config = common::fixtures::minimal_portage_config();
+    config.package_env = vec![
+        PackageEnvEntry {
+            atom: "dev-libs/good".into(),
+            env_file: "safe.conf".into(),
+        },
+        PackageEnvEntry {
+            atom: "dev-libs/bad".into(),
+            env_file: "sub/dir.conf".into(),
+        },
+    ];
+
+    remerge_worker::portage_setup::write_package_env_inner(&base, &config)
+        .await
+        .expect("should handle gracefully");
+
+    let content = std::fs::read_to_string(base.join("package.env/remerge")).unwrap();
+    assert!(content.contains("dev-libs/good"), "valid entry present");
+    assert!(!content.contains("dev-libs/bad"), "invalid entry filtered");
+}
