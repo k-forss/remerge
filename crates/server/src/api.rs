@@ -487,7 +487,12 @@ async fn handle_ws(
                     Err(RecvError::Lagged(n)) => {
                         warn!(skipped = n, "Progress receiver lagged");
                     }
-                    Err(RecvError::Closed) => break,
+                    Err(RecvError::Closed) => {
+                        // Channel closed without a Finished event — send a
+                        // Close frame so the client doesn't hang.
+                        let _ = ws_write.send(ws::Message::Close(None)).await;
+                        break;
+                    }
                 }
             } else {
                 // raw_done is false only when raw_rx is Some — unwrap is safe.
@@ -537,7 +542,12 @@ async fn handle_ws(
                             Err(RecvError::Lagged(n)) => {
                                 warn!(skipped = n, "Progress receiver lagged");
                             }
-                            Err(RecvError::Closed) => break,
+                            Err(RecvError::Closed) => {
+                                // Channel closed without a Finished event —
+                                // send a Close frame so the client exits.
+                                let _ = ws_write.send(ws::Message::Close(None)).await;
+                                break;
+                            }
                         }
                     }
                 }
