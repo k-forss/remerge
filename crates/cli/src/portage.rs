@@ -173,20 +173,37 @@ impl PortageReader {
         // so we capture LLVM_SLOT, LLVM_TARGETS, and any other vars that
         // eselect or profiles define.  Without this, the worker container
         // won't know which LLVM slot, Python targets, etc. to use.
-        let use_expand_keys: Vec<String> = match Self::portageq_envvar("USE_EXPAND") {
-            Ok(expand_str) => {
-                let keys: Vec<String> = expand_str.split_whitespace().map(String::from).collect();
+        //
+        // Some variables (e.g. LLVM_SLOT) live in USE_EXPAND_UNPREFIXED
+        // or USE_EXPAND_HIDDEN rather than USE_EXPAND.  Query all three
+        // and merge the results so nothing is silently dropped.
+        let use_expand_keys: Vec<String> = {
+            let mut keys = std::collections::BTreeSet::new();
+            let mut any_succeeded = false;
+
+            for var in ["USE_EXPAND", "USE_EXPAND_UNPREFIXED", "USE_EXPAND_HIDDEN"] {
+                match Self::portageq_envvar(var) {
+                    Ok(expand_str) => {
+                        let found: Vec<String> =
+                            expand_str.split_whitespace().map(String::from).collect();
+                        debug!(var, count = found.len(), "Discovered {var} variables");
+                        keys.extend(found);
+                        any_succeeded = true;
+                    }
+                    Err(e) => {
+                        debug!(%e, var, "Failed to query {var}");
+                    }
+                }
+            }
+
+            if any_succeeded {
                 info!(
                     count = keys.len(),
                     "Discovered USE_EXPAND variables via portageq"
                 );
-                keys
-            }
-            Err(e) => {
-                warn!(
-                    %e,
-                    "Failed to query USE_EXPAND — using hardcoded fallback"
-                );
+                keys.into_iter().collect()
+            } else {
+                warn!("Failed to query any USE_EXPAND variants — using hardcoded fallback");
                 [
                     "ABI_X86",
                     "VIDEO_CARDS",
@@ -1041,39 +1058,49 @@ impl PortageReader {
     /// Keeping them in USE would cause slot conflicts in the worker container
     /// (e.g. forcing ABI_X86="32 64" on a non-multilib container).
     ///
-    /// We query `portageq envvar USE_EXPAND` for the authoritative list of
-    /// USE_EXPAND variable names, then filter any flag matching their
-    /// lowercased prefix.
+    /// We query `portageq envvar USE_EXPAND`, `USE_EXPAND_UNPREFIXED`, and
+    /// `USE_EXPAND_HIDDEN` for the authoritative list of USE_EXPAND variable
+    /// names, then filter any flag matching their lowercased prefix.
     fn strip_use_expand_flags(flags: Vec<String>) -> Vec<String> {
-        // Get the list of USE_EXPAND variables from portage.
-        let prefixes: Vec<String> = match Self::portageq_envvar("USE_EXPAND") {
-            Ok(expand_str) => expand_str
-                .split_whitespace()
-                .map(|var| format!("{}_", var.to_ascii_lowercase()))
-                .collect(),
-            Err(e) => {
-                // Fall back to a hardcoded list of common USE_EXPAND vars.
-                warn!(%e, "Could not query USE_EXPAND — using hardcoded fallback");
-                [
-                    "ABI_X86",
-                    "ABI_MIPS",
-                    "ABI_S390",
-                    "CPU_FLAGS_X86",
-                    "CPU_FLAGS_ARM",
-                    "PYTHON_TARGETS",
-                    "PYTHON_SINGLE_TARGET",
-                    "RUBY_TARGETS",
-                    "LUA_TARGETS",
-                    "LUA_SINGLE_TARGET",
-                    "VIDEO_CARDS",
-                    "INPUT_DEVICES",
-                    "L10N",
-                ]
-                .iter()
-                .map(|var| format!("{}_", var.to_ascii_lowercase()))
-                .collect()
+        // Collect prefixes from all USE_EXPAND variants.
+        let mut prefixes = Vec::new();
+        let mut any_succeeded = false;
+
+        for var in ["USE_EXPAND", "USE_EXPAND_UNPREFIXED", "USE_EXPAND_HIDDEN"] {
+            if let Ok(expand_str) = Self::portageq_envvar(var) {
+                prefixes.extend(
+                    expand_str
+                        .split_whitespace()
+                        .map(|v| format!("{}_", v.to_ascii_lowercase())),
+                );
+                any_succeeded = true;
             }
-        };
+        }
+
+        if !any_succeeded {
+            // Fall back to a hardcoded list of common USE_EXPAND vars.
+            warn!("Could not query any USE_EXPAND variant — using hardcoded fallback");
+            prefixes = [
+                "ABI_X86",
+                "ABI_MIPS",
+                "ABI_S390",
+                "CPU_FLAGS_X86",
+                "CPU_FLAGS_ARM",
+                "PYTHON_TARGETS",
+                "PYTHON_SINGLE_TARGET",
+                "RUBY_TARGETS",
+                "LUA_TARGETS",
+                "LUA_SINGLE_TARGET",
+                "LLVM_SLOT",
+                "LLVM_TARGETS",
+                "VIDEO_CARDS",
+                "INPUT_DEVICES",
+                "L10N",
+            ]
+            .iter()
+            .map(|var| format!("{}_", var.to_ascii_lowercase()))
+            .collect();
+        }
 
         let before = flags.len();
         let filtered: Vec<String> = flags
