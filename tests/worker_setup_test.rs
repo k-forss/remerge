@@ -840,3 +840,198 @@ fn parse_repo_sections_skips_default() {
     assert_eq!(repos.len(), 1);
     assert_eq!(repos[0].0, "gentoo");
 }
+
+// ── ensure_repo_locations_inner ─────────────────────────────────────
+
+/// Repo found in bind-mount → symlink is created pointing to bind-mount path.
+#[tokio::test]
+async fn ensure_repo_locations_bind_mount_symlink() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let base = tmp.path();
+
+    // Set up a repos_base with a "gentoo" repo directory (simulating bind-mount).
+    let repos_base = base.join("repos");
+    let gentoo_bind = repos_base.join("gentoo");
+    std::fs::create_dir_all(&gentoo_bind).expect("create bind dir");
+
+    // Target location for the repo.
+    let target_location = base.join("target_repos/gentoo");
+
+    // repos.conf content referencing the target location.
+    let repos_conf_base = base.join("repos_conf");
+    std::fs::create_dir_all(&repos_conf_base).expect("create repos_conf dir");
+    let remap_base = base.join("remap");
+
+    let mut repos_conf = std::collections::BTreeMap::new();
+    repos_conf.insert(
+        "gentoo.conf".to_string(),
+        format!(
+            "[gentoo]\nlocation = {}\nsync-type = rsync\n",
+            target_location.display()
+        ),
+    );
+
+    let config = PortageConfig {
+        repos_conf,
+        ..common::fixtures::minimal_portage_config()
+    };
+
+    portage_setup::ensure_repo_locations_inner(&config, &repos_base, &repos_conf_base, &remap_base)
+        .await
+        .expect("ensure_repo_locations_inner should succeed");
+
+    // The target location should now be a symlink to the bind-mount path.
+    assert!(
+        target_location.is_symlink(),
+        "target location should be a symlink"
+    );
+    let link_target = std::fs::read_link(&target_location).expect("read symlink");
+    assert_eq!(
+        link_target, gentoo_bind,
+        "symlink should point to bind-mount path"
+    );
+}
+
+/// Repo NOT in bind-mount + REMERGE_SKIP_SYNC=1 → remapped and location line rewritten.
+#[tokio::test]
+async fn ensure_repo_locations_remap_when_skip_sync() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let base = tmp.path();
+
+    // repos_base with NO "custom" repo (not in bind-mount).
+    let repos_base = base.join("repos");
+    std::fs::create_dir_all(&repos_base).expect("create repos dir");
+
+    // Target location under repos_base prefix (will trigger remap).
+    let target_location = format!("{}/custom", repos_base.display());
+
+    let repos_conf_base = base.join("repos_conf");
+    std::fs::create_dir_all(&repos_conf_base).expect("create repos_conf dir");
+    let remap_base = base.join("remap");
+
+    // Write the repos.conf file that will be rewritten.
+    let conf_content = format!("[custom]\nlocation = {target_location}\nsync-type = rsync\n");
+    std::fs::write(repos_conf_base.join("custom.conf"), &conf_content)
+        .expect("write initial repos.conf");
+
+    let mut repos_conf = std::collections::BTreeMap::new();
+    repos_conf.insert("custom.conf".to_string(), conf_content);
+
+    let config = PortageConfig {
+        repos_conf,
+        ..common::fixtures::minimal_portage_config()
+    };
+
+    // Set REMERGE_SKIP_SYNC to trigger remapping.
+    unsafe { std::env::set_var("REMERGE_SKIP_SYNC", "1") };
+
+    let result = portage_setup::ensure_repo_locations_inner(
+        &config,
+        &repos_base,
+        &repos_conf_base,
+        &remap_base,
+    )
+    .await;
+
+    unsafe { std::env::remove_var("REMERGE_SKIP_SYNC") };
+
+    result.expect("ensure_repo_locations_inner should succeed");
+
+    // The remap directory should have been created.
+    assert!(
+        remap_base.join("custom").is_dir(),
+        "remapped directory should exist"
+    );
+
+    // The repos.conf file should have been rewritten.
+    let rewritten = std::fs::read_to_string(repos_conf_base.join("custom.conf"))
+        .expect("read rewritten conf");
+    let expected_alt = format!("{}", remap_base.join("custom").display());
+    assert!(
+        rewritten.contains(&expected_alt),
+        "repos.conf should contain remapped path, got: {rewritten}"
+    );
+}
+
+/// Repo NOT in bind-mount, no skip-sync → empty directory created at location.
+#[tokio::test]
+async fn ensure_repo_locations_create_empty_dir() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let base = tmp.path();
+
+    let repos_base = base.join("repos");
+    std::fs::create_dir_all(&repos_base).expect("create repos dir");
+
+    // Target location NOT under repos_base prefix.
+    let target_location = base.join("external_repos/overlay");
+
+    let repos_conf_base = base.join("repos_conf");
+    std::fs::create_dir_all(&repos_conf_base).expect("create repos_conf dir");
+    let remap_base = base.join("remap");
+
+    let mut repos_conf = std::collections::BTreeMap::new();
+    repos_conf.insert(
+        "overlay.conf".to_string(),
+        format!(
+            "[overlay]\nlocation = {}\nsync-type = rsync\n",
+            target_location.display()
+        ),
+    );
+
+    let config = PortageConfig {
+        repos_conf,
+        ..common::fixtures::minimal_portage_config()
+    };
+
+    // Make sure REMERGE_SKIP_SYNC is not set.
+    unsafe { std::env::remove_var("REMERGE_SKIP_SYNC") };
+
+    portage_setup::ensure_repo_locations_inner(&config, &repos_base, &repos_conf_base, &remap_base)
+        .await
+        .expect("ensure_repo_locations_inner should succeed");
+
+    // The target location should be an empty directory.
+    assert!(
+        target_location.is_dir(),
+        "target location should be a directory"
+    );
+}
+
+/// Invalid location (path traversal with `..`) → error returned.
+#[tokio::test]
+async fn ensure_repo_locations_rejects_traversal() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let base = tmp.path();
+
+    let repos_base = base.join("repos");
+    std::fs::create_dir_all(&repos_base).expect("create repos dir");
+    let repos_conf_base = base.join("repos_conf");
+    std::fs::create_dir_all(&repos_conf_base).expect("create repos_conf dir");
+    let remap_base = base.join("remap");
+
+    let mut repos_conf = std::collections::BTreeMap::new();
+    repos_conf.insert(
+        "evil.conf".to_string(),
+        "[evil]\nlocation = /var/db/repos/../../../etc/shadow\nsync-type = rsync\n".to_string(),
+    );
+
+    let config = PortageConfig {
+        repos_conf,
+        ..common::fixtures::minimal_portage_config()
+    };
+
+    let result = portage_setup::ensure_repo_locations_inner(
+        &config,
+        &repos_base,
+        &repos_conf_base,
+        &remap_base,
+    )
+    .await;
+
+    assert!(result.is_err(), "path traversal should be rejected");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("invalid location") || err_msg.contains("traversal"),
+        "error should mention invalid location: {err_msg}"
+    );
+}

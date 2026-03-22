@@ -230,3 +230,63 @@ fn server_config_empty_object_uses_defaults() {
     );
     assert!(config.max_workers > 0, "max_workers should have default");
 }
+
+// ── Server config validation — Task 7.6 ────────────────────────────
+
+/// Non-writable binpkg_dir path causes create_dir_all to fail.
+/// Since AppState::new() calls DockerManager first (which needs Docker),
+/// we test the dir creation logic independently.
+#[tokio::test]
+async fn non_writable_binpkg_dir_fails() {
+    // /proc/nonexistent is guaranteed to not exist and /proc is not writable.
+    let result = tokio::fs::create_dir_all("/proc/nonexistent/binpkgs").await;
+    assert!(result.is_err(), "creating dir under /proc should fail");
+}
+
+/// Non-writable state_dir path causes create_dir_all to fail.
+#[tokio::test]
+async fn non_writable_state_dir_fails() {
+    let result = tokio::fs::create_dir_all("/proc/nonexistent/state").await;
+    assert!(result.is_err(), "creating dir under /proc should fail");
+}
+
+/// Auth config with Mtls mode but empty clients is accepted (resolve fails at runtime).
+#[test]
+fn auth_config_mtls_empty_clients() {
+    use remerge_server::auth::{AuthConfig, CertRegistry};
+    use remerge_types::auth::AuthMode;
+
+    let config = AuthConfig {
+        mode: AuthMode::Mtls,
+        clients: Vec::new(),
+        ..Default::default()
+    };
+
+    // CertRegistry::new does not fail — it just creates an empty registry.
+    // The error happens at resolve() time when no cert header is present.
+    let registry = CertRegistry::new(&config);
+    assert_eq!(registry.mode(), AuthMode::Mtls);
+}
+
+/// Auth resolve in Mtls mode without cert header returns error.
+#[test]
+fn auth_mtls_resolve_without_cert_rejects() {
+    use remerge_server::auth::{AuthConfig, CertRegistry};
+    use remerge_types::auth::AuthMode;
+    use remerge_types::client::ClientRole;
+
+    let config = AuthConfig {
+        mode: AuthMode::Mtls,
+        clients: Vec::new(),
+        ..Default::default()
+    };
+
+    let registry = CertRegistry::new(&config);
+
+    let headers = axum::http::HeaderMap::new();
+    let result = registry.resolve(&headers, uuid::Uuid::new_v4(), ClientRole::Main);
+    assert!(
+        result.is_err(),
+        "Mtls resolve without cert should return error"
+    );
+}

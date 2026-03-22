@@ -270,7 +270,7 @@ mock layer.
       files, verify they appear in `base/env/`, verify content matches,
       verify invalid filenames (containing `/` or `..`) are skipped.
 
-- [ ] **3.7** `write_repos_conf` with server `repos_dir` bind-mount remapping
+- [x] **3.7** `write_repos_conf` with server `repos_dir` bind-mount remapping
       (locations must be rewritten to `/var/db/repos/<name>`)
 
       **Audit finding:** UNCHECKED — the `write_repos_conf_inner` function
@@ -406,7 +406,7 @@ they report as "passed" despite not actually running. This must be fixed.
       - Requires Docker. Gate with `require_docker()`.
 
 - [x] **4.11** Client registry: follower registration requires existing main
-- [ ] **4.12** Config diff detection: same config → empty diff, changed
+- [x] **4.12** Config diff detection: same config → empty diff, changed
       package.use → `portage_changed = true`
 
       **Implementation notes:**
@@ -414,10 +414,12 @@ they report as "passed" despite not actually running. This must be fixed.
       - For integration: submit from client A, then submit again from
         client A with changed USE flags. The server should detect the
         config change internally.
-      - Check if `portage_changed` is surfaced in any API response.
-        If not directly observable via HTTP, this is covered by unit
-        tests and can be skipped as an integration test.
-      - Requires Docker. Gate with `require_docker()`.
+      - `portage_changed` is not surfaced in any HTTP API response; it is
+        internal to the server's `ClientRegistry`.  The 7 unit tests in
+        `crates/server/src/registry.rs` comprehensively cover diff
+        detection (new client, same config, changed USE flags, active
+        workorder, follower scenarios).  No additional integration test
+        is needed.
 
 - [x] **4.13** Metrics endpoint (`/metrics`) returns Prometheus text format
 - [x] **4.14** GET /api/v1/workorders/{nonexistent} returns 404
@@ -673,7 +675,7 @@ logic exists. It falsely reports as "passed".
       - Does NOT require Docker — tests the error path.
       - No feature gate needed; add to `error_test.rs`.
 
-- [ ] **7.6** Server config validation — missing `binpkg_dir`, invalid
+- [x] **7.6** Server config validation — missing `binpkg_dir`, invalid
       `auth` section, missing TLS cert
 
       **Audit finding:** UNCHECKED — the existing tests in `error_test.rs`

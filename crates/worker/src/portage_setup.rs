@@ -517,6 +517,28 @@ pub async fn write_repos_conf_inner(base: &Path, config: &PortageConfig) -> Resu
 /// mount, the overlay is remapped to a writable path under
 /// `/var/tmp/remerge-repos/` and the repos.conf entry is updated.
 async fn ensure_repo_locations(config: &PortageConfig) -> Result<()> {
+    ensure_repo_locations_inner(
+        config,
+        Path::new("/var/db/repos"),
+        Path::new("/etc/portage/repos.conf"),
+        Path::new("/var/tmp/remerge-repos"),
+    )
+    .await
+}
+
+/// Testable inner variant of [`ensure_repo_locations`].
+///
+/// `repos_base` is where bind-mounted repos live (e.g. `/var/db/repos`).
+/// `repos_conf_base` is the directory containing the repos.conf files
+/// (e.g. `/etc/portage/repos.conf`).
+/// `remap_base` is the writable fallback for read-only repos
+/// (e.g. `/var/tmp/remerge-repos`).
+pub async fn ensure_repo_locations_inner(
+    config: &PortageConfig,
+    repos_base: &Path,
+    repos_conf_base: &Path,
+    remap_base: &Path,
+) -> Result<()> {
     use std::path::Component;
 
     let repos_mounted_ro = std::env::var("REMERGE_SKIP_SYNC").is_ok();
@@ -552,7 +574,7 @@ async fn ensure_repo_locations(config: &PortageConfig) -> Result<()> {
             }
 
             // Check if the repo is available under the bind-mount.
-            let bind_path = Path::new("/var/db/repos").join(&name);
+            let bind_path = repos_base.join(&name);
             if bind_path.is_dir() {
                 if let Some(parent) = loc.parent() {
                     fs::create_dir_all(parent)
@@ -573,16 +595,20 @@ async fn ensure_repo_locations(config: &PortageConfig) -> Result<()> {
 
             // Repo not in bind-mount.  If the location is under the
             // read-only mount, remap to a writable alternative path.
-            if repos_mounted_ro && location.starts_with("/var/db/repos/") {
-                let alt = format!("/var/tmp/remerge-repos/{name}");
+            let repos_base_str = repos_base.to_string_lossy();
+            let repos_prefix = format!("{repos_base_str}/");
+            if repos_mounted_ro && location.starts_with(&repos_prefix) {
+                let alt = remap_base.join(&name);
+                let alt_str = alt.to_string_lossy().to_string();
                 fs::create_dir_all(&alt)
                     .await
-                    .with_context(|| format!("Failed to create writable repo dir {alt}"))?;
-                rewrite_repo_location(filename, &location, &alt).await?;
+                    .with_context(|| format!("Failed to create writable repo dir {alt_str}"))?;
+                rewrite_repo_location_inner(repos_conf_base, filename, &location, &alt_str)
+                    .await?;
                 info!(
                     repo = %name,
                     original = %location,
-                    remapped = %alt,
+                    remapped = %alt_str,
                     "Remapped overlay to writable path (bind-mount is read-only)"
                 );
             } else {
@@ -601,15 +627,21 @@ async fn ensure_repo_locations(config: &PortageConfig) -> Result<()> {
     Ok(())
 }
 
-/// Rewrite a single `location` value inside a repos.conf file.
+/// Testable inner variant of `rewrite_repo_location`.
 ///
-/// Only the line whose value exactly matches `old_loc` is changed, so
-/// multi-section files are handled correctly.
-async fn rewrite_repo_location(filename: &str, old_loc: &str, new_loc: &str) -> Result<()> {
-    let path = format!("/etc/portage/repos.conf/{filename}");
+/// `repos_conf_base` is the directory containing the repos.conf files
+/// (e.g. `/etc/portage/repos.conf`).
+pub async fn rewrite_repo_location_inner(
+    repos_conf_base: &Path,
+    filename: &str,
+    old_loc: &str,
+    new_loc: &str,
+) -> Result<()> {
+    let path = repos_conf_base.join(filename);
+    let path_str = path.to_string_lossy().to_string();
     let content = fs::read_to_string(&path)
         .await
-        .with_context(|| format!("Failed to read {path} for location rewrite"))?;
+        .with_context(|| format!("Failed to read {path_str} for location rewrite"))?;
 
     let mut output = String::with_capacity(content.len());
     for line in content.lines() {
@@ -627,7 +659,7 @@ async fn rewrite_repo_location(filename: &str, old_loc: &str, new_loc: &str) -> 
 
     fs::write(&path, &output)
         .await
-        .with_context(|| format!("Failed to rewrite {path}"))?;
+        .with_context(|| format!("Failed to rewrite {path_str}"))?;
 
     Ok(())
 }
