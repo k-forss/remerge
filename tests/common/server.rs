@@ -155,8 +155,7 @@ impl TestServer {
         let binpkg_dir = tempfile::TempDir::new().expect("temp dir");
         let state_dir = tempfile::TempDir::new().expect("temp dir");
 
-        let mut config =
-            config_override.unwrap_or_else(|| remerge_server::config::ServerConfig::default());
+        let mut config = config_override.unwrap_or_default();
 
         // Always override dirs and URL with test-local temp paths so
         // tests never collide and never touch the real filesystem.
