@@ -351,10 +351,18 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
         if self.gpg_home.is_some() {
             env.push("REMERGE_GPG_HOME=/var/cache/remerge/gnupg".to_string());
         }
-        // Tell the worker to skip `emerge --sync` when repos are mounted
-        // or when the config explicitly requests it (e.g. pre-synced test
-        // images).
-        if server_config.repos_dir.is_some() || server_config.skip_worker_sync {
+        // Tell the worker to skip the full `emerge --sync` when:
+        //  - repos are bind-mounted from the server (`repos_dir`),
+        //  - the config explicitly requests it (`skip_worker_sync`), OR
+        //  - a custom base image is used (assumed to be pre-synced).
+        //
+        // In all three cases the container's portage tree is already
+        // usable.  Missing overlays are still synced individually by
+        // `sync_missing_repos()` inside the worker.
+        if server_config.repos_dir.is_some()
+            || server_config.skip_worker_sync
+            || self.worker_base_image.is_some()
+        {
             env.push("REMERGE_SKIP_SYNC=1".to_string());
         }
 
