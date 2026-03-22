@@ -1313,12 +1313,19 @@ sync-type = git
     async fn set_profile_skips_when_profile_not_found() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let link = tmp.path().join("make.profile");
-        // No repos have the requested profile.
+        // No repos have the requested profile.  Use a profile name that
+        // cannot exist in the real `/var/db/repos/gentoo` fallback path
+        // (the test runs on the host, so an actually-valid profile would
+        // be found there and the assertion would fail).
         let locations: Vec<String> = vec!["/nonexistent/repo".to_string()];
 
-        set_profile_inner("default/linux/amd64/23.0", &locations, &link)
-            .await
-            .expect("should return Ok even when profile is missing");
+        set_profile_inner(
+            "remerge-test-nonexistent-profile/23.0",
+            &locations,
+            &link,
+        )
+        .await
+        .expect("should return Ok even when profile is missing");
 
         assert!(
             !link.exists(),
