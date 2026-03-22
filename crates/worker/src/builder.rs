@@ -92,16 +92,22 @@ pub async fn build_packages(workorder: &Workorder, emerge_cmd: &str) -> Result<(
 /// Sync the portage tree.
 ///
 /// When `REMERGE_SKIP_SYNC=1` is set (i.e. the server bind-mounted its own
-/// repos directory into the container), syncing is skipped entirely.  This
-/// avoids re-downloading the tree on every build and ensures the worker
-/// uses the exact same ebuild repo as the server.
+/// repos directory into the container), the main tree sync is skipped.
+/// However, overlay repos that are NOT present in the bind-mount are still
+/// synced individually so the worker has the exact same ebuild set as the
+/// client.
+///
+/// When `REMERGE_SKIP_SYNC` is not set, `emerge --sync` syncs ALL
+/// configured repositories (gentoo + overlays) in one go.
 async fn sync_portage() -> Result<()> {
     if std::env::var("REMERGE_SKIP_SYNC").is_ok() {
-        info!("Skipping portage sync (repos are bind-mounted from the server)");
+        info!("Main repo sync skipped (repos are bind-mounted from the server)");
+        // Overlays not present on the server still need to be synced.
+        sync_missing_repos().await?;
         return Ok(());
     }
 
-    info!("Syncing portage tree");
+    info!("Syncing all configured repos");
 
     let status = Command::new("emerge")
         .args(["--sync", "--quiet"])
@@ -115,4 +121,71 @@ async fn sync_portage() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Sync overlay repos whose location directory is empty or missing.
+///
+/// When repos are bind-mounted from the server, the main gentoo tree is
+/// already available.  But client overlays (layman, eselect-repository,
+/// GURU, etc.) may not be present on the server.  This function detects
+/// those and syncs them individually via `emaint sync -r <name>`.
+async fn sync_missing_repos() -> Result<()> {
+    let repos = discover_configured_repos().await;
+    let mut synced = 0usize;
+
+    for (name, location) in &repos {
+        if is_repo_populated(location) {
+            continue;
+        }
+
+        info!(repo = %name, location = %location, "Syncing missing overlay");
+        let status = Command::new("emaint")
+            .args(["sync", "-r", name])
+            .status()
+            .await
+            .with_context(|| format!("Failed to sync overlay {name}"))?;
+
+        if status.success() {
+            synced += 1;
+        } else {
+            tracing::warn!(repo = %name, "Overlay sync failed (continuing anyway)");
+        }
+    }
+
+    if synced > 0 {
+        info!(synced, "Synced missing overlay repos");
+    }
+    Ok(())
+}
+
+/// Read `/etc/portage/repos.conf/` and return `(name, location)` pairs
+/// for all configured repositories.
+async fn discover_configured_repos() -> Vec<(String, String)> {
+    let conf_path = std::path::Path::new("/etc/portage/repos.conf");
+    let mut repos = Vec::new();
+
+    if conf_path.is_dir() {
+        let Ok(mut dir) = tokio::fs::read_dir(conf_path).await else {
+            return repos;
+        };
+        while let Ok(Some(entry)) = dir.next_entry().await {
+            if let Ok(content) = tokio::fs::read_to_string(entry.path()).await {
+                repos.extend(crate::portage_setup::parse_repo_sections(&content));
+            }
+        }
+    } else if conf_path.is_file()
+        && let Ok(content) = tokio::fs::read_to_string(conf_path).await
+    {
+        repos.extend(crate::portage_setup::parse_repo_sections(&content));
+    }
+
+    repos
+}
+
+/// A repo is "populated" if its location directory contains a `profiles/`
+/// subdirectory (the minimum structure for a valid portage repository).
+/// Symlinked directories (pointing to bind-mounted repos) also pass this
+/// check because the symlink target is a fully populated repo tree.
+fn is_repo_populated(location: &str) -> bool {
+    std::path::Path::new(location).join("profiles").exists()
 }

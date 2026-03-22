@@ -384,12 +384,22 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
 
     // Give the log stream a moment to flush final lines, then abort if
     // it hasn't finished.  This avoids losing the last few log lines.
-    tokio::select! {
-        _ = &mut log_handle => {},
+    let log_task_finished = tokio::select! {
+        _ = &mut log_handle => true,
         _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
             warn!("Log stream did not finish within 5 s — aborting");
             log_handle.abort();
+            false
         }
+    };
+
+    // Ensure the task is fully complete so its captured `raw_tx` clone
+    // is dropped.  Without this, the raw broadcast channel stays open
+    // and the WS handler never transitions to text-only mode.
+    // Only await here if the select above did not already consume it;
+    // awaiting a JoinHandle a second time after it completed is unsafe.
+    if !log_task_finished {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), log_handle).await;
     }
 
     // Close the raw PTY channel *before* sending Finished so the WS

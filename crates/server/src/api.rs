@@ -451,7 +451,7 @@ async fn handle_ws(
     // build events as Text frames.  Binary frames carry the lossless
     // terminal byte stream; Text frames carry only status / result events
     // (StatusChanged, PackageBuilt, PackageFailed, Finished).
-    let send_task = tokio::spawn(async move {
+    let mut send_task = tokio::spawn(async move {
         use futures::SinkExt;
         use tokio::sync::broadcast::error::RecvError;
 
@@ -550,7 +550,7 @@ async fn handle_ws(
     // The stdin channel is created by the queue processor when it attaches
     // to the container, which may happen *after* the WebSocket connects.
     // We look up the sender dynamically on each message to handle this race.
-    let recv_task = tokio::spawn(async move {
+    let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = ws_read.next().await {
             let data = match msg {
                 ws::Message::Text(text) => text.as_bytes().to_vec(),
@@ -575,9 +575,10 @@ async fn handle_ws(
         }
     });
 
-    // Wait for either task to finish, then abort the other.
+    // Wait for either task to finish, then abort the other so it
+    // doesn't linger and hold the WebSocket connection open.
     tokio::select! {
-        _ = send_task => {},
-        _ = recv_task => {},
+        _ = &mut send_task => { recv_task.abort(); },
+        _ = &mut recv_task => { send_task.abort(); },
     }
 }

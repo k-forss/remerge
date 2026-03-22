@@ -161,8 +161,12 @@ impl AppState {
     }
 
     /// Remove all per-workorder channels (progress, raw output, stdin) when a
-    /// workorder finishes.  Progress is removed first to preserve the invariant
-    /// that a visible progress channel implies a live raw output channel.
+    /// workorder finishes.
+    ///
+    /// Note: the raw output channel may already have been removed by
+    /// `process_workorder` before the `Finished` event is broadcast.
+    /// The WS handler tolerates a missing raw channel by falling back
+    /// to text-only mode.
     pub async fn remove_workorder_channels(&self, id: &WorkorderId) {
         self.progress_txs.write().await.remove(id);
         self.raw_output_txs.write().await.remove(id);
