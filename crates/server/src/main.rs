@@ -6,8 +6,6 @@ use clap::Parser;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-use remerge_types::workorder::WorkorderStatus;
-
 use remerge_server::config::{self, ServerConfig};
 use remerge_server::state::AppState;
 use remerge_server::{api, persistence, queue};
@@ -182,82 +180,13 @@ async fn run_eviction_task(state: Arc<AppState>) {
     loop {
         interval.tick().await;
 
-        let cutoff =
-            chrono::Utc::now() - chrono::Duration::hours(state.config.retention_hours as i64);
-
-        let mut workorders = state.workorders.write().await;
-        let mut results = state.results.write().await;
-        let mut progress_txs = state.progress_txs.write().await;
-        let mut raw_output_txs = state.raw_output_txs.write().await;
-
-        let stale_ids: Vec<_> = workorders
-            .iter()
-            .filter(|(_, w)| {
-                matches!(
-                    w.status,
-                    WorkorderStatus::Completed
-                        | WorkorderStatus::Cancelled
-                        | WorkorderStatus::Failed { .. }
-                ) && w.updated_at < cutoff
-            })
-            .map(|(id, _)| *id)
-            .collect();
-
-        if !stale_ids.is_empty() {
-            info!(count = stale_ids.len(), "Evicting stale workorders");
-        }
-
-        for id in stale_ids {
-            workorders.remove(&id);
-            results.remove(&id);
-            progress_txs.remove(&id);
-            raw_output_txs.remove(&id);
-        }
-
-        // Enforce max-entry cap: if the workorder count still exceeds the
-        // configured limit, evict the oldest terminal entries first.
-        let cap = state.config.max_retained_workorders;
-        if cap > 0 && workorders.len() > cap {
-            let excess = workorders.len() - cap;
-            let mut terminal: Vec<(uuid::Uuid, chrono::DateTime<chrono::Utc>)> = workorders
-                .iter()
-                .filter(|(_, w)| {
-                    matches!(
-                        w.status,
-                        WorkorderStatus::Completed
-                            | WorkorderStatus::Cancelled
-                            | WorkorderStatus::Failed { .. }
-                    )
-                })
-                .map(|(id, w)| (*id, w.updated_at))
-                .collect();
-            terminal.sort_by_key(|&(_, ts)| ts);
-
-            let to_evict: Vec<_> = terminal
-                .into_iter()
-                .take(excess)
-                .map(|(id, _)| id)
-                .collect();
-            if !to_evict.is_empty() {
-                info!(
-                    count = to_evict.len(),
-                    "Evicting workorders (max cap exceeded)"
-                );
-            }
-            for id in to_evict {
-                workorders.remove(&id);
-                results.remove(&id);
-                progress_txs.remove(&id);
-                raw_output_txs.remove(&id);
-            }
+        let evicted = state.evict_workorders().await;
+        if evicted > 0 {
+            info!(count = evicted, "Evicted stale/excess workorders");
         }
 
         // Also clean up old package versions, keeping the 3 most recent per
         // package.  This avoids unbounded disk usage.
-        drop(workorders);
-        drop(results);
-        drop(progress_txs);
-        drop(raw_output_txs);
         match state.binpkg_repo.cleanup_old_versions(3).await {
             Ok(removed) if removed > 0 => {
                 info!(removed, "Cleaned up old package versions");
