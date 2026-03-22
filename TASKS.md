@@ -20,7 +20,7 @@ All items are ordered by dependency (earlier items unblock later ones).
 - [x] **0.4** Add workspace features (`integration`, `e2e`) and dev-dependencies
       to `Cargo.toml`; created lib.rs for server/worker/CLI crates to expose
       modules for integration testing
-- [ ] **0.5** Create a CI job in `.github/workflows/ci.yml` that runs integration
+- [x] **0.5** Create a CI job in `.github/workflows/ci.yml` that runs integration
       tests on `ubuntu-latest` with Docker available (GitHub-hosted runners
       have Docker pre-installed)
 
@@ -33,7 +33,7 @@ All items are ordered by dependency (earlier items unblock later ones).
         `cargo test --workspace --features e2e`.
       - Depend on the new GHCR test image from task 0.6.
 
-- [ ] **0.6** Create and publish a remerge integration test Docker image to GHCR
+- [x] **0.6** Create and publish a remerge integration test Docker image to GHCR
 
       **Implementation notes:**
       This is a prerequisite for all Gentoo-specific tests (Phase 2 tasks
@@ -154,7 +154,7 @@ Tests that create a temp directory tree mimicking `/etc/portage/` and `/var/db/p
   - [x] `=category/pkg-1.2*` — glob
   - [x] `@world` — always returns false
   - [x] Uninstalled package — returns false
-- [ ] **2.8** `expand_set` for `@world` (reads world file) and `@system`
+- [x] **2.8** `expand_set` for `@world` (reads world file) and `@system`
       (calls `portageq`) — requires portageq
 
       **Implementation notes:**
@@ -188,7 +188,7 @@ and `build_makeopts_inner`) that accept a base path parameter. Make them
 `pub` for integration testing. This is a minimal visibility change, not a
 mock layer.
 
-- [ ] **3.0** Create `_inner` variants for private portage_setup functions
+- [x] **3.0** Create `_inner` variants for private portage_setup functions
 
       **Implementation notes:**
       Add `pub` `_inner` variants for these functions in
@@ -217,7 +217,7 @@ mock layer.
       - `set_profile` → `set_profile_inner`
       - `build_makeopts` → `build_makeopts_inner`
 
-- [ ] **3.1** `write_make_conf` golden path: provide a `MakeConf`, assert
+- [x] **3.1** `write_make_conf` golden path: provide a `MakeConf`, assert
       generated file content line-by-line
 
       **Implementation notes:**
@@ -226,21 +226,21 @@ mock layer.
       FEATURES, ACCEPT_LICENSE, ACCEPT_KEYWORDS, CPU_FLAGS, USE_EXPAND,
       extra vars, PKGDIR lines are all present and correct.
 
-- [ ] **3.2** `write_make_conf` with `use_flags_resolved = true` — USE line
+- [x] **3.2** `write_make_conf` with `use_flags_resolved = true` — USE line
       must start with `-* `
 
       **Implementation notes:**
       Depends on task 3.0. Set `make_conf.use_flags_resolved = true`,
       verify the output contains `USE="-* flag1 flag2"`.
 
-- [ ] **3.3** `write_make_conf` with `use_flags_resolved = false` — no `-*`
+- [x] **3.3** `write_make_conf` with `use_flags_resolved = false` — no `-*`
       prefix
 
       **Implementation notes:**
       Depends on task 3.0. Set `make_conf.use_flags_resolved = false`,
       verify the output does NOT contain `-*`.
 
-- [ ] **3.4** `write_make_conf` with USE_EXPAND flags — must appear as
+- [x] **3.4** `write_make_conf` with USE_EXPAND flags — must appear as
       separate variables, not inside USE
 
       **Implementation notes:**
@@ -249,7 +249,7 @@ mock layer.
       verify output has `VIDEO_CARDS="intel"` and
       `INPUT_DEVICES="libinput"` as separate lines.
 
-- [ ] **3.5** `write_package_config` for each config type (use, keywords,
+- [x] **3.5** `write_package_config` for each config type (use, keywords,
       license, mask, unmask, env) — both single-entry and multi-entry
 
       **Implementation notes:**
@@ -263,14 +263,14 @@ mock layer.
       - `package.unmask/remerge`: `atom\n`
       - `package.env/remerge`: `atom env-file.conf\n`
 
-- [ ] **3.6** `write_env_files` — write, verify content and permissions
+- [x] **3.6** `write_env_files` — write, verify content and permissions
 
       **Implementation notes:**
       Depends on task 3.0 (`write_env_files_inner`). Write multiple env
       files, verify they appear in `base/env/`, verify content matches,
       verify invalid filenames (containing `/` or `..`) are skipped.
 
-- [ ] **3.7** `write_repos_conf` with server `repos_dir` bind-mount remapping
+- [x] **3.7** `write_repos_conf` with server `repos_dir` bind-mount remapping
       (locations must be rewritten to `/var/db/repos/<name>`)
 
       **Implementation notes:**
@@ -278,7 +278,7 @@ mock layer.
       value and verify that the `location =` lines in the output are
       rewritten to use the repos_dir path.
 
-- [ ] **3.8** `write_repos_conf` without server repos_dir — locations
+- [x] **3.8** `write_repos_conf` without server repos_dir — locations
       preserved as-is
 
       **Implementation notes:**
@@ -319,7 +319,7 @@ Tests skip gracefully when Docker is unavailable.
 unavailable — they `return` early with `eprintln`. In CI without Docker,
 they report as "passed" despite not actually running. This must be fixed.
 
-- [ ] **4.0** Fix Phase 4 test skip behavior
+- [x] **4.0** Fix Phase 4 test skip behavior
 
       **Implementation notes:**
       Replace the `if !require_docker() { return; }` pattern with a
@@ -402,7 +402,7 @@ they report as "passed" despite not actually running. This must be fixed.
 These tests need a running Docker daemon. Gate behind
 `#[cfg(feature = "integration")]`.
 
-- [ ] **5.1** `DockerManager::new` — connects to local Docker socket
+- [x] **5.1** `DockerManager::new` — connects to local Docker socket
 
       **Audit note:** The current `docker_availability_check` test is a
       no-op — it always passes regardless of Docker status. The
@@ -637,7 +637,7 @@ logic exists. It falsely reports as "passed".
       - Requires Docker + Gentoo.
       - Gate behind `#[cfg(feature = "e2e")]`.
 
-- [ ] **7.5** Docker socket unavailable — verify graceful error
+- [x] **7.5** Docker socket unavailable — verify graceful error
 
       **Implementation notes:**
       - Set `docker_socket` to `/nonexistent/docker.sock`.
@@ -646,7 +646,7 @@ logic exists. It falsely reports as "passed".
       - Does NOT require Docker — tests the error path.
       - No feature gate needed; add to `error_test.rs`.
 
-- [ ] **7.6** Server config validation — missing `binpkg_dir`, invalid
+- [x] **7.6** Server config validation — missing `binpkg_dir`, invalid
       `auth` section, missing TLS cert
 
       **Implementation notes:**
@@ -697,7 +697,7 @@ logic exists. It falsely reports as "passed".
 
 ## Phase 8 — CI & Regression
 
-- [ ] **8.1** Add integration test job to CI with Docker
+- [x] **8.1** Add integration test job to CI with Docker
 
       **Implementation notes:**
       Add to `.github/workflows/ci.yml`:
