@@ -115,7 +115,7 @@ async fn ensure_crossdev_installed() -> Result<()> {
 
 /// Extract the primary architecture from a CHOST tuple.
 ///
-/// ```
+/// ```text
 /// chost_arch("x86_64-pc-linux-gnu")      => "x86_64"
 /// chost_arch("aarch64-unknown-linux-gnu") => "aarch64"
 /// chost_arch("armv7a-unknown-linux-gnueabihf") => "armv7a"

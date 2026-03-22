@@ -172,4 +172,84 @@ impl AppState {
         self.raw_output_txs.write().await.remove(id);
         self.stdin_txs.write().await.remove(id);
     }
+
+    /// Run a single eviction pass — remove stale terminal workorders and
+    /// enforce the max-retained cap.
+    ///
+    /// Returns the number of workorders evicted.
+    pub async fn evict_workorders(&self) -> usize {
+        use remerge_types::workorder::WorkorderStatus;
+
+        let cutoff =
+            chrono::Utc::now() - chrono::Duration::hours(self.config.retention_hours as i64);
+
+        let mut workorders = self.workorders.write().await;
+        let mut results = self.results.write().await;
+        let mut progress_txs = self.progress_txs.write().await;
+        let mut raw_output_txs = self.raw_output_txs.write().await;
+        let mut stdin_txs = self.stdin_txs.write().await;
+        let mut container_ids = self.container_ids.write().await;
+
+        let mut evicted = 0;
+
+        // Phase 1: remove workorders past the retention cutoff.
+        let stale_ids: Vec<_> = workorders
+            .iter()
+            .filter(|(_, w)| {
+                matches!(
+                    w.status,
+                    WorkorderStatus::Completed
+                        | WorkorderStatus::Cancelled
+                        | WorkorderStatus::Failed { .. }
+                ) && w.updated_at < cutoff
+            })
+            .map(|(id, _)| *id)
+            .collect();
+
+        for id in &stale_ids {
+            workorders.remove(id);
+            results.remove(id);
+            progress_txs.remove(id);
+            raw_output_txs.remove(id);
+            stdin_txs.remove(id);
+            container_ids.remove(id);
+        }
+        evicted += stale_ids.len();
+
+        // Phase 2: enforce max-entry cap.
+        let cap = self.config.max_retained_workorders;
+        if cap > 0 && workorders.len() > cap {
+            let excess = workorders.len() - cap;
+            let mut terminal: Vec<(uuid::Uuid, chrono::DateTime<chrono::Utc>)> = workorders
+                .iter()
+                .filter(|(_, w)| {
+                    matches!(
+                        w.status,
+                        WorkorderStatus::Completed
+                            | WorkorderStatus::Cancelled
+                            | WorkorderStatus::Failed { .. }
+                    )
+                })
+                .map(|(id, w)| (*id, w.updated_at))
+                .collect();
+            terminal.sort_by_key(|&(_, ts)| ts);
+
+            let to_evict: Vec<_> = terminal
+                .into_iter()
+                .take(excess)
+                .map(|(id, _)| id)
+                .collect();
+            for id in &to_evict {
+                workorders.remove(id);
+                results.remove(id);
+                progress_txs.remove(id);
+                raw_output_txs.remove(id);
+                stdin_txs.remove(id);
+                container_ids.remove(id);
+            }
+            evicted += to_evict.len();
+        }
+
+        evicted
+    }
 }

@@ -11,8 +11,9 @@ FROM rust:1.94-bookworm AS builder
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
+COPY src/ src/
 COPY crates/ crates/
-RUN cargo build --release --bin remerge-worker
+RUN cargo build --release -p remerge-worker --bin remerge-worker
 
 FROM gentoo/stage3:latest
 

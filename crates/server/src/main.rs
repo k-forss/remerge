@@ -1,26 +1,14 @@
-mod api;
-mod auth;
-mod config;
-mod docker;
-mod metrics;
-mod persistence;
-mod queue;
-mod registry;
-mod repo;
-mod state;
-
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-use remerge_types::workorder::WorkorderStatus;
-
-use crate::config::ServerConfig;
-use crate::state::AppState;
+use remerge_server::config::{self, ServerConfig};
+use remerge_server::state::AppState;
+use remerge_server::{api, persistence, queue};
 
 /// remerge-server — binary host build coordinator.
 #[derive(Parser, Debug)]
@@ -125,24 +113,7 @@ async fn main() -> Result<()> {
 async fn serve_tls(app: axum::Router, addr: &str, tls_cfg: &config::TlsConfig) -> Result<()> {
     use tokio_rustls::TlsAcceptor;
 
-    let cert_pem = std::fs::read(&tls_cfg.cert)
-        .with_context(|| format!("Failed to read TLS cert: {}", tls_cfg.cert.display()))?;
-    let key_pem = std::fs::read(&tls_cfg.key)
-        .with_context(|| format!("Failed to read TLS key: {}", tls_cfg.key.display()))?;
-
-    use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
-
-    let certs = CertificateDer::pem_slice_iter(&cert_pem)
-        .collect::<Result<Vec<_>, _>>()
-        .context("Failed to parse TLS certificate")?;
-    let key =
-        PrivateKeyDer::from_pem_slice(&key_pem).context("No private key found in key file")?;
-
-    let mut tls_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .context("Invalid TLS configuration")?;
-    tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let tls_config = tls_cfg.load_rustls_config()?;
 
     let acceptor = TlsAcceptor::from(Arc::new(tls_config));
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -192,82 +163,13 @@ async fn run_eviction_task(state: Arc<AppState>) {
     loop {
         interval.tick().await;
 
-        let cutoff =
-            chrono::Utc::now() - chrono::Duration::hours(state.config.retention_hours as i64);
-
-        let mut workorders = state.workorders.write().await;
-        let mut results = state.results.write().await;
-        let mut progress_txs = state.progress_txs.write().await;
-        let mut raw_output_txs = state.raw_output_txs.write().await;
-
-        let stale_ids: Vec<_> = workorders
-            .iter()
-            .filter(|(_, w)| {
-                matches!(
-                    w.status,
-                    WorkorderStatus::Completed
-                        | WorkorderStatus::Cancelled
-                        | WorkorderStatus::Failed { .. }
-                ) && w.updated_at < cutoff
-            })
-            .map(|(id, _)| *id)
-            .collect();
-
-        if !stale_ids.is_empty() {
-            info!(count = stale_ids.len(), "Evicting stale workorders");
-        }
-
-        for id in stale_ids {
-            workorders.remove(&id);
-            results.remove(&id);
-            progress_txs.remove(&id);
-            raw_output_txs.remove(&id);
-        }
-
-        // Enforce max-entry cap: if the workorder count still exceeds the
-        // configured limit, evict the oldest terminal entries first.
-        let cap = state.config.max_retained_workorders;
-        if cap > 0 && workorders.len() > cap {
-            let excess = workorders.len() - cap;
-            let mut terminal: Vec<(uuid::Uuid, chrono::DateTime<chrono::Utc>)> = workorders
-                .iter()
-                .filter(|(_, w)| {
-                    matches!(
-                        w.status,
-                        WorkorderStatus::Completed
-                            | WorkorderStatus::Cancelled
-                            | WorkorderStatus::Failed { .. }
-                    )
-                })
-                .map(|(id, w)| (*id, w.updated_at))
-                .collect();
-            terminal.sort_by_key(|&(_, ts)| ts);
-
-            let to_evict: Vec<_> = terminal
-                .into_iter()
-                .take(excess)
-                .map(|(id, _)| id)
-                .collect();
-            if !to_evict.is_empty() {
-                info!(
-                    count = to_evict.len(),
-                    "Evicting workorders (max cap exceeded)"
-                );
-            }
-            for id in to_evict {
-                workorders.remove(&id);
-                results.remove(&id);
-                progress_txs.remove(&id);
-                raw_output_txs.remove(&id);
-            }
+        let evicted = state.evict_workorders().await;
+        if evicted > 0 {
+            info!(count = evicted, "Evicted stale/excess workorders");
         }
 
         // Also clean up old package versions, keeping the 3 most recent per
         // package.  This avoids unbounded disk usage.
-        drop(workorders);
-        drop(results);
-        drop(progress_txs);
-        drop(raw_output_txs);
         match state.binpkg_repo.cleanup_old_versions(3).await {
             Ok(removed) if removed > 0 => {
                 info!(removed, "Cleaned up old package versions");

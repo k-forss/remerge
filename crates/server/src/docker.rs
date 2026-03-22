@@ -36,6 +36,9 @@ pub struct DockerManager {
     /// SHA-256 hash of the worker binary (computed at startup) for
     /// cache-invalidating images when the binary is recompiled.
     worker_binary_hash: Option<String>,
+    /// Optional override for the base Docker image (e.g. a pre-synced
+    /// test image to avoid slow `emerge --sync` in CI).
+    worker_base_image: Option<String>,
 }
 
 impl DockerManager {
@@ -84,6 +87,7 @@ impl DockerManager {
             gpg_home: config.signing.gpg_home.clone(),
             worker_binary,
             worker_binary_hash,
+            worker_base_image: config.worker_base_image.clone(),
         })
     }
 
@@ -221,14 +225,16 @@ impl DockerManager {
     /// For native builds, uses the matching `gentoo/stage3` variant.
     /// For cross-architecture builds, uses an `amd64` stage3 with `crossdev`
     /// pre-installed so the worker can build for the target CHOST.
-    fn generate_dockerfile(&self, sys: &SystemIdentity) -> String {
+    pub fn generate_dockerfile(&self, sys: &SystemIdentity) -> String {
         let target_arch = sys.chost.split('-').next().unwrap_or("x86_64");
 
         // Determine if this is a cross-build.
         // The server always runs on amd64 — if the target isn't x86_64, it's cross.
         let is_cross = !matches!(target_arch, "x86_64" | "i686");
 
-        let base_image = if is_cross {
+        let base_image = if let Some(ref override_img) = self.worker_base_image {
+            override_img.clone()
+        } else if is_cross {
             // For cross-builds we always start from amd64 and set up crossdev.
             "gentoo/stage3:latest".to_string()
         } else {
@@ -269,17 +275,27 @@ RUN echo 'CHOST="{chost}"' >> /etc/portage/make.conf && \
             .map(|h| format!("LABEL remerge.worker.sha256=\"{h}\""))
             .unwrap_or_default();
 
+        // When a custom base image is provided (e.g. a pre-synced test
+        // image), skip the slow emerge --sync and git install steps — the
+        // image is assumed to be ready.
+        let sync_block = if self.worker_base_image.is_some() {
+            "# Custom base image — skipping emerge --sync (assumed pre-synced).".to_string()
+        } else {
+            "# Set up portage for building.\n\
+             RUN emerge --sync --quiet || true\n\
+             \n\
+             # Git is needed for syncing git-based overlays (e.g. GURU, custom repos).\n\
+             RUN emerge --oneshot --quiet dev-vcs/git || true"
+                .to_string()
+        };
+
         format!(
             r#"FROM {base_image}
 
 {binary_install}
 {hash_label}
 
-# Set up portage for building.
-RUN emerge --sync --quiet || true
-
-# Git is needed for syncing git-based overlays (e.g. GURU, custom repos).
-RUN emerge --oneshot --quiet dev-vcs/git || true
+{sync_block}
 {crossdev_block}
 # Create binpkg output directory.
 RUN mkdir -p {binpkg_mount}
@@ -292,6 +308,7 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
             base_image = base_image,
             binary_install = binary_install,
             hash_label = hash_label,
+            sync_block = sync_block,
             crossdev_block = crossdev_block,
             binpkg_mount = self.worker_binpkg_mount,
         )
@@ -334,8 +351,10 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
         if self.gpg_home.is_some() {
             env.push("REMERGE_GPG_HOME=/var/cache/remerge/gnupg".to_string());
         }
-        // Tell the worker to skip `emerge --sync` when repos are mounted.
-        if server_config.repos_dir.is_some() {
+        // Tell the worker to skip `emerge --sync` when repos are mounted
+        // or when the config explicitly requests it (e.g. pre-synced test
+        // images).
+        if server_config.repos_dir.is_some() || server_config.skip_worker_sync {
             env.push("REMERGE_SKIP_SYNC=1".to_string());
         }
 

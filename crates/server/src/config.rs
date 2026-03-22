@@ -115,6 +115,23 @@ pub struct ServerConfig {
     /// Default: 10 GiB.
     #[serde(default = "default_binpkg_disk_warn_bytes")]
     pub binpkg_disk_warn_bytes: u64,
+
+    /// Override the base Docker image used for worker containers.
+    ///
+    /// When set, `generate_dockerfile` uses this image instead of
+    /// `gentoo/stage3:latest`.  This is useful for CI and integration
+    /// tests where a pre-synced image avoids the slow `emerge --sync`
+    /// step.
+    #[serde(default)]
+    pub worker_base_image: Option<String>,
+
+    /// Skip the `emerge --sync` step inside worker containers.
+    ///
+    /// When `true`, the `REMERGE_SKIP_SYNC=1` env var is passed to every
+    /// worker container regardless of `repos_dir`.  Useful for CI and
+    /// integration tests where the base image already has a synced tree.
+    #[serde(default)]
+    pub skip_worker_sync: bool,
 }
 
 fn default_binpkg_dir() -> PathBuf {
@@ -201,6 +218,35 @@ pub struct TlsConfig {
     pub key: PathBuf,
 }
 
+impl TlsConfig {
+    /// Load and validate the TLS certificate and key from disk.
+    ///
+    /// Returns a configured [`rustls::ServerConfig`] on success, or an error
+    /// if the files are missing, unreadable, or contain invalid PEM data.
+    pub fn load_rustls_config(&self) -> Result<rustls::ServerConfig> {
+        let cert_pem = std::fs::read(&self.cert)
+            .with_context(|| format!("Failed to read TLS cert: {}", self.cert.display()))?;
+        let key_pem = std::fs::read(&self.key)
+            .with_context(|| format!("Failed to read TLS key: {}", self.key.display()))?;
+
+        use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+
+        let certs = CertificateDer::pem_slice_iter(&cert_pem)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("Failed to parse TLS certificate")?;
+        let key =
+            PrivateKeyDer::from_pem_slice(&key_pem).context("No private key found in key file")?;
+
+        let mut tls_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .context("Invalid TLS configuration")?;
+        tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+        Ok(tls_config)
+    }
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -223,6 +269,8 @@ impl Default for ServerConfig {
             log_json: false,
             repos_dir: None,
             binpkg_disk_warn_bytes: default_binpkg_disk_warn_bytes(),
+            worker_base_image: None,
+            skip_worker_sync: false,
         }
     }
 }
@@ -341,6 +389,12 @@ impl ServerConfig {
             && let Ok(n) = v.parse()
         {
             config.binpkg_disk_warn_bytes = n;
+        }
+        if let Ok(v) = std::env::var("REMERGE_WORKER_BASE_IMAGE") {
+            config.worker_base_image = Some(v);
+        }
+        if let Ok(v) = std::env::var("REMERGE_SKIP_WORKER_SYNC") {
+            config.skip_worker_sync = v == "1" || v.eq_ignore_ascii_case("true");
         }
 
         config.validate();

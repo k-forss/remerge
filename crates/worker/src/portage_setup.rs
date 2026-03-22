@@ -42,10 +42,69 @@ pub async fn apply_config(
     Ok(())
 }
 
+/// Testable inner variant of [`apply_config`] that writes all portage
+/// configuration files relative to `base` (e.g. a temp dir) instead of
+/// hardcoded `/etc/portage/`.
+///
+/// This does NOT call `ensure_repo_locations` or `set_profile`'s
+/// on-disk repos.conf scanning, since those operate on absolute
+/// container paths.  Profile is set based on repo locations derived
+/// from the config's repos_conf.
+pub async fn apply_config_inner(
+    base: &Path,
+    config: &PortageConfig,
+    worker_chost: &str,
+    gpg_key: Option<&str>,
+    gpg_home: Option<&str>,
+) -> Result<()> {
+    write_make_conf_inner(base, config, worker_chost, gpg_key, gpg_home).await?;
+    write_package_use_inner(base, config).await?;
+    write_package_accept_keywords_inner(base, config).await?;
+    write_package_license_inner(base, config).await?;
+    write_package_mask_inner(base, config).await?;
+    write_package_unmask_inner(base, config).await?;
+    write_package_env_inner(base, config).await?;
+    write_env_files_inner(base, config).await?;
+    write_repos_conf_inner(base, config).await?;
+    write_profile_overlay_inner(&base.join("profile"), config).await?;
+    write_patches_inner(&base.join("patches"), config).await?;
+
+    // Derive repo locations from the config for profile setting.
+    let repo_locations: Vec<String> = config
+        .repos_conf
+        .values()
+        .flat_map(|content| parse_repo_sections(content))
+        .map(|(_, location)| location)
+        .collect();
+
+    set_profile_inner(&config.profile, &repo_locations, &base.join("make.profile")).await?;
+
+    info!("Portage configuration applied to {}", base.display());
+    Ok(())
+}
+
 /// Write/overwrite `/etc/portage/make.conf` with the client's settings.
 ///
 /// Sets `CHOST` to the target and, when cross-compiling, also `CBUILD`.
 async fn write_make_conf(
+    config: &PortageConfig,
+    worker_chost: &str,
+    gpg_key: Option<&str>,
+    gpg_home: Option<&str>,
+) -> Result<()> {
+    write_make_conf_inner(
+        Path::new("/etc/portage"),
+        config,
+        worker_chost,
+        gpg_key,
+        gpg_home,
+    )
+    .await
+}
+
+/// Testable inner variant of [`write_make_conf`] that writes relative to `base`.
+pub async fn write_make_conf_inner(
+    base: &Path,
     config: &PortageConfig,
     worker_chost: &str,
     gpg_key: Option<&str>,
@@ -198,21 +257,28 @@ async fn write_make_conf(
         content.push_str(&format!("BINPKG_GPG_SIGNING_GPG_HOME=\"{home}\"\n"));
     }
 
-    fs::write("/etc/portage/make.conf", &content)
+    let make_conf_path = base.join("make.conf");
+    fs::write(&make_conf_path, &content)
         .await
         .context("Failed to write make.conf")?;
 
-    info!("Wrote /etc/portage/make.conf");
+    info!("Wrote {}", make_conf_path.display());
     Ok(())
 }
 
 /// Write `/etc/portage/package.use/remerge`.
 async fn write_package_use(config: &PortageConfig) -> Result<()> {
+    write_package_use_inner(Path::new("/etc/portage"), config).await
+}
+
+/// Testable inner variant of [`write_package_use`] that writes relative to `base`.
+pub async fn write_package_use_inner(base: &Path, config: &PortageConfig) -> Result<()> {
     if config.package_use.is_empty() {
         return Ok(());
     }
 
-    ensure_dir("/etc/portage/package.use").await?;
+    let dir = base.join("package.use");
+    fs::create_dir_all(&dir).await?;
 
     let content: String = config
         .package_use
@@ -220,21 +286,31 @@ async fn write_package_use(config: &PortageConfig) -> Result<()> {
         .map(|e| format!("{} {}\n", e.atom, e.flags.join(" ")))
         .collect();
 
-    fs::write("/etc/portage/package.use/remerge", &content)
+    let path = dir.join("remerge");
+    fs::write(&path, &content)
         .await
         .context("Failed to write package.use")?;
 
-    info!("Wrote /etc/portage/package.use/remerge");
+    info!("Wrote {}", path.display());
     Ok(())
 }
 
 /// Write `/etc/portage/package.accept_keywords/remerge`.
 async fn write_package_accept_keywords(config: &PortageConfig) -> Result<()> {
+    write_package_accept_keywords_inner(Path::new("/etc/portage"), config).await
+}
+
+/// Testable inner variant of [`write_package_accept_keywords`] that writes relative to `base`.
+pub async fn write_package_accept_keywords_inner(
+    base: &Path,
+    config: &PortageConfig,
+) -> Result<()> {
     if config.package_accept_keywords.is_empty() {
         return Ok(());
     }
 
-    ensure_dir("/etc/portage/package.accept_keywords").await?;
+    let dir = base.join("package.accept_keywords");
+    fs::create_dir_all(&dir).await?;
 
     let content: String = config
         .package_accept_keywords
@@ -242,21 +318,28 @@ async fn write_package_accept_keywords(config: &PortageConfig) -> Result<()> {
         .map(|e| format!("{} {}\n", e.atom, e.keywords.join(" ")))
         .collect();
 
-    fs::write("/etc/portage/package.accept_keywords/remerge", &content)
+    let path = dir.join("remerge");
+    fs::write(&path, &content)
         .await
         .context("Failed to write package.accept_keywords")?;
 
-    info!("Wrote /etc/portage/package.accept_keywords/remerge");
+    info!("Wrote {}", path.display());
     Ok(())
 }
 
 /// Write `/etc/portage/package.license/remerge`.
 async fn write_package_license(config: &PortageConfig) -> Result<()> {
+    write_package_license_inner(Path::new("/etc/portage"), config).await
+}
+
+/// Testable inner variant of [`write_package_license`] that writes relative to `base`.
+pub async fn write_package_license_inner(base: &Path, config: &PortageConfig) -> Result<()> {
     if config.package_license.is_empty() {
         return Ok(());
     }
 
-    ensure_dir("/etc/portage/package.license").await?;
+    let dir = base.join("package.license");
+    fs::create_dir_all(&dir).await?;
 
     let content: String = config
         .package_license
@@ -264,21 +347,28 @@ async fn write_package_license(config: &PortageConfig) -> Result<()> {
         .map(|e| format!("{} {}\n", e.atom, e.licenses.join(" ")))
         .collect();
 
-    fs::write("/etc/portage/package.license/remerge", &content)
+    let path = dir.join("remerge");
+    fs::write(&path, &content)
         .await
         .context("Failed to write package.license")?;
 
-    info!("Wrote /etc/portage/package.license/remerge");
+    info!("Wrote {}", path.display());
     Ok(())
 }
 
 /// Write `/etc/portage/package.mask/remerge`.
 async fn write_package_mask(config: &PortageConfig) -> Result<()> {
+    write_package_mask_inner(Path::new("/etc/portage"), config).await
+}
+
+/// Testable inner variant of [`write_package_mask`] that writes relative to `base`.
+pub async fn write_package_mask_inner(base: &Path, config: &PortageConfig) -> Result<()> {
     if config.package_mask.is_empty() {
         return Ok(());
     }
 
-    ensure_dir("/etc/portage/package.mask").await?;
+    let dir = base.join("package.mask");
+    fs::create_dir_all(&dir).await?;
 
     let content: String = config
         .package_mask
@@ -286,21 +376,28 @@ async fn write_package_mask(config: &PortageConfig) -> Result<()> {
         .map(|atom| format!("{atom}\n"))
         .collect();
 
-    fs::write("/etc/portage/package.mask/remerge", &content)
+    let path = dir.join("remerge");
+    fs::write(&path, &content)
         .await
         .context("Failed to write package.mask")?;
 
-    info!("Wrote /etc/portage/package.mask/remerge");
+    info!("Wrote {}", path.display());
     Ok(())
 }
 
 /// Write `/etc/portage/package.unmask/remerge`.
 async fn write_package_unmask(config: &PortageConfig) -> Result<()> {
+    write_package_unmask_inner(Path::new("/etc/portage"), config).await
+}
+
+/// Testable inner variant of [`write_package_unmask`] that writes relative to `base`.
+pub async fn write_package_unmask_inner(base: &Path, config: &PortageConfig) -> Result<()> {
     if config.package_unmask.is_empty() {
         return Ok(());
     }
 
-    ensure_dir("/etc/portage/package.unmask").await?;
+    let dir = base.join("package.unmask");
+    fs::create_dir_all(&dir).await?;
 
     let content: String = config
         .package_unmask
@@ -308,11 +405,12 @@ async fn write_package_unmask(config: &PortageConfig) -> Result<()> {
         .map(|atom| format!("{atom}\n"))
         .collect();
 
-    fs::write("/etc/portage/package.unmask/remerge", &content)
+    let path = dir.join("remerge");
+    fs::write(&path, &content)
         .await
         .context("Failed to write package.unmask")?;
 
-    info!("Wrote /etc/portage/package.unmask/remerge");
+    info!("Wrote {}", path.display());
     Ok(())
 }
 
@@ -320,11 +418,17 @@ async fn write_package_unmask(config: &PortageConfig) -> Result<()> {
 ///
 /// Maps atoms to environment override files (which live in `/etc/portage/env/`).
 async fn write_package_env(config: &PortageConfig) -> Result<()> {
+    write_package_env_inner(Path::new("/etc/portage"), config).await
+}
+
+/// Testable inner variant of [`write_package_env`] that writes relative to `base`.
+pub async fn write_package_env_inner(base: &Path, config: &PortageConfig) -> Result<()> {
     if config.package_env.is_empty() {
         return Ok(());
     }
 
-    ensure_dir("/etc/portage/package.env").await?;
+    let dir = base.join("package.env");
+    fs::create_dir_all(&dir).await?;
 
     let content: String = config
         .package_env
@@ -345,11 +449,12 @@ async fn write_package_env(config: &PortageConfig) -> Result<()> {
         .map(|e| format!("{} {}\n", e.atom, e.env_file))
         .collect();
 
-    fs::write("/etc/portage/package.env/remerge", &content)
+    let path = dir.join("remerge");
+    fs::write(&path, &content)
         .await
         .context("Failed to write package.env")?;
 
-    info!("Wrote /etc/portage/package.env/remerge");
+    info!("Wrote {}", path.display());
     Ok(())
 }
 
@@ -358,11 +463,17 @@ async fn write_package_env(config: &PortageConfig) -> Result<()> {
 /// These contain per-package variable overrides (e.g. custom CFLAGS,
 /// MAKEOPTS, CMAKE_BUILD_TYPE) referenced by `package.env` entries.
 async fn write_env_files(config: &PortageConfig) -> Result<()> {
+    write_env_files_inner(Path::new("/etc/portage"), config).await
+}
+
+/// Testable inner variant of [`write_env_files`] that writes relative to `base`.
+pub async fn write_env_files_inner(base: &Path, config: &PortageConfig) -> Result<()> {
     if config.env_files.is_empty() {
         return Ok(());
     }
 
-    ensure_dir("/etc/portage/env").await?;
+    let dir = base.join("env");
+    fs::create_dir_all(&dir).await?;
 
     for (filename, content) in &config.env_files {
         // Sanitise filename — reject empty, blank, and path-traversal.
@@ -370,15 +481,16 @@ async fn write_env_files(config: &PortageConfig) -> Result<()> {
             tracing::warn!(filename, "Skipping env file with invalid filename");
             continue;
         }
-        let path = format!("/etc/portage/env/{filename}");
+        let path = dir.join(filename);
         fs::write(&path, content)
             .await
-            .with_context(|| format!("Failed to write {path}"))?;
+            .with_context(|| format!("Failed to write {}", path.display()))?;
     }
 
     info!(
         count = config.env_files.len(),
-        "Wrote /etc/portage/env/ files"
+        "Wrote {} env files",
+        dir.display()
     );
     Ok(())
 }
@@ -394,22 +506,7 @@ async fn write_env_files(config: &PortageConfig) -> Result<()> {
 /// directories (or symlinks them to bind-mounted repos under
 /// `/var/db/repos/`) so portage doesn't error out before sync.
 async fn write_repos_conf(config: &PortageConfig) -> Result<()> {
-    if config.repos_conf.is_empty() {
-        return Ok(());
-    }
-
-    ensure_dir("/etc/portage/repos.conf").await?;
-
-    for (filename, content) in &config.repos_conf {
-        if filename.trim().is_empty() || filename.contains('/') || filename.contains("..") {
-            tracing::warn!(filename, "Skipping repos.conf file with invalid filename");
-            continue;
-        }
-        let path = format!("/etc/portage/repos.conf/{filename}");
-        fs::write(&path, content)
-            .await
-            .with_context(|| format!("Failed to write {path}"))?;
-    }
+    write_repos_conf_inner(Path::new("/etc/portage"), config).await?;
 
     // Ensure every referenced repo location exists so portage doesn't
     // error out before we get a chance to sync.
@@ -419,6 +516,32 @@ async fn write_repos_conf(config: &PortageConfig) -> Result<()> {
         count = config.repos_conf.len(),
         "Wrote /etc/portage/repos.conf/ files"
     );
+    Ok(())
+}
+
+/// Testable inner variant of [`write_repos_conf`] that writes relative to `base`.
+///
+/// Note: this does NOT call `ensure_repo_locations` — that operates on
+/// absolute filesystem paths and is only meaningful inside a container.
+pub async fn write_repos_conf_inner(base: &Path, config: &PortageConfig) -> Result<()> {
+    if config.repos_conf.is_empty() {
+        return Ok(());
+    }
+
+    let dir = base.join("repos.conf");
+    fs::create_dir_all(&dir).await?;
+
+    for (filename, content) in &config.repos_conf {
+        if filename.trim().is_empty() || filename.contains('/') || filename.contains("..") {
+            tracing::warn!(filename, "Skipping repos.conf file with invalid filename");
+            continue;
+        }
+        let path = dir.join(filename);
+        fs::write(&path, content)
+            .await
+            .with_context(|| format!("Failed to write {}", path.display()))?;
+    }
+
     Ok(())
 }
 
@@ -435,6 +558,28 @@ async fn write_repos_conf(config: &PortageConfig) -> Result<()> {
 /// mount, the overlay is remapped to a writable path under
 /// `/var/tmp/remerge-repos/` and the repos.conf entry is updated.
 async fn ensure_repo_locations(config: &PortageConfig) -> Result<()> {
+    ensure_repo_locations_inner(
+        config,
+        Path::new("/var/db/repos"),
+        Path::new("/etc/portage/repos.conf"),
+        Path::new("/var/tmp/remerge-repos"),
+    )
+    .await
+}
+
+/// Testable inner variant of [`ensure_repo_locations`].
+///
+/// `repos_base` is where bind-mounted repos live (e.g. `/var/db/repos`).
+/// `repos_conf_base` is the directory containing the repos.conf files
+/// (e.g. `/etc/portage/repos.conf`).
+/// `remap_base` is the writable fallback for read-only repos
+/// (e.g. `/var/tmp/remerge-repos`).
+pub async fn ensure_repo_locations_inner(
+    config: &PortageConfig,
+    repos_base: &Path,
+    repos_conf_base: &Path,
+    remap_base: &Path,
+) -> Result<()> {
     use std::path::Component;
 
     let repos_mounted_ro = std::env::var("REMERGE_SKIP_SYNC").is_ok();
@@ -470,7 +615,7 @@ async fn ensure_repo_locations(config: &PortageConfig) -> Result<()> {
             }
 
             // Check if the repo is available under the bind-mount.
-            let bind_path = Path::new("/var/db/repos").join(&name);
+            let bind_path = repos_base.join(&name);
             if bind_path.is_dir() {
                 if let Some(parent) = loc.parent() {
                     fs::create_dir_all(parent)
@@ -491,16 +636,19 @@ async fn ensure_repo_locations(config: &PortageConfig) -> Result<()> {
 
             // Repo not in bind-mount.  If the location is under the
             // read-only mount, remap to a writable alternative path.
-            if repos_mounted_ro && location.starts_with("/var/db/repos/") {
-                let alt = format!("/var/tmp/remerge-repos/{name}");
+            let repos_base_str = repos_base.to_string_lossy();
+            let repos_prefix = format!("{repos_base_str}/");
+            if repos_mounted_ro && location.starts_with(&repos_prefix) {
+                let alt = remap_base.join(&name);
+                let alt_str = alt.to_string_lossy().to_string();
                 fs::create_dir_all(&alt)
                     .await
-                    .with_context(|| format!("Failed to create writable repo dir {alt}"))?;
-                rewrite_repo_location(filename, &location, &alt).await?;
+                    .with_context(|| format!("Failed to create writable repo dir {alt_str}"))?;
+                rewrite_repo_location_inner(repos_conf_base, filename, &location, &alt_str).await?;
                 info!(
                     repo = %name,
                     original = %location,
-                    remapped = %alt,
+                    remapped = %alt_str,
                     "Remapped overlay to writable path (bind-mount is read-only)"
                 );
             } else {
@@ -519,15 +667,21 @@ async fn ensure_repo_locations(config: &PortageConfig) -> Result<()> {
     Ok(())
 }
 
-/// Rewrite a single `location` value inside a repos.conf file.
+/// Testable inner variant of `rewrite_repo_location`.
 ///
-/// Only the line whose value exactly matches `old_loc` is changed, so
-/// multi-section files are handled correctly.
-async fn rewrite_repo_location(filename: &str, old_loc: &str, new_loc: &str) -> Result<()> {
-    let path = format!("/etc/portage/repos.conf/{filename}");
+/// `repos_conf_base` is the directory containing the repos.conf files
+/// (e.g. `/etc/portage/repos.conf`).
+pub async fn rewrite_repo_location_inner(
+    repos_conf_base: &Path,
+    filename: &str,
+    old_loc: &str,
+    new_loc: &str,
+) -> Result<()> {
+    let path = repos_conf_base.join(filename);
+    let path_str = path.to_string_lossy().to_string();
     let content = fs::read_to_string(&path)
         .await
-        .with_context(|| format!("Failed to read {path} for location rewrite"))?;
+        .with_context(|| format!("Failed to read {path_str} for location rewrite"))?;
 
     let mut output = String::with_capacity(content.len());
     for line in content.lines() {
@@ -545,7 +699,7 @@ async fn rewrite_repo_location(filename: &str, old_loc: &str, new_loc: &str) -> 
 
     fs::write(&path, &output)
         .await
-        .with_context(|| format!("Failed to rewrite {path}"))?;
+        .with_context(|| format!("Failed to rewrite {path_str}"))?;
 
     Ok(())
 }
@@ -560,7 +714,7 @@ async fn write_profile_overlay(config: &PortageConfig) -> Result<()> {
     write_profile_overlay_inner(Path::new("/etc/portage/profile"), config).await
 }
 
-async fn write_profile_overlay_inner(base: &Path, config: &PortageConfig) -> Result<()> {
+pub async fn write_profile_overlay_inner(base: &Path, config: &PortageConfig) -> Result<()> {
     if config.profile_overlay.is_empty() {
         return Ok(());
     }
@@ -649,7 +803,7 @@ async fn set_profile(config: &PortageConfig) -> Result<()> {
     .await
 }
 
-async fn set_profile_inner(
+pub async fn set_profile_inner(
     profile: &str,
     repo_locations: &[String],
     link_path: &Path,
@@ -706,7 +860,7 @@ async fn write_patches(config: &PortageConfig) -> Result<()> {
     write_patches_inner(Path::new("/etc/portage/patches"), config).await
 }
 
-async fn write_patches_inner(base: &Path, config: &PortageConfig) -> Result<()> {
+pub async fn write_patches_inner(base: &Path, config: &PortageConfig) -> Result<()> {
     if config.patches.is_empty() {
         return Ok(());
     }
@@ -751,7 +905,7 @@ async fn write_patches_inner(base: &Path, config: &PortageConfig) -> Result<()> 
 /// Parse an INI-style repos.conf file and return `(section_name, location)`
 /// pairs.  The `[DEFAULT]` section and sections without a `location` key
 /// are skipped.
-pub(crate) fn parse_repo_sections(content: &str) -> Vec<(String, String)> {
+pub fn parse_repo_sections(content: &str) -> Vec<(String, String)> {
     let mut repos = Vec::new();
     let mut current_name = String::new();
     let mut current_location: Option<String> = None;
@@ -781,27 +935,6 @@ pub(crate) fn parse_repo_sections(content: &str) -> Vec<(String, String)> {
     repos
 }
 
-/// Ensure a directory exists (convert file to directory if needed).
-async fn ensure_dir(path: &str) -> Result<()> {
-    let p = Path::new(path);
-    if p.is_file() {
-        // Portage supports both file and directory — if it's a file, rename
-        // it and create a directory.
-        let backup = format!("{path}.bak");
-        fs::rename(path, &backup).await?;
-        fs::create_dir_all(path).await?;
-        // Move the original file into the directory.
-        let filename = Path::new(path)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or("original".into());
-        fs::rename(&backup, format!("{path}/{filename}")).await?;
-    } else if !p.exists() {
-        fs::create_dir_all(path).await?;
-    }
-    Ok(())
-}
-
 /// Build the `MAKEOPTS` value from server-provided env vars, falling back to
 /// the client's make.conf value.
 ///
@@ -821,7 +954,7 @@ fn build_makeopts(client_makeopts: &str) -> String {
     )
 }
 
-fn build_makeopts_inner(
+pub fn build_makeopts_inner(
     client_makeopts: &str,
     server_jobs: Option<&str>,
     server_load: Option<&str>,

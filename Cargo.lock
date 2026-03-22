@@ -1396,6 +1396,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "remerge-integration-tests"
+version = "0.0.0"
+dependencies = [
+ "axum",
+ "bollard",
+ "chrono",
+ "futures-util",
+ "remerge",
+ "remerge-server",
+ "remerge-types",
+ "remerge-worker",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite",
+ "uuid",
+]
+
+[[package]]
 name = "remerge-server"
 version = "0.1.0"
 dependencies = [

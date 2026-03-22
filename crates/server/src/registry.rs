@@ -66,6 +66,12 @@ impl std::fmt::Display for RegistryError {
     }
 }
 
+impl Default for ClientRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ClientRegistry {
     /// Create an empty registry (used when no persisted state exists).
     #[allow(dead_code)]

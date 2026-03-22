@@ -5,6 +5,7 @@ WORKDIR /build
 
 FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
+COPY src/ src/
 COPY crates/ crates/
 RUN cargo chef prepare --recipe-path recipe.json
 
@@ -14,11 +15,12 @@ COPY --from=planner /build/recipe.json recipe.json
 COPY Cargo.toml Cargo.lock ./
 
 # Pre-build dependencies (this layer is cached unless Cargo.toml/lock changes).
-RUN cargo chef cook --release --recipe-path recipe.json --bin remerge-server
+RUN cargo chef cook --release --recipe-path recipe.json -p remerge-server --bin remerge-server
 
 # Copy actual source and build.
+COPY src/ src/
 COPY crates/ crates/
-RUN cargo build --release --bin remerge-server
+RUN cargo build --release -p remerge-server --bin remerge-server
 
 # ── Runtime stage ────────────────────────────────────────────────────
 FROM debian:bookworm-slim

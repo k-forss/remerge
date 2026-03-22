@@ -1,12 +1,85 @@
 # Integration Test Suite — Agent Prompt
 
-You are implementing a comprehensive integration test suite for **remerge**,
-a distributed Gentoo binary-package builder written in Rust.  This document
-is your single source of truth.  Read it in full before writing any code.
+You are implementing integration tests for **remerge**, a distributed
+Gentoo binary-package builder written in Rust. Previous agents completed
+69 of 87 tasks. Your job is to fix and finish the remaining **18
+unchecked `[ ]` items** in `TASKS.md`.
 
 ---
 
-## 1  Project Overview
+## CRITICAL: Read This First
+
+Previous agents repeatedly marked tasks `[x]` without implementing them.
+This is the #1 problem. The user has had to audit and uncheck tasks
+**five times**. The specific failure modes were:
+
+1. Writing tests that accept BOTH success and error outcomes (always pass)
+2. Using `eprintln!` instead of `assert!` (always passes)
+3. Asserting multiple status variants like `Failed | Running | Pending`
+   (always passes)
+4. Accepting `200 || 400` or `200 || 409` in HTTP status checks (always passes)
+5. Testing a nonexistent image/container (trivially true) instead of
+   building one and verifying the real logic
+6. Duplicating Phase 4 API submission tests under the `e2e` feature flag
+   and calling it an "E2E test"
+7. Testing HashMap operations and calling it "eviction logic"
+8. Marking `[x]` with "(deferred)" annotation
+
+**If you do ANY of the above, your work is invalid.**
+
+---
+
+## Hard Rules
+
+1. `TASKS.md` is the single source of truth. Read it FIRST.
+2. You are NOT finished until every `[ ]` is either `[x]` or has a
+   "Blocked:" note, AND you have run the §9 verification checklist.
+3. Do NOT mark `[x]` unless the test compiles, runs, and has assertions
+   that can FAIL. If the test can never fail, it is not a test.
+4. Do NOT batch-check tasks. One at a time, verified, then checked.
+5. Build the stage3 image locally if needed:
+   `docker build -f docker/test-stage3.Dockerfile -t ghcr.io/k-forss/remerge/test-stage3:latest .`
+6. Test failures due to production code bugs are EXPECTED and DESIRED.
+   A test that compiles, asserts correctly, and fails because production
+   code is broken → mark `[x]` with "Known failure:" note.
+7. A test that always passes is worse than no test. It provides false
+   confidence. If you can't make a test fail when the feature is broken,
+   the test is wrong.
+8. Before stopping, run §9 and report every line.
+9. NEVER write `assert!(status == A || status == B)` — this always
+   passes. Assert the ONE expected outcome.
+
+---
+
+## 1  Completion Protocol
+
+```
+LOOP:
+  1. Read TASKS.md, find the highest-priority unchecked [ ] task.
+  2. Read the relevant source files (use grep/read_file — do NOT guess).
+  3. Read the existing test code for that task if any exists.
+  4. Write or fix the test.
+  5. Run: cargo test --workspace 2>&1 | tail -20
+  6. Verify the test CAN FAIL: temporarily break an assertion and
+     confirm it fails. If it can't fail, the test is wrong.
+  7. If the test PASSES with real assertions → mark [x] in TASKS.md.
+  8. If it FAILS due to a TEST bug → fix the test, re-run, then mark [x].
+  9. If it FAILS due to a PRODUCTION CODE bug → mark [x], add
+     "Known failure:" note. This is expected.
+  10. If it CANNOT be implemented (e.g., needs QEMU) → leave [ ],
+      add "Blocked:" note.
+  11. Every 3–5 tasks: cargo clippy --workspace --all-targets -D warnings
+  12. GOTO 1.
+
+STOP ONLY WHEN:
+  - Every [ ] in TASKS.md is either [x] or has a "Blocked:" note.
+  - §9 verification checklist passes.
+  - You have posted the checklist results.
+```
+
+---
+
+## 2  Project Overview
 
 Remerge is a Rust workspace (edition 2024, rust-version 1.88) with four
 crates:
@@ -14,7 +87,7 @@ crates:
 | Crate | Path | Role |
 |-------|------|------|
 | `remerge` | `crates/cli` | CLI binary — drop-in `emerge` wrapper |
-| `remerge-server` | `crates/server` | HTTP/WS API, Docker orchestration, FIFO queue |
+| `remerge-server` | `crates/server` | HTTP/WS API, Docker orchestration |
 | `remerge-worker` | `crates/worker` | Runs inside Docker, applies portage config, executes `emerge` |
 | `remerge-types` | `crates/types` | Shared types: portage, workorder, validation, client, auth |
 
@@ -22,435 +95,257 @@ crates:
 
 ```
 CLI reads /etc/portage/ → serializes PortageConfig
-  → HTTP POST to server /api/v1/workorder
+  → POST /api/v1/workorders to server
   → server queues Workorder, builds/reuses Docker image
-  → starts container with REMERGE_WORKORDER env var (JSON)
-  → worker deserializes, writes /etc/portage/ inside container
-  → worker runs `emerge --buildpkg …`
-  → PTY output streamed back via Docker attach → WebSocket → CLI
-  → binpkgs written to shared volume
-  → CLI runs local `emerge --getbinpkg` to install
+  → starts container with REMERGE_WORKORDER env
+  → worker writes /etc/portage/ inside container, runs emerge --buildpkg
+  → PTY output → WebSocket → CLI
+  → binpkgs to shared volume
+  → CLI runs emerge --getbinpkg to install
 ```
 
 ---
 
-## 2  Existing Test Coverage
+## 3  Current State (verified by line-by-line code audit)
 
-All existing tests are inline `#[cfg(test)]` unit tests (72 total).  There
-are **no integration tests**, **no test fixtures**, **no mock infrastructure**,
-and **no `tests/` directory**.
+### 3.1  Properly implemented (69 tasks — do NOT touch)
 
-| Module | Tests | What they cover |
-|--------|-------|-----------------|
-| `types/validation.rs` | 11 | `validate_atom` |
-| `types/portage.rs` | 2 | Serde round-trips |
-| `server/auth.rs` | 14 | All 3 auth modes, fingerprint normalisation |
-| `server/registry.rs` | 7 | Client registry (async) |
-| `worker/portage_setup.rs` | 8 | MAKEOPTS, USE flags, repo section parsing |
-| `cli/config.rs` | 5 | Config file parsing, persistence |
-| `cli/portage.rs` | 10 | make.conf parsing, `split_name_version`, version comparison |
+- Phase 0 (0.1–0.6): all 6 ✅
+- Phase 1 (1.1–1.6): all 6 ✅
+- Phase 2 (2.1–2.10): all 10 ✅
+- Phase 3 (3.0–3.13): all 14 ✅
+- Phase 4 (4.0–4.14): all 15 ✅
+- Phase 5: 5.1, 5.2, 5.4, 5.6 (4 of 7) ✅
+- Phase 6: 6.7, 6.9 (2 of 10) ✅
+- Phase 7: 7.5, 7.7, 7.8, 7.9–7.14 (10 of 14) ✅
+- Phase 8: 8.1, 8.3, 8.4 (3 of 5) ✅
 
-### Gaps to fill
+### 3.2  The 18 unchecked tasks
 
-- CLI portage reader (`read_config`, `is_installed`, set expansion)
-- Server HTTP/WS API endpoints
-- Server queue processor
-- Docker lifecycle (build, start, attach, remove, image eviction)
-- Worker builder (`build_packages`, `sync_repos`)
-- End-to-end CLI → binpkg pipeline
-- Error paths (missing deps, USE conflicts, path traversal, shell injection)
+| ID | Problem | Priority |
+|----|---------|----------|
+| **7.6** | TLS tests call `tokio::fs::read` directly instead of server startup | P1 |
+| **5.3** | Test accepts both success AND error — always passes | P2 |
+| **5.5** | Only checks `!id.is_empty()` — no env/mount verification; depends 5.3 | P2 |
+| **5.7** | Tests HashMap, not eviction logic | P2 |
+| **6.1** | Uses `eprintln!` instead of `assert!`; submits with --pretend | P3 |
+| **6.2** | `assert!(200 \|\| 400)` always passes; no flag verification | P3 |
+| **6.3** | Only checks 200 status — no USE flag verification | P3 |
+| **6.4** | Only checks 200 status — no set expansion verification | P3 |
+| **6.6** | `assert!(200 \|\| 409)` always passes; wrong client_id usage | P3 |
+| **6.8** | Tests nonexistent image (trivially true); depends 5.3 | P3 |
+| **6.10** | Only checks `reconnect.is_ok()`; no event verification | P3 |
+| **7.1** | `assert!(Failed \|\| Running \|\| Pending)` always passes; 10s timeout | P3 |
+| **7.2** | Not implemented | P4 |
+| **7.3** | Not implemented | P4 |
+| **7.4** | Not implemented | P4 |
+| **6.5** | Blocked: needs QEMU | P4 |
+| **8.2** | Not implemented (CI caching) | P4 |
+| **8.5** | Not implemented (nextest) | P4 |
 
----
-
-## 3  Architecture Decisions
-
-### 3.1  Test location
-
-Create a top-level `tests/` directory in the workspace root.  Use a single
-integration test crate with multiple modules:
+### 3.3  Test infrastructure
 
 ```
 tests/
   common/
-    mod.rs          — shared helpers
-    fixtures.rs     — fixture builders
-    server.rs       — in-process server harness
-  types_test.rs     — Phase 1 (pure logic)
-  cli_portage_test.rs — Phase 2 (filesystem)
-  worker_setup_test.rs — Phase 3 (filesystem)
-  server_api_test.rs   — Phase 4 (in-process HTTP)
-  docker_test.rs       — Phase 5 (Docker daemon)
-  e2e_test.rs          — Phase 6 (full pipeline)
-  error_test.rs        — Phase 7 (error paths)
-```
-
-### 3.2  Feature gating
-
-- Phases 1–4 run with `cargo test` (no feature flag).
-- Phase 5 (Docker) is gated behind `#[cfg(feature = "integration")]`.
-- Phase 6 (E2E) is gated behind `#[cfg(feature = "e2e")]`.
-- Add these features to the workspace `Cargo.toml`.
-
-### 3.3  Test helpers (`tests/common/mod.rs`)
-
-Provide the following reusable utilities:
-
-```rust
-/// Allocate a random free TCP port and return the address.
-pub fn free_port() -> u16;
-
-/// Create a temp directory with a populated `/etc/portage/` tree.
-/// Returns (TempDir, PathBuf) — keep TempDir alive for the test duration.
-pub fn portage_tree() -> (TempDir, PathBuf);
-
-/// Create a temp directory with a populated `/var/db/pkg/` VDB.
-pub fn vdb_tree(packages: &[(&str, &str)]) -> (TempDir, PathBuf);
-
-/// Build a minimal PortageConfig with sensible defaults.
-pub fn minimal_portage_config() -> PortageConfig;
-
-/// Build a minimal ServerConfig pointing at temp dirs.
-pub fn minimal_server_config(port: u16, binpkg_dir: &Path) -> ServerConfig;
-
-/// Start the axum server in-process and return a handle.
-pub async fn start_test_server(config: ServerConfig) -> TestServer;
-
-/// Assert with a timeout — panics if the future doesn't resolve.
-pub async fn with_timeout<F: Future>(duration: Duration, f: F) -> F::Output;
-```
-
-### 3.4  In-process server harness
-
-For Phase 4 tests, start the axum app on `127.0.0.1:<free_port>` inside the
-test process.  Use `reqwest` as the HTTP client and `tokio-tungstenite` for
-WebSocket tests.  Do **not** spawn a separate OS process.
-
-### 3.5  Docker tests
-
-For Phase 5, connect to the local Docker socket via `bollard`.  Tag test
-images with `remerge-test-<uuid>` and clean up in a `Drop` guard.  Skip
-tests if Docker is not available (`bollard::Docker::connect_with_local_defaults()`
-fails → skip, don't panic).
-
----
-
-## 4  Key Source Files to Read
-
-Before writing any test, read these files to understand the real interfaces:
-
-| File | What to learn |
-|------|---------------|
-| `crates/types/src/portage.rs` | `PortageConfig`, `MakeConf`, `SystemId`, field names, serde annotations |
-| `crates/types/src/workorder.rs` | `Workorder`, `WorkorderStatus`, `WorkorderResult`, `BuiltPackage`, `FailedPackage` |
-| `crates/types/src/validation.rs` | `validate_atom` — all acceptance/rejection rules |
-| `crates/types/src/client.rs` | `ClientRole`, `ClientState`, `ConfigDiff` |
-| `crates/types/src/auth.rs` | `AuthMode` enum |
-| `crates/cli/src/portage.rs` | `PortageReader`, `read_config`, `is_installed`, `expand_set`, `split_name_version`, `compare_versions`, `parse_atom_operator`, `split_revision` |
-| `crates/cli/src/args.rs` | `Cli` struct, `run()`, `extract_atoms()`, `run_local_emerge()` |
-| `crates/cli/src/cflags.rs` | `resolve_flags()` — march=native resolution |
-| `crates/cli/src/config.rs` | `CliConfig`, `load_or_create()` |
-| `crates/server/src/main.rs` | Server bootstrap, background tasks, axum router |
-| `crates/server/src/config.rs` | `ServerConfig` fields, env var overrides |
-| `crates/server/src/api.rs` | All HTTP/WS routes and handlers |
-| `crates/server/src/auth.rs` | `AuthState`, `authenticate()`, 3 modes |
-| `crates/server/src/registry.rs` | `ClientRegistry`, `register_or_update()`, follower rules |
-| `crates/server/src/queue.rs` | `process_queue()`, `process_workorder()`, event parsing |
-| `crates/server/src/docker.rs` | `DockerManager`, image build, container lifecycle |
-| `crates/server/src/state.rs` | `AppState` — central shared state |
-| `crates/worker/src/main.rs` | Worker bootstrap, cross-compilation detection |
-| `crates/worker/src/portage_setup.rs` | `apply_config()`, `write_make_conf()`, `set_profile()`, `write_profile_overlay()`, `write_patches()`, `write_repos_conf()` |
-| `crates/worker/src/builder.rs` | `build_packages()`, `sync_repos()`, arg filtering |
-| `crates/worker/src/crossdev.rs` | `emerge_command()`, `setup_crossdev()` |
-
----
-
-## 5  Detailed Test Specifications
-
-### Phase 1 — Types & Validation (no I/O)
-
-**Goal:** Verify all shared types serialize, deserialize, validate, and
-display correctly.
-
-1. **PortageConfig round-trip** — construct a config with every field
-   populated (including `profile_overlay`, `patches`, `repos_conf`,
-   `use_flags_resolved = true`).  Serialize to JSON, deserialize, assert
-   field-by-field equality.
-
-2. **PortageConfig with defaults** — deserialize a minimal JSON object
-   `{}` into `PortageConfig`.  Assert `profile_overlay` is an empty
-   `BTreeMap`, `use_flags_resolved` is `false`, etc.
-
-3. **Workorder status transitions** — create a Pending workorder, walk it
-   through every status.  Verify timestamps are set correctly.
-
-4. **validate_atom exhaustive** — test every legal form:
-   - Qualified: `dev-libs/openssl`
-   - Versioned: `=dev-libs/openssl-3.1.0`, `>=dev-libs/openssl-3.0`,
-     `~dev-libs/openssl-3.1.0`, `=dev-libs/openssl-3.1*`
-   - Sets: `@world`, `@system`
-   - Unqualified: `gcc`
-   - Rejection: empty, `; rm -rf`, `$(evil)`, `` `evil` ``,
-     `=gcc-12` (versioned unqualified)
-
-5. **ClientRole / AuthMode Display+FromStr** — round-trip through string.
-
-### Phase 2 — CLI Portage Reader (filesystem)
-
-**Goal:** Test `PortageReader` against a synthetic portage tree in a temp
-directory.
-
-**Setup pattern:**
-```rust
-let tmp = tempdir()?;
-let root = tmp.path();
-// Create /etc/portage/make.conf, package.use/, repos.conf, etc.
-std::env::set_var("ROOT", root);
-let reader = PortageReader::new()?;
-let config = reader.read_config()?;
-```
-
-Key tests:
-
-1. **Full golden path** — populate every directory and file a real Gentoo
-   system would have.  Call `read_config()` and assert every field.
-
-2. **Missing optional directories** — only create `make.conf`.  Assert
-   `package_use` is empty, `patches` is empty, `profile_overlay` is empty.
-
-3. **`is_installed` version constraints** — create VDB entries in
-   `/var/db/pkg/dev-libs/openssl-3.1.0-r2/` and
-   `/var/db/pkg/dev-libs/openssl-1.1.1w/`, then test:
-   - `dev-libs/openssl` → true (any version)
-   - `=dev-libs/openssl-3.1.0-r2` → true (exact)
-   - `=dev-libs/openssl-3.1.0` → false (different revision in VDB)
-   - `>=dev-libs/openssl-3.0` → true
-   - `<dev-libs/openssl-2.0` → true (1.1.1w matches)
-   - `>dev-libs/openssl-4.0` → false
-   - `~dev-libs/openssl-3.1.0` → true (any revision of 3.1.0)
-   - `=dev-libs/openssl-3.1*` → true (glob)
-   - `=dev-libs/openssl-3.2*` → false
-   - `@world` → false (set)
-   - `dev-libs/nonexistent` → false
-
-4. **`read_profile_overlay`** — create files in `<root>/etc/portage/profile/`
-   including nested subdirectories.  Assert the BTreeMap contains all
-   relative paths as keys and file contents as values.
-
-5. **`read_patches_recursive`** — create patches in
-   `<root>/etc/portage/patches/dev-libs/openssl/fix.patch`.  Assert key
-   format and content.
-
-### Phase 3 — Worker Portage Setup (filesystem)
-
-**Goal:** Test worker-side portage config writing against a temp directory.
-
-**Setup pattern:**
-```rust
-let tmp = tempdir()?;
-let root = tmp.path();
-std::fs::create_dir_all(root.join("etc/portage"))?;
-// call write_make_conf, write_package_config, etc.
-// then read files back and assert content
-```
-
-Key tests:
-
-1. **`write_make_conf` golden path** — pass a fully-populated `MakeConf`
-   with CHOST, CBUILD, CFLAGS, USE, FEATURES, signing, use_expand.
-   Read generated file, assert every expected line is present.
-
-2. **`write_make_conf` with `use_flags_resolved = true`** — USE line must
-   start with `USE="-* flag1 flag2"`.
-
-3. **`write_make_conf` with `use_flags_resolved = false`** — USE line must
-   NOT have `-*` prefix.
-
-4. **`write_make_conf` with USE_EXPAND** — verify `VIDEO_CARDS="intel"`,
-   `INPUT_DEVICES="libinput"` appear as separate variables.
-
-5. **`write_package_config`** — for each type (use, keywords, license,
-   mask, unmask, env), write multi-entry configs and read back.
-
-6. **`write_repos_conf` with remapping** — set server repos_dir, verify
-   location values are rewritten.
-
-7. **`set_profile`** — create repo directory structures with
-   `profiles/<profile>` paths, call `set_profile`, verify symlink target.
-
-8. **`write_profile_overlay`** — write overlay files, verify they appear
-   in `/etc/portage/profile/`.
-
-9. **`write_profile_overlay` path traversal** — keys containing `..` or
-   starting with `/` must be rejected.
-
-10. **`write_patches`** — write patches, verify directory structure and
-    file content.
-
-11. **`apply_config` orchestration** — call `apply_config` with a full
-    `PortageConfig` and verify that all expected files exist.
-
-### Phase 4 — Server API (in-process, no Docker)
-
-**Goal:** Test the axum HTTP/WS API without Docker.
-
-**Approach:** The server's queue processor calls `DockerManager` — for these
-tests you need to either:
-- (a) Let the queue idle (don't submit workorders that reach "Building"), or
-- (b) Submit workorders and test only the API-level response (status codes,
-  JSON shape, auth enforcement) without waiting for completion.
-
-Key tests:
-
-1. **Submit workorder** — POST valid JSON, assert 200, parse workorder ID.
-2. **Submit invalid atoms** — POST with `; rm -rf /`, assert 400.
-3. **Duplicate active** — submit twice with same client, assert 409.
-4. **Get workorder** — fetch by ID, assert fields match.
-5. **List workorders** — submit several, list, assert count and ordering.
-6. **Cancel** — submit, cancel, verify status = Cancelled.
-7. **Health** — GET /health → 200.
-8. **Info** — GET /api/v1/info → version, binhost_url, auth_mode.
-9. **Auth: None mode** — all requests pass.
-10. **Auth: Mtls mode** — missing cert header → 401.
-11. **WebSocket** — connect, verify text frame with initial status event.
-12. **Metrics** — GET /metrics → contains `remerge_` prefix lines.
-13. **Client registry** — submit as follower without main → error.
-
-### Phase 5 — Docker Integration
-
-**Gate:** `#[cfg(feature = "integration")]`
-
-**Pre-condition check:**
-```rust
-fn docker_available() -> bool {
-    bollard::Docker::connect_with_local_defaults().is_ok()
-}
-```
-Skip all tests if Docker is not available.
-
-Key tests:
-
-1. **Connect** — `DockerManager::new()` succeeds.
-2. **Build image** — build from Gentoo stage3, verify image exists.
-3. **Rebuild detection** — `needs_rebuild` returns `false` after build,
-   `true` after binary hash change.
-4. **Start container** — verify env vars and mounts.
-5. **Cleanup** — remove container, verify gone.
-6. **Image eviction** — create multiple images, run cleanup, verify only
-   newest per group survives.
-
-### Phase 6 — End-to-End
-
-**Gate:** `#[cfg(feature = "e2e")]`
-
-These are slow (~minutes).  The test process must:
-1. Start the server in-process.
-2. Use the CLI client library (not the binary) to submit a workorder.
-3. Wait for WebSocket completion.
-4. Assert binpkg file exists with correct SHA-256.
-
-Candidate packages for E2E: `app-misc/hello`, `virtual/libc` (fast builds).
-
-### Phase 7 — Error Paths
-
-Intentionally trigger every known error path:
-
-1. **Worker exit non-zero** — assert `WorkorderStatus::Failed`.
-2. **Missing dep** — assert `missing_dependencies` event.
-3. **USE conflict** — assert `use_conflicts` event.
-4. **Path traversal in profile_overlay** — assert rejection.
-5. **Path traversal in patches** — assert rejection.
-6. **Shell injection in atoms** — assert validation rejects.
-7. **Workorder TTL expiry** — advance time, verify reaping.
-
----
-
-## 6  Code Quality Requirements
-
-- All tests must pass `cargo clippy --all-targets -- -D warnings`.
-- All tests must be formatted with `cargo fmt`.
-- Use `#[tokio::test]` for async tests.
-- Use `assert!`, `assert_eq!`, `assert_ne!` with descriptive messages.
-- Every test function has a `/// doc comment` explaining what it verifies.
-- No `.unwrap()` in production code — use `anyhow::Result` in tests.
-- Clean up temp dirs and Docker resources in `Drop` guards.
-
----
-
-## 7  Dependencies to Add
-
-Add these to the workspace `Cargo.toml` under `[workspace.dependencies]`:
-
-```toml
-tempfile = "3"                # temp dirs for filesystem tests
-tokio-tungstenite = "0.26"    # WebSocket client for API tests
-```
-
-And in whatever crate hosts the integration tests:
-
-```toml
-[dev-dependencies]
-tempfile = { workspace = true }
-tokio-tungstenite = { workspace = true }
-reqwest = { workspace = true }
-bollard = { workspace = true }
-serde_json = { workspace = true }
-tokio = { workspace = true }
-uuid = { workspace = true }
-remerge-types = { workspace = true }
+    mod.rs          — free_port(), with_timeout()
+    fixtures.rs     — portage_tree(), vdb_tree(), configs, system_identity
+    server.rs       — docker_available(), TestServer::start[_with_config]()
+  types_test.rs          — Phase 1 (27+ tests) ✅
+  cli_portage_test.rs    — Phase 2 (19+ tests) ✅
+  worker_setup_test.rs   — Phase 3 (38+ tests) ✅
+  server_api_test.rs     — Phase 4 (16+ tests) ✅
+  docker_test.rs         — Phase 5 (8 tests, 3 need fixing)
+  e2e_test.rs            — Phase 6 (10 tests, 8 need fixing)
+  error_test.rs          — Phase 7 (16+ tests, 2 need fixing)
 ```
 
 ---
 
-## 8  Audit Checklist
+## 4  Implementation Guide — by Priority
 
-After implementing all tests, verify:
+### P1 — Task 7.6: TLS Config Validation
 
-- [ ] `cargo test --workspace` passes (Phases 1–4)
-- [ ] `cargo test --workspace --features integration` passes when Docker is
-      available (Phases 1–5)
+**File:** `tests/error_test.rs`
+
+The existing `tls_config_missing_cert_file_fails` and
+`tls_config_missing_key_file_fails` just call `tokio::fs::read()` — they
+test Tokio's filesystem, not remerge.
+
+**Fix:**
+1. Read `crates/server/src/main.rs` to find how TLS is configured.
+2. If TLS cert validation happens at bind time: start the server with
+   nonexistent cert/key paths and assert the startup error.
+3. If validation happens in config parsing: call that config parsing
+   function with bad paths and assert the error.
+4. Keep the existing auth tests (they're correct).
+5. Keep the AppState binpkg/state dir tests (they're correct, behind
+   `#[cfg(feature = "integration")]`).
+
+### P2 — Docker Tests (5.3, 5.5, 5.7)
+
+**File:** `tests/docker_test.rs`
+
+These three tasks have test code that APPEARS to exist but always passes
+because they accept both success and error outcomes.
+
+#### 5.3: `build_worker_image`
+1. Build stage3 locally first.
+2. The existing `build_worker_image_with_label` already has the structure.
+3. Fix: remove the `Err(e)` branch that silently passes. If stage3 is
+   missing, skip explicitly (don't pass). On success, use bollard to
+   inspect the image for the `remerge.worker.sha256` label.
+4. Add `bollard = { workspace = true }` to `[dev-dependencies]`.
+
+#### 5.5: `start_worker` — depends on 5.3
+1. After 5.3 builds an image, `start_worker_container` can succeed.
+2. Fix: on success, use bollard to inspect the container for
+   `REMERGE_WORKORDER` env var and binpkg mount.
+3. Remove the `Err(e)` branch that silently passes.
+
+#### 5.7: Image eviction
+1. The eviction loop is in `crates/server/src/main.rs` (~L219).
+2. `AppState` has `pub image_last_used: RwLock<HashMap<String, Instant>>`
+   and `pub async fn evict_workorders(&self) -> usize`.
+3. But image eviction is in the background loop, not `evict_workorders`.
+4. Extract the image reaper logic into a testable function, or test
+   `remove_image` + `image_last_used` map together on real images.
+5. The current test just proves HashMap works — replace entirely.
+
+### P3 — E2E Pipeline Tests (6.x, 7.1)
+
+**File:** `tests/e2e_test.rs`, `tests/error_test.rs`
+
+All these tests exist but have one of these defects:
+- `eprintln!` instead of `assert!`
+- `assert!(A || B)` always-pass pattern
+- Only testing API submission (duplicate of Phase 4)
+- Testing nonexistent image (trivially true)
+
+**Common fixes:**
+1. Replace `eprintln!` with `assert!` or `panic!`.
+2. Replace `assert!(status == A || status == B)` with
+   `assert_eq!(status, A)`.
+3. Add WebSocket connection + event verification where the task
+   requires verifying build output.
+4. For 6.1: submit WITHOUT `--pretend`, wait for Finished, assert
+   binpkg files exist.
+5. For 6.8: depends on 5.3 — build image with binary A, then check
+   with binary B.
+6. For 7.1: assert `WorkorderStatus::Failed { .. }` ONLY, increase
+   timeout to 120s.
+
+### P4 — Not implemented / Blocked
+
+- **7.2, 7.3, 7.4:** Write new tests. Submit builds that will fail
+  in specific ways, verify WebSocket events. These will likely fail
+  because the production code may not emit structured error events
+  yet — that's fine, mark `[x]` with "Known failure:" note.
+- **6.5:** Leave `[ ]` with "Blocked: QEMU" note.
+- **8.2:** Add buildx caching to CI workflow.
+- **8.5:** Add nextest installation and JUnit output to CI.
+
+---
+
+## 5  Key Source Files
+
+| File | Key contents |
+|------|-------------|
+| `crates/worker/src/portage_setup.rs` | All `write_*_inner` functions |
+| `crates/server/src/state.rs` | `AppState::new()` (L69), `evict_workorders()` (L180), `image_last_used` (L56) |
+| `crates/server/src/main.rs` | Image reaper loop (~L219), TLS setup, `evict_workorders` call (L183) |
+| `crates/server/src/docker.rs` | `DockerManager::new()`, `image_tag()`, `image_needs_rebuild()`, `build_worker_image()`, `start_worker()`, `remove_image()` |
+| `crates/server/src/config.rs` | `ServerConfig` with serde defaults |
+| `crates/server/src/api.rs` | `router()` — axum routes |
+| `crates/server/src/auth.rs` | `CertRegistry`, 14 unit tests |
+| `crates/types/src/portage.rs` | `PortageConfig`, `MakeConf`, `SystemIdentity` |
+| `crates/types/src/validation.rs` | `validate_atom()` |
+| `crates/types/src/api.rs` | HTTP request/response types |
+| `crates/cli/src/portage.rs` | `PortageReader`, `is_installed`, `expand_set` |
+
+---
+
+## 6  Architecture Decisions (do NOT change)
+
+- **Test location:** `tests/` directory, one file per phase.
+- **Feature gating:** Phases 1–3 = no flag. Phase 4–5 =
+  `#[cfg(feature = "integration")]`. Phase 6+ = `#[cfg(feature = "e2e")]`.
+- **In-process server:** `TestServer::start()` requires Docker.
+- **`_inner` pattern:** Testable variants with base `Path` parameter.
+- **No mocks:** No trait abstractions or mock layers.
+
+---
+
+## 7  Code Quality
+
+- `cargo clippy --workspace --all-targets -- -D warnings` must pass.
+- `cargo fmt --all -- --check` must pass.
+- `#[tokio::test]` for async tests.
+- Every test has a `/// doc comment`.
+- `.expect("descriptive msg")` — no bare `.unwrap()`.
+- Clean up temp dirs/containers/images.
+
+---
+
+## 8  Constraints
+
+- Do NOT modify production source unless adding `pub` visibility or
+  extracting testable functions.
+- Do NOT add trait abstractions or mock layers.
+- Do NOT create Docker images in Phase 1–3 tests.
+- After every change: `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings`
+
+---
+
+## 9  Verification Checklist
+
+**Run through EVERY line before declaring work complete.**
+
+- [ ] `cargo test --workspace` compiles and runs
+- [ ] `cargo test --workspace --features integration` compiles and runs
+- [ ] `cargo test --workspace --features integration,e2e` compiles
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` clean
 - [ ] `cargo fmt --all -- --check` clean
-- [ ] No test depends on network access (except E2E)
-- [ ] No test leaves behind temp files, Docker containers, or images
-- [ ] Every `PortageConfig` field is exercised in at least one test
-- [ ] Every `validate_atom` rejection class has a dedicated test
-- [ ] Every `is_installed` operator variant has at least 2 tests
-      (satisfied + unsatisfied)
-- [ ] Every server API route has at least one test
-- [ ] Path traversal rejection is tested for `profile_overlay` and `patches`
-- [ ] Feature-gated tests skip gracefully when prerequisites are missing
+- [ ] No test uses `todo!()`, `unimplemented!()`, or empty assertions
+- [ ] No test has `assert!(A || B)` pattern (always-pass)
+- [ ] No test uses `eprintln!` where `assert!` is needed
+- [ ] No test leaves behind temp files, containers, or images
+- [ ] Every `[ ]` in TASKS.md is `[x]` or has "Blocked:" note
+- [ ] Phase 4 sentinel test asserts Docker IS available
+- [ ] Any test failures documented with "Known failure:" notes
 
 ---
 
-## 9  File Listing
+## 10  Anti-Pattern Blacklist
 
-When you are done, the following files should exist:
-
-```
-tests/
-  common/
-    mod.rs
-    fixtures.rs
-    server.rs
-  types_test.rs
-  cli_portage_test.rs
-  worker_setup_test.rs
-  server_api_test.rs
-  docker_test.rs
-  e2e_test.rs
-  error_test.rs
-TASKS.md            (already exists — check off completed items)
-```
+| Anti-pattern | Why it's invalid |
+|---|---|
+| `assert!(status == 200 \|\| status == 400)` | Always passes. Assert ONE expected outcome. |
+| `eprintln!("skip"); return;` | Falsely passes. Use `#[cfg(feature)]`. |
+| Marking `[x]` with "(deferred)" | Deferred ≠ done. Leave `[ ]`. |
+| Testing nonexistent image returns true | Trivially true. Build an image and test the real logic. |
+| Allowing `Failed \| Running \| Pending` | Always passes. Assert the exact expected status. |
+| Testing HashMap insert/read | Tests HashMap, not your code. Test the actual eviction. |
+| Duplicating Phase 4 tests under `e2e` flag | API submission ≠ E2E pipeline. Add WebSocket + output verification. |
+| `match result { Ok(..) => .., Err(..) => assert_msg_ok }` | Both arms pass. Test ONE expected outcome. |
+| Saying "all tasks are straightforward" and stopping | **You are not finished.** Run §9. |
+| Checking [x] without running the test | It may not compile. |
 
 ---
 
-## 10  Constraints
+## 11  GHCR Test Image — Build Locally
 
-- Do **not** modify any existing source code unless a function is not `pub`
-  and needs to be made accessible for testing.  If you change visibility,
-  do it minimally (e.g. `pub(crate)` → `pub`).
-- Do **not** add trait abstractions or mock layers to production code.
-  Test at the boundary (filesystem, HTTP, Docker socket).
-- Do **not** add any dependencies that are not listed in §7.
-- Do **not** create Docker images during Phase 1–4 tests.
-- Follow the code style in `CONTRIBUTING.md`.
+```sh
+# Build locally (~10–20 min, requires network for emerge --sync)
+docker build -f docker/test-stage3.Dockerfile \
+  -t ghcr.io/k-forss/remerge/test-stage3:latest .
+
+# Verify
+docker images ghcr.io/k-forss/remerge/test-stage3
+
+# Run all tests
+cargo test --workspace --features integration,e2e
+```
+
+Use the full GHCR tag when building locally so tests find the image.
+Test failures from production bugs are expected — the goal is to find them.

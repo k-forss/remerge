@@ -115,7 +115,7 @@ fn validate_package_name(package: &str) -> Result<(), AtomValidationError> {
 }
 
 /// Error returned when a portage atom is invalid.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AtomValidationError {
     /// The atom string is empty.
     Empty,
