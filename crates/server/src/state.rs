@@ -187,6 +187,8 @@ impl AppState {
         let mut results = self.results.write().await;
         let mut progress_txs = self.progress_txs.write().await;
         let mut raw_output_txs = self.raw_output_txs.write().await;
+        let mut stdin_txs = self.stdin_txs.write().await;
+        let mut container_ids = self.container_ids.write().await;
 
         let mut evicted = 0;
 
@@ -209,6 +211,8 @@ impl AppState {
             results.remove(id);
             progress_txs.remove(id);
             raw_output_txs.remove(id);
+            stdin_txs.remove(id);
+            container_ids.remove(id);
         }
         evicted += stale_ids.len();
 
@@ -240,6 +244,8 @@ impl AppState {
                 results.remove(id);
                 progress_txs.remove(id);
                 raw_output_txs.remove(id);
+                stdin_txs.remove(id);
+                container_ids.remove(id);
             }
             evicted += to_evict.len();
         }

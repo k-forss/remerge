@@ -200,9 +200,7 @@ fn is_installed_any_version() {
         ("dev-libs", "openssl-3.1.0-r2"),
         ("dev-libs", "openssl-1.1.1w"),
     ]);
-    unsafe {
-        std::env::set_var("ROOT", root.to_str().unwrap());
-    }
+    let _env = common::set_root_env(&root);
     let reader = remerge::portage::PortageReader::new().unwrap();
 
     assert!(
@@ -218,9 +216,7 @@ fn is_installed_exact_match() {
         ("dev-libs", "openssl-3.1.0-r2"),
         ("dev-libs", "openssl-1.1.1w"),
     ]);
-    unsafe {
-        std::env::set_var("ROOT", root.to_str().unwrap());
-    }
+    let _env = common::set_root_env(&root);
     let reader = remerge::portage::PortageReader::new().unwrap();
 
     assert!(
@@ -240,9 +236,7 @@ fn is_installed_ge() {
         ("dev-libs", "openssl-3.1.0-r2"),
         ("dev-libs", "openssl-1.1.1w"),
     ]);
-    unsafe {
-        std::env::set_var("ROOT", root.to_str().unwrap());
-    }
+    let _env = common::set_root_env(&root);
     let reader = remerge::portage::PortageReader::new().unwrap();
 
     assert!(
@@ -262,9 +256,7 @@ fn is_installed_lt_le() {
         ("dev-libs", "openssl-3.1.0-r2"),
         ("dev-libs", "openssl-1.1.1w"),
     ]);
-    unsafe {
-        std::env::set_var("ROOT", root.to_str().unwrap());
-    }
+    let _env = common::set_root_env(&root);
     let reader = remerge::portage::PortageReader::new().unwrap();
 
     assert!(
@@ -281,9 +273,7 @@ fn is_installed_lt_le() {
 #[test]
 fn is_installed_tilde() {
     let (_tmp, root) = common::fixtures::vdb_tree(&[("dev-libs", "openssl-3.1.0-r2")]);
-    unsafe {
-        std::env::set_var("ROOT", root.to_str().unwrap());
-    }
+    let _env = common::set_root_env(&root);
     let reader = remerge::portage::PortageReader::new().unwrap();
 
     assert!(
@@ -296,9 +286,7 @@ fn is_installed_tilde() {
 #[test]
 fn is_installed_glob() {
     let (_tmp, root) = common::fixtures::vdb_tree(&[("dev-libs", "openssl-3.1.0-r2")]);
-    unsafe {
-        std::env::set_var("ROOT", root.to_str().unwrap());
-    }
+    let _env = common::set_root_env(&root);
     let reader = remerge::portage::PortageReader::new().unwrap();
 
     assert!(
@@ -315,9 +303,7 @@ fn is_installed_glob() {
 #[test]
 fn is_installed_set() {
     let (_tmp, root) = common::fixtures::vdb_tree(&[("dev-libs", "openssl-3.1.0")]);
-    unsafe {
-        std::env::set_var("ROOT", root.to_str().unwrap());
-    }
+    let _env = common::set_root_env(&root);
     let reader = remerge::portage::PortageReader::new().unwrap();
 
     assert!(!reader.is_installed("@world"), "sets are never installed");
@@ -327,9 +313,7 @@ fn is_installed_set() {
 #[test]
 fn is_installed_nonexistent() {
     let (_tmp, root) = common::fixtures::vdb_tree(&[("dev-libs", "openssl-3.1.0")]);
-    unsafe {
-        std::env::set_var("ROOT", root.to_str().unwrap());
-    }
+    let _env = common::set_root_env(&root);
     let reader = remerge::portage::PortageReader::new().unwrap();
 
     assert!(
@@ -368,11 +352,7 @@ fn fixture_vdb_tree() {
 #[test]
 fn expand_set_world() {
     let (_tmp, root) = common::fixtures::portage_tree();
-    // Safety: tests run with --test-threads=1 or in separate processes,
-    // but we still need unsafe for set_var in edition 2024.
-    unsafe {
-        std::env::set_var("ROOT", root.to_str().unwrap());
-    }
+    let _env = common::set_root_env(&root);
     let reader = portage::PortageReader::new().unwrap();
     let atoms = reader.expand_set("@world");
     assert!(!atoms.is_empty(), "world set should expand");
@@ -385,18 +365,13 @@ fn expand_set_world() {
         atoms.contains(&"sys-apps/systemd".to_string()),
         "world should contain sys-apps/systemd"
     );
-    unsafe {
-        std::env::remove_var("ROOT");
-    }
 }
 
 /// Unknown set names are passed through unchanged.
 #[test]
 fn expand_set_unknown_passthrough() {
     let (_tmp, root) = common::fixtures::portage_tree();
-    unsafe {
-        std::env::set_var("ROOT", root.to_str().unwrap());
-    }
+    let _env = common::set_root_env(&root);
     let reader = portage::PortageReader::new().unwrap();
     let atoms = reader.expand_set("@custom-set");
     assert_eq!(
@@ -404,9 +379,6 @@ fn expand_set_unknown_passthrough() {
         vec!["@custom-set"],
         "unknown set should pass through"
     );
-    unsafe {
-        std::env::remove_var("ROOT");
-    }
 }
 
 // ── PortageReader round-trip tests (Tasks 2.1-2.6) ──────────────────
@@ -416,9 +388,7 @@ fn expand_set_unknown_passthrough() {
 #[test]
 fn read_config_golden_path() {
     let (_tmp, root) = common::fixtures::portage_tree();
-    unsafe {
-        std::env::set_var("ROOT", root.to_str().unwrap());
-    }
+    let _env = common::set_root_env(&root);
     let reader = portage::PortageReader::new().unwrap();
     let config = reader.read_config().expect("read_config should succeed");
 
@@ -503,10 +473,6 @@ fn read_config_golden_path() {
         !config.make_conf.chost.is_empty(),
         "CHOST should be detected or read"
     );
-
-    unsafe {
-        std::env::remove_var("ROOT");
-    }
 }
 
 /// 2.2: read_config with missing optional dirs (no package.use/, etc.).
@@ -524,9 +490,7 @@ fn read_config_missing_optional_dirs() {
     )
     .expect("write make.conf");
 
-    unsafe {
-        std::env::set_var("ROOT", root.to_str().unwrap());
-    }
+    let _env = common::set_root_env(&root);
     let reader = portage::PortageReader::new().unwrap();
     let config = reader.read_config().expect("should handle missing dirs");
 
@@ -546,10 +510,6 @@ fn read_config_missing_optional_dirs() {
         config.profile_overlay.is_empty(),
         "profile_overlay should be empty with no dir"
     );
-
-    unsafe {
-        std::env::remove_var("ROOT");
-    }
 }
 
 /// 2.3: read_config with package.use as a single file vs. a directory.
@@ -573,9 +533,7 @@ fn read_config_package_use_single_file() {
     )
     .expect("write package.use");
 
-    unsafe {
-        std::env::set_var("ROOT", root.to_str().unwrap());
-    }
+    let _env = common::set_root_env(&root);
     let reader = portage::PortageReader::new().unwrap();
     let config = reader
         .read_config()
@@ -592,19 +550,13 @@ fn read_config_package_use_single_file() {
             .any(|e| e.atom == "dev-libs/openssl"),
         "should contain openssl entry"
     );
-
-    unsafe {
-        std::env::remove_var("ROOT");
-    }
 }
 
 /// 2.4: read_profile_overlay round-trip — write files, read back, compare.
 #[test]
 fn read_profile_overlay_round_trip() {
     let (_tmp, root) = common::fixtures::portage_tree();
-    unsafe {
-        std::env::set_var("ROOT", root.to_str().unwrap());
-    }
+    let _env = common::set_root_env(&root);
     let reader = portage::PortageReader::new().unwrap();
     let config = reader.read_config().expect("read config");
 
@@ -617,19 +569,13 @@ fn read_profile_overlay_round_trip() {
         content.contains("custom-flag"),
         "use.mask should contain custom-flag"
     );
-
-    unsafe {
-        std::env::remove_var("ROOT");
-    }
 }
 
 /// 2.5: read_patches_recursive with nested category/package/*.patch structure.
 #[test]
 fn read_patches_recursive_nested() {
     let (_tmp, root) = common::fixtures::portage_tree();
-    unsafe {
-        std::env::set_var("ROOT", root.to_str().unwrap());
-    }
+    let _env = common::set_root_env(&root);
     let reader = portage::PortageReader::new().unwrap();
     let config = reader.read_config().expect("read config");
 
@@ -640,10 +586,6 @@ fn read_patches_recursive_nested() {
         "patches should contain openssl patch, got keys: {:?}",
         config.patches.keys().collect::<Vec<_>>()
     );
-
-    unsafe {
-        std::env::remove_var("ROOT");
-    }
 }
 
 /// 2.6: read_repos_conf with multiple section blocks.
@@ -674,9 +616,7 @@ fn read_repos_conf_multiple_sections() {
     )
     .expect("write overlay.conf");
 
-    unsafe {
-        std::env::set_var("ROOT", root.to_str().unwrap());
-    }
+    let _env = common::set_root_env(&root);
     let reader = portage::PortageReader::new().unwrap();
     let config = reader.read_config().expect("read config");
 
@@ -696,8 +636,4 @@ fn read_repos_conf_multiple_sections() {
         all_content.contains("[guru]"),
         "should contain guru section"
     );
-
-    unsafe {
-        std::env::remove_var("ROOT");
-    }
 }

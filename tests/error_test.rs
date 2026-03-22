@@ -103,7 +103,13 @@ async fn profile_overlay_path_traversal_absolute() {
         .await
         .expect("should handle gracefully");
 
-    assert!(!std::path::Path::new("/tmp/etc/shadow").exists());
+    // The base directory should remain empty — no files written for
+    // absolute-path keys.
+    let entries: Vec<_> = std::fs::read_dir(&base).expect("read base dir").collect();
+    assert!(
+        entries.is_empty(),
+        "base dir should be empty after absolute path key is rejected, got: {entries:?}"
+    );
 }
 
 /// Profile overlay with empty key is rejected.
@@ -155,6 +161,14 @@ async fn patches_path_traversal_absolute() {
     remerge_worker::portage_setup::write_patches_inner(&base, &config)
         .await
         .expect("should handle gracefully");
+
+    // The base directory should remain empty — no files written for
+    // absolute-path keys.
+    let entries: Vec<_> = std::fs::read_dir(&base).expect("read base dir").collect();
+    assert!(
+        entries.is_empty(),
+        "base dir should be empty after absolute path key is rejected, got: {entries:?}"
+    );
 }
 
 // ── Validation edge cases ───────────────────────────────────────────

@@ -92,6 +92,7 @@ jobs:
         run: |
           docker pull ghcr.io/k-forss/remerge/test-stage3:latest || true
           docker tag ghcr.io/k-forss/remerge/test-stage3:latest gentoo/stage3:latest || true
+          docker tag ghcr.io/k-forss/remerge/test-stage3:latest remerge/test-stage3:latest || true
 
       - name: Run E2E tests
         run: cargo test --workspace --features integration,e2e

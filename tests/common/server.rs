@@ -172,10 +172,11 @@ impl TestServer {
             );
         }
 
-        let state = match remerge_server::state::AppState::new(config).await {
-            Ok(s) => std::sync::Arc::new(s),
-            Err(_) => return None,
-        };
+        let state = std::sync::Arc::new(
+            remerge_server::state::AppState::new(config)
+                .await
+                .expect("AppState::new failed — Docker is available but state init errored"),
+        );
 
         let queue_handle = if enable_queue {
             let q = state.clone();
