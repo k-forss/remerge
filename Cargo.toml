@@ -87,7 +87,7 @@ hex = "0.4"
 regex = "1"
 bytes = "1"
 tempfile = "3"
-tokio-tungstenite = "0.28"
+tokio-tungstenite = "0.29"
 
 [profile.release]
 lto = true
