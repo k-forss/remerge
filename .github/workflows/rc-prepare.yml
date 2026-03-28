@@ -30,7 +30,7 @@ jobs:
     # Skip commits made by this workflow to avoid infinite loops.
     if: "!startsWith(github.event.head_commit.message, 'release: prepare')"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
