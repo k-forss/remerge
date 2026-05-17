@@ -31,9 +31,40 @@ pub struct ServerConfig {
     #[serde(default = "default_max_workers")]
     pub max_workers: usize,
 
+    /// Maximum number of non-terminal workorders (pending, provisioning,
+    /// building) accepted at once.
+    ///
+    /// Additional submissions are rejected with 503 until capacity is freed.
+    #[serde(default = "default_max_active_workorders")]
+    pub max_active_workorders: usize,
+
+    /// Maximum HTTP request body size, in bytes.
+    ///
+    /// Applies to JSON workorder submission bodies.
+    #[serde(default = "default_request_body_size_bytes")]
+    pub request_body_size_bytes: usize,
+
+    /// Maximum allowed build duration, in seconds.
+    ///
+    /// Set to `0` to disable the timeout.
+    #[serde(default = "default_build_timeout_secs")]
+    pub build_timeout_secs: u64,
+
     /// How long (seconds) to keep idle worker containers before removing them.
     #[serde(default = "default_worker_idle_timeout")]
     pub worker_idle_timeout: u64,
+
+    /// Memory limit for worker containers, in bytes.
+    #[serde(default = "default_worker_memory_bytes")]
+    pub worker_memory_bytes: i64,
+
+    /// Relative CPU share weight for worker containers.
+    #[serde(default = "default_worker_cpu_shares")]
+    pub worker_cpu_shares: i64,
+
+    /// Docker network mode for worker containers.
+    #[serde(default = "default_worker_network_mode")]
+    pub worker_network_mode: String,
 
     /// Volume mount path inside workers for the binpkg output.
     #[serde(default = "default_worker_binpkg_mount")]
@@ -149,8 +180,26 @@ fn default_worker_image_prefix() -> String {
 fn default_max_workers() -> usize {
     4
 }
+fn default_max_active_workorders() -> usize {
+    256
+}
+fn default_request_body_size_bytes() -> usize {
+    2 * 1024 * 1024
+}
+fn default_build_timeout_secs() -> u64 {
+    4 * 60 * 60
+}
 fn default_worker_idle_timeout() -> u64 {
     3600
+}
+fn default_worker_memory_bytes() -> i64 {
+    4 * 1024 * 1024 * 1024
+}
+fn default_worker_cpu_shares() -> i64 {
+    1024
+}
+fn default_worker_network_mode() -> String {
+    "bridge".into()
 }
 fn default_worker_binpkg_mount() -> String {
     "/var/cache/binpkgs".into()
@@ -255,7 +304,13 @@ impl Default for ServerConfig {
             docker_socket: default_docker_socket(),
             worker_image_prefix: default_worker_image_prefix(),
             max_workers: default_max_workers(),
+            max_active_workorders: default_max_active_workorders(),
+            request_body_size_bytes: default_request_body_size_bytes(),
+            build_timeout_secs: default_build_timeout_secs(),
             worker_idle_timeout: default_worker_idle_timeout(),
+            worker_memory_bytes: default_worker_memory_bytes(),
+            worker_cpu_shares: default_worker_cpu_shares(),
+            worker_network_mode: default_worker_network_mode(),
             worker_binpkg_mount: default_worker_binpkg_mount(),
             auth: AuthConfig::default(),
             signing: SigningConfig::default(),
@@ -278,6 +333,22 @@ impl Default for ServerConfig {
 impl ServerConfig {
     /// Validate configuration values and log warnings for problems.
     pub fn validate(&mut self) {
+        if self.request_body_size_bytes == 0 {
+            tracing::warn!("request_body_size_bytes must be > 0 — resetting to default");
+            self.request_body_size_bytes = default_request_body_size_bytes();
+        }
+        if self.worker_memory_bytes <= 0 {
+            tracing::warn!("worker_memory_bytes must be > 0 — resetting to default");
+            self.worker_memory_bytes = default_worker_memory_bytes();
+        }
+        if self.worker_cpu_shares <= 0 {
+            tracing::warn!("worker_cpu_shares must be > 0 — resetting to default");
+            self.worker_cpu_shares = default_worker_cpu_shares();
+        }
+        if self.worker_network_mode.trim().is_empty() {
+            tracing::warn!("worker_network_mode must not be empty — resetting to default");
+            self.worker_network_mode = default_worker_network_mode();
+        }
         if let Some(ref path) = self.repos_dir {
             if !path.exists() {
                 tracing::warn!(path = %path.display(), "repos_dir does not exist — ignoring");
@@ -318,10 +389,38 @@ impl ServerConfig {
         {
             config.max_workers = n;
         }
+        if let Ok(v) = std::env::var("REMERGE_MAX_ACTIVE_WORKORDERS")
+            && let Ok(n) = v.parse()
+        {
+            config.max_active_workorders = n;
+        }
+        if let Ok(v) = std::env::var("REMERGE_REQUEST_BODY_SIZE_BYTES")
+            && let Ok(n) = v.parse()
+        {
+            config.request_body_size_bytes = n;
+        }
+        if let Ok(v) = std::env::var("REMERGE_BUILD_TIMEOUT_SECS")
+            && let Ok(n) = v.parse()
+        {
+            config.build_timeout_secs = n;
+        }
         if let Ok(v) = std::env::var("REMERGE_WORKER_IDLE_TIMEOUT")
             && let Ok(n) = v.parse()
         {
             config.worker_idle_timeout = n;
+        }
+        if let Ok(v) = std::env::var("REMERGE_WORKER_MEMORY_BYTES")
+            && let Ok(n) = v.parse()
+        {
+            config.worker_memory_bytes = n;
+        }
+        if let Ok(v) = std::env::var("REMERGE_WORKER_CPU_SHARES")
+            && let Ok(n) = v.parse()
+        {
+            config.worker_cpu_shares = n;
+        }
+        if let Ok(v) = std::env::var("REMERGE_WORKER_NETWORK_MODE") {
+            config.worker_network_mode = v;
         }
         if let Ok(v) = std::env::var("REMERGE_WORKER_BINPKG_MOUNT") {
             config.worker_binpkg_mount = v;

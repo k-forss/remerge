@@ -78,7 +78,7 @@ impl PortageReader {
         let content = fs::read_to_string(&path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
 
-        let vars = Self::parse_shell_vars(&content);
+        let vars = Self::parse_make_conf_vars(&content);
 
         let split_flags = |key: &str| -> Vec<String> {
             vars.get(key)
@@ -891,7 +891,7 @@ impl PortageReader {
         // 1. Try reading from make.conf.
         let path = self.root.join("etc/portage/make.conf");
         if let Ok(content) = fs::read_to_string(&path) {
-            let vars = Self::parse_shell_vars(&content);
+            let vars = Self::parse_make_conf_vars(&content);
             if let Some(chost) = vars.get("CHOST")
                 && !chost.is_empty()
             {
@@ -970,7 +970,7 @@ impl PortageReader {
     fn detect_python_targets(&self) -> Vec<String> {
         let path = self.root.join("etc/portage/make.conf");
         if let Ok(content) = fs::read_to_string(&path) {
-            let vars = Self::parse_shell_vars(&content);
+            let vars = Self::parse_make_conf_vars(&content);
             if let Some(targets) = vars.get("PYTHON_TARGETS") {
                 return targets.split_whitespace().map(String::from).collect();
             }
@@ -985,7 +985,7 @@ impl PortageReader {
     ///
     /// For variables that need full resolution (including `source` directives
     /// and profile inheritance), use [`portageq_envvar`] instead.
-    fn parse_shell_vars(content: &str) -> BTreeMap<String, String> {
+    pub fn parse_make_conf_vars(content: &str) -> BTreeMap<String, String> {
         let mut vars = BTreeMap::new();
 
         // Join continuation lines (backslash-newline).
@@ -1005,8 +1005,9 @@ impl PortageReader {
                 let val = line[eq_pos + 1..].trim();
 
                 // Strip surrounding quotes.
-                let val = if (val.starts_with('"') && val.ends_with('"'))
-                    || (val.starts_with('\'') && val.ends_with('\''))
+                let val = if val.len() >= 2
+                    && ((val.starts_with('"') && val.ends_with('"'))
+                        || (val.starts_with('\'') && val.ends_with('\'')))
                 {
                     &val[1..val.len() - 1]
                 } else {
@@ -1372,7 +1373,7 @@ USE="X wayland -systemd pulseaudio"
 ACCEPT_KEYWORDS="~amd64"
 VIDEO_CARDS="amdgpu radeonsi"
 "#;
-        let vars = PortageReader::parse_shell_vars(input);
+        let vars = PortageReader::parse_make_conf_vars(input);
         assert_eq!(vars["CFLAGS"], "-O2 -pipe -march=native");
         assert_eq!(vars["CXXFLAGS"], "${CFLAGS}");
         assert_eq!(vars["MAKEOPTS"], "-j12");
@@ -1384,8 +1385,14 @@ VIDEO_CARDS="amdgpu radeonsi"
     #[test]
     fn parse_continuation_lines() {
         let input = "USE=\"foo \\\nbar \\\nbaz\"";
-        let vars = PortageReader::parse_shell_vars(input);
+        let vars = PortageReader::parse_make_conf_vars(input);
         assert_eq!(vars["USE"], "foo  bar  baz");
+    }
+
+    #[test]
+    fn parse_make_conf_vars_does_not_panic_on_single_quote_value() {
+        let vars = PortageReader::parse_make_conf_vars("BROKEN='");
+        assert_eq!(vars["BROKEN"], "'");
     }
 
     #[test]

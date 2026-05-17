@@ -14,6 +14,19 @@ use crate::portage::PortageReader;
 use remerge_types::client::ClientRole;
 use remerge_types::validation::validate_atom;
 
+/// Extract package atoms from emerge arguments.
+///
+/// Anything that doesn't start with `-` is treated as a potential atom.
+/// This covers qualified (`www-client/firefox`), unqualified (`firefox`),
+/// versioned (`=www-client/firefox-128.0`), and set (`@world`) forms.
+/// Emerge itself will reject truly invalid atoms.
+pub fn extract_package_atoms(args: &[String]) -> Vec<String> {
+    args.iter()
+        .filter(|arg| !arg.starts_with('-'))
+        .cloned()
+        .collect()
+}
+
 /// remerge — distributed Gentoo binary host builder.
 ///
 /// Drop-in wrapper for `emerge`.  Forwards your arguments to a remote build
@@ -210,6 +223,9 @@ impl Cli {
             "Workorder {} submitted — streaming progress…",
             resp.workorder_id
         );
+        if let Some(trace_id) = &resp.trace_id {
+            println!("Trace ID: {trace_id}");
+        }
 
         if self.submit_only {
             println!("Workorder ID: {}", resp.workorder_id);
@@ -260,18 +276,8 @@ impl Cli {
         self.run_emerge_locally(&local_args).await
     }
 
-    /// Extract package atoms from emerge arguments.
-    ///
-    /// Anything that doesn't start with `-` is treated as a potential atom.
-    /// This covers qualified (`www-client/firefox`), unqualified (`firefox`),
-    /// versioned (`=www-client/firefox-128.0`), and set (`@world`) forms.
-    /// Emerge itself will reject truly invalid atoms.
     fn extract_atoms(&self) -> Vec<String> {
-        self.emerge_args
-            .iter()
-            .filter(|a| !a.starts_with('-'))
-            .cloned()
-            .collect()
+        extract_package_atoms(&self.emerge_args)
     }
 
     /// Run emerge as a child process with the given arguments.
@@ -288,5 +294,41 @@ impl Cli {
             anyhow::bail!("emerge exited with status {}", status);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_package_atoms;
+
+    #[test]
+    fn extract_package_atoms_preserves_sets_and_versioned_atoms() {
+        let args = vec![
+            "--ask".to_string(),
+            "@world".to_string(),
+            "=dev-libs/openssl-3.1.4".to_string(),
+            "--with-bdeps=y".to_string(),
+            "firefox".to_string(),
+        ];
+
+        assert_eq!(
+            extract_package_atoms(&args),
+            vec![
+                "@world".to_string(),
+                "=dev-libs/openssl-3.1.4".to_string(),
+                "firefox".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_package_atoms_ignores_option_like_values() {
+        let args = vec![
+            "--jobs=8".to_string(),
+            "--keep-going".to_string(),
+            "-av".to_string(),
+        ];
+
+        assert!(extract_package_atoms(&args).is_empty());
     }
 }

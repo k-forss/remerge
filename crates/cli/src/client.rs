@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
+use remerge_types::trace::TRACEPARENT_HEADER;
 use remerge_types::{
     api::{SubmitWorkorderRequest, SubmitWorkorderResponse},
     client::{ClientId, ClientRole},
@@ -49,10 +50,19 @@ impl RemergeClient {
             portage_config: portage_config.clone(),
             system_id: system_id.clone(),
         };
+        let trace_context = remerge_observability::new_trace_context();
+
+        debug!(
+            trace_id = %trace_context.trace_id,
+            %client_id,
+            atom_count = atoms.len(),
+            "Submitting workorder with distributed trace context"
+        );
 
         let resp = self
             .http
             .post(format!("{}/api/v1/workorders", self.base_url))
+            .header(TRACEPARENT_HEADER, &trace_context.traceparent)
             .json(&req)
             .send()
             .await

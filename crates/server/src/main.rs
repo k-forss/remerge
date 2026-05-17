@@ -1,12 +1,15 @@
+use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::Parser;
+use tokio::task;
 use tracing::{info, warn};
-use tracing_subscriber::EnvFilter;
 
 use remerge_server::config::{self, ServerConfig};
+use remerge_server::signing;
 use remerge_server::state::AppState;
 use remerge_server::{api, persistence, queue};
 
@@ -30,31 +33,14 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = ServerConfig::load(&cli.config)?;
 
-    // Install tracing subscriber — JSON or human-readable.
-    let env_filter = EnvFilter::from_default_env();
-    if config.log_json {
-        tracing_subscriber::fmt()
-            .json()
-            .with_env_filter(env_filter)
-            .init();
-    } else {
-        tracing_subscriber::fmt().with_env_filter(env_filter).init();
-    }
+    let _telemetry = remerge_observability::init_tracing("remerge-server", config.log_json)?;
 
     info!(?config, "Loaded configuration");
 
-    if config.worker_binary.is_none() {
-        warn!(
-            "No worker binary found.  The server will not be able to build \
-             worker images.  Install the remerge-worker package or set \
-             worker_binary in the configuration."
-        );
-    } else {
-        info!(
-            worker_binary = ?config.worker_binary,
-            "Worker binary configured"
-        );
-    }
+    let worker_binary = validate_worker_binary(config.worker_binary.as_deref())?;
+    info!(worker_binary = ?worker_binary, "Worker binary configured");
+    let signing_config = config.signing.clone();
+    task::spawn_blocking(move || signing::validate_signing_config(&signing_config)).await??;
 
     let state = Arc::new(AppState::new(config).await?);
 
@@ -107,6 +93,30 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn validate_worker_binary(path: Option<&Path>) -> Result<&Path> {
+    let path = path.ok_or_else(|| {
+        anyhow::anyhow!(
+            "No worker binary configured. Install remerge-worker and set `worker_binary` or REMERGE_WORKER_BINARY before starting remerge-server."
+        )
+    })?;
+
+    let metadata = fs::metadata(path).map_err(|e| {
+        anyhow::anyhow!(
+            "Configured worker binary {:?} is not readable: {e}. Install remerge-worker or fix `worker_binary` before starting remerge-server.",
+            path
+        )
+    })?;
+
+    if !metadata.is_file() {
+        return Err(anyhow::anyhow!(
+            "Configured worker binary {:?} is not a regular file. Install remerge-worker or fix `worker_binary` before starting remerge-server.",
+            path
+        ));
+    }
+
+    Ok(path)
 }
 
 /// Serve the application with TLS using `tokio-rustls`.
@@ -288,5 +298,98 @@ async fn run_disk_usage_monitor(state: Arc<AppState>) {
                 warn!("Failed to check binpkg disk usage: {e:#}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_worker_binary;
+    use remerge_server::config::SigningConfig;
+    use remerge_server::signing::{validate_gpg_key, validate_signing_config};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("remerge-{name}-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn validate_worker_binary_requires_configuration() {
+        let err = validate_worker_binary(None).expect_err("missing worker binary should fail");
+        assert!(
+            err.to_string().contains("No worker binary configured"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn validate_worker_binary_rejects_directory() {
+        let dir = temp_path("worker-dir");
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let err = validate_worker_binary(Some(&dir)).expect_err("directory should fail");
+        assert!(
+            err.to_string().contains("not a regular file"),
+            "unexpected error: {err:#}"
+        );
+
+        fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn validate_worker_binary_accepts_regular_file() {
+        let path = temp_path("worker-bin");
+        fs::write(&path, b"#!/bin/sh\nexit 0\n").expect("write temp file");
+
+        let validated = validate_worker_binary(Some(&path)).expect("regular file should pass");
+        assert_eq!(validated, path.as_path());
+
+        fs::remove_file(path).expect("remove temp file");
+    }
+
+    #[test]
+    fn validate_signing_config_requires_complete_configuration() {
+        let err = validate_signing_config(&SigningConfig {
+            gpg_key: Some("0x1234".into()),
+            gpg_home: None,
+        })
+        .expect_err("partial signing config should fail");
+        assert!(err.to_string().contains("both `gpg_key` and `gpg_home`"));
+    }
+
+    #[test]
+    fn validate_gpg_key_rejects_missing_home() {
+        let missing = temp_path("missing-gnupg-home");
+        let err = validate_gpg_key(&missing, "0x1234").expect_err("missing home should fail");
+        assert!(err.to_string().contains("not readable"));
+    }
+
+    #[test]
+    fn validate_gpg_key_accepts_existing_secret_key() {
+        let gpg_home = temp_path("gnupg-home");
+        fs::create_dir_all(&gpg_home).expect("create gnupg home");
+
+        let status = Command::new("gpg")
+            .arg("--homedir")
+            .arg(&gpg_home)
+            .arg("--batch")
+            .arg("--pinentry-mode")
+            .arg("loopback")
+            .arg("--passphrase")
+            .arg("")
+            .arg("--quick-generate-key")
+            .arg("remerge-test@example.invalid")
+            .arg("default")
+            .arg("default")
+            .arg("never")
+            .status()
+            .expect("run gpg quick-generate-key");
+        assert!(status.success(), "gpg quick-generate-key should succeed");
+
+        validate_gpg_key(&gpg_home, "remerge-test@example.invalid")
+            .expect("generated signing key should validate");
+
+        fs::remove_dir_all(gpg_home).expect("remove gnupg home");
     }
 }

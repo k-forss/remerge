@@ -6,7 +6,25 @@
 //! Counters: workorders submitted/completed/failed/cancelled, build duration.
 //! Gauges: active builds, queue depth, binpkg disk usage.
 
+use std::collections::BTreeMap;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+const MAX_PACKAGE_BUILD_METRIC_SERIES: usize = 128;
+
+fn lock_package_builds(
+    mutex: &Mutex<BTreeMap<String, PackageBuildMetrics>>,
+) -> std::sync::MutexGuard<'_, BTreeMap<String, PackageBuildMetrics>> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[derive(Default)]
+struct PackageBuildMetrics {
+    builds_total: u64,
+    duration_secs_total: u64,
+}
 
 /// Atomic counters and gauges for server metrics.
 pub struct Metrics {
@@ -26,6 +44,24 @@ pub struct Metrics {
     pub queue_depth: AtomicU64,
     /// Total size of the binpkg repository directory in bytes.
     pub binpkg_disk_usage_bytes: AtomicU64,
+    /// Number of worker image build attempts.
+    pub worker_image_builds_total: AtomicU64,
+    /// Cumulative worker image build duration in seconds.
+    pub worker_image_build_duration_secs_total: AtomicU64,
+    /// Number of worker container start attempts.
+    pub worker_container_starts_total: AtomicU64,
+    /// Cumulative worker container startup duration in seconds.
+    pub worker_container_startup_duration_secs_total: AtomicU64,
+    /// Successful runtime cleanup operations.
+    pub cleanup_success_total: AtomicU64,
+    /// Failed runtime cleanup operations.
+    pub cleanup_failure_total: AtomicU64,
+    /// Best-effort package build completions detected from emerge output.
+    pub package_builds_total: AtomicU64,
+    /// Cumulative best-effort package build duration in seconds.
+    pub package_build_duration_secs_total: AtomicU64,
+    /// Bounded per-package timing aggregates for Prometheus label output.
+    package_builds_by_atom: Mutex<BTreeMap<String, PackageBuildMetrics>>,
 }
 
 impl Default for Metrics {
@@ -45,7 +81,53 @@ impl Metrics {
             builds_total_duration_secs: AtomicU64::new(0),
             queue_depth: AtomicU64::new(0),
             binpkg_disk_usage_bytes: AtomicU64::new(0),
+            worker_image_builds_total: AtomicU64::new(0),
+            worker_image_build_duration_secs_total: AtomicU64::new(0),
+            worker_container_starts_total: AtomicU64::new(0),
+            worker_container_startup_duration_secs_total: AtomicU64::new(0),
+            cleanup_success_total: AtomicU64::new(0),
+            cleanup_failure_total: AtomicU64::new(0),
+            package_builds_total: AtomicU64::new(0),
+            package_build_duration_secs_total: AtomicU64::new(0),
+            package_builds_by_atom: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    pub fn record_worker_image_build(&self, duration_secs: u64) {
+        self.worker_image_builds_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.worker_image_build_duration_secs_total
+            .fetch_add(duration_secs, Ordering::Relaxed);
+    }
+
+    pub fn record_worker_container_start(&self, duration_secs: u64) {
+        self.worker_container_starts_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.worker_container_startup_duration_secs_total
+            .fetch_add(duration_secs, Ordering::Relaxed);
+    }
+
+    pub fn record_cleanup(&self, success: bool) {
+        let counter = if success {
+            &self.cleanup_success_total
+        } else {
+            &self.cleanup_failure_total
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_package_build(&self, atom: &str, duration_secs: u64) {
+        self.package_builds_total.fetch_add(1, Ordering::Relaxed);
+        self.package_build_duration_secs_total
+            .fetch_add(duration_secs, Ordering::Relaxed);
+
+        let mut by_atom = lock_package_builds(&self.package_builds_by_atom);
+        if !by_atom.contains_key(atom) && by_atom.len() >= MAX_PACKAGE_BUILD_METRIC_SERIES {
+            return;
+        }
+        let entry = by_atom.entry(atom.to_string()).or_default();
+        entry.builds_total += 1;
+        entry.duration_secs_total += duration_secs;
     }
 
     /// Format metrics in Prometheus text exposition format.
@@ -100,9 +182,90 @@ impl Metrics {
             "Total size of the binpkg repository in bytes.",
             self.binpkg_disk_usage_bytes.load(Ordering::Relaxed),
         );
+        write_counter(
+            &mut out,
+            "remerge_worker_image_builds_total",
+            "Total number of worker image build attempts.",
+            self.worker_image_builds_total.load(Ordering::Relaxed),
+        );
+        write_counter(
+            &mut out,
+            "remerge_worker_image_build_duration_seconds_total",
+            "Total cumulative worker image build duration in seconds.",
+            self.worker_image_build_duration_secs_total
+                .load(Ordering::Relaxed),
+        );
+        write_counter(
+            &mut out,
+            "remerge_worker_container_starts_total",
+            "Total number of worker container start attempts.",
+            self.worker_container_starts_total.load(Ordering::Relaxed),
+        );
+        write_counter(
+            &mut out,
+            "remerge_worker_container_startup_duration_seconds_total",
+            "Total cumulative worker container startup duration in seconds.",
+            self.worker_container_startup_duration_secs_total
+                .load(Ordering::Relaxed),
+        );
+        write_counter(
+            &mut out,
+            "remerge_cleanup_success_total",
+            "Total successful worker runtime cleanup operations.",
+            self.cleanup_success_total.load(Ordering::Relaxed),
+        );
+        write_counter(
+            &mut out,
+            "remerge_cleanup_failure_total",
+            "Total failed worker runtime cleanup operations.",
+            self.cleanup_failure_total.load(Ordering::Relaxed),
+        );
+        write_counter(
+            &mut out,
+            "remerge_package_builds_total",
+            "Total best-effort package build completions detected from emerge output.",
+            self.package_builds_total.load(Ordering::Relaxed),
+        );
+        write_counter(
+            &mut out,
+            "remerge_package_build_duration_seconds_total",
+            "Total cumulative best-effort package build duration in seconds.",
+            self.package_build_duration_secs_total
+                .load(Ordering::Relaxed),
+        );
+
+        out.push_str(
+            "# HELP remerge_package_builds_by_atom_total Best-effort package build completions grouped by atom.\n",
+        );
+        out.push_str("# TYPE remerge_package_builds_by_atom_total counter\n");
+        out.push_str(
+            "# HELP remerge_package_build_duration_seconds_by_atom_total Best-effort package build duration grouped by atom.\n",
+        );
+        out.push_str("# TYPE remerge_package_build_duration_seconds_by_atom_total counter\n");
+
+        let by_atom = lock_package_builds(&self.package_builds_by_atom);
+        for (atom, metrics) in by_atom.iter() {
+            let atom = prometheus_escape_label_value(atom);
+            out.push_str(&format!(
+                "remerge_package_builds_by_atom_total{{atom=\"{atom}\"}} {}\n",
+                metrics.builds_total
+            ));
+            out.push_str(&format!(
+                "remerge_package_build_duration_seconds_by_atom_total{{atom=\"{atom}\"}} {}\n",
+                metrics.duration_secs_total
+            ));
+        }
+        out.push('\n');
 
         out
     }
+}
+
+fn prometheus_escape_label_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('"', "\\\"")
 }
 
 fn write_counter(out: &mut String, name: &str, help: &str, value: u64) {
@@ -115,4 +278,20 @@ fn write_gauge(out: &mut String, name: &str, help: &str, value: u64) {
     out.push_str(&format!("# HELP {name} {help}\n"));
     out.push_str(&format!("# TYPE {name} gauge\n"));
     out.push_str(&format!("{name} {value}\n\n"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Metrics;
+
+    #[test]
+    fn prometheus_output_includes_package_labels() {
+        let metrics = Metrics::new();
+        metrics.record_package_build("dev-libs/openssl", 12);
+        metrics.record_cleanup(true);
+
+        let body = metrics.to_prometheus();
+        assert!(body.contains("remerge_package_builds_by_atom_total{atom=\"dev-libs/openssl\"} 1"));
+        assert!(body.contains("remerge_cleanup_success_total 1"));
+    }
 }

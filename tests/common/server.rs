@@ -104,7 +104,7 @@ pub struct TestServer {
 
 impl TestServer {
     /// Start an in-process test server. Requires Docker to be available.
-    pub async fn start() -> Option<Self> {
+    pub async fn start() -> Self {
         Self::start_inner(None, false).await
     }
 
@@ -117,7 +117,7 @@ impl TestServer {
     ///
     /// Uses the pre-synced `remerge/test-stage3:latest` image as the
     /// worker base to avoid the slow `emerge --sync` during image builds.
-    pub async fn start_with_queue() -> Option<Self> {
+    pub async fn start_with_queue() -> Self {
         ensure_test_stage3();
 
         let mut config = remerge_server::config::ServerConfig {
@@ -135,23 +135,43 @@ impl TestServer {
         Self::start_inner(Some(config), true).await
     }
 
+    /// Start an in-process test server with the queue processor enabled and a
+    /// caller-supplied config override.
+    pub async fn start_with_queue_config(mut config: remerge_server::config::ServerConfig) -> Self {
+        ensure_test_stage3();
+
+        if config.worker_base_image.is_none() {
+            config.worker_base_image = Some(TEST_STAGE3_IMAGE.to_string());
+        }
+        config.skip_worker_sync = true;
+
+        Self::start_inner(Some(config), true).await
+    }
+
     /// Start an in-process test server with a custom config override.
     /// If `config_override` is None, uses the default config.
     pub async fn start_with_config(
         config_override: Option<remerge_server::config::ServerConfig>,
-    ) -> Option<Self> {
+    ) -> Self {
         Self::start_inner(config_override, false).await
     }
 
     async fn start_inner(
         config_override: Option<remerge_server::config::ServerConfig>,
         enable_queue: bool,
-    ) -> Option<Self> {
-        if !docker_available() {
-            return None;
-        }
+    ) -> Self {
+        assert!(
+            docker_available(),
+            "Docker is required for integration tests but was not found"
+        );
 
-        let port = super::free_port();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let port = listener
+            .local_addr()
+            .expect("read test listener local addr")
+            .port();
         let binpkg_dir = tempfile::TempDir::new().expect("temp dir");
         let state_dir = tempfile::TempDir::new().expect("temp dir");
 
@@ -188,8 +208,6 @@ impl TestServer {
         };
 
         let app = remerge_server::api::router(state.clone());
-        let addr = format!("127.0.0.1:{port}");
-        let listener = tokio::net::TcpListener::bind(&addr).await.ok()?;
 
         let handle = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
@@ -198,7 +216,7 @@ impl TestServer {
         // Wait a bit for the server to start
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        Some(TestServer {
+        TestServer {
             port,
             base_url: format!("http://127.0.0.1:{port}"),
             state,
@@ -206,7 +224,7 @@ impl TestServer {
             _queue_handle: queue_handle,
             _binpkg_dir: binpkg_dir,
             _state_dir: state_dir,
-        })
+        }
     }
 }
 

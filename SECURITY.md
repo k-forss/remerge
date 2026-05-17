@@ -63,3 +63,26 @@ Out of scope:
 - Denial of service via malformed requests (low severity for a build service)
 - Issues in upstream dependencies (report those upstream, but let us know)
 - Vulnerabilities in the reverse proxy configuration (that's your deployment)
+
+## Deployment trust boundary
+
+When `auth.mode` is `mtls` or `mixed`, the reverse proxy becomes part of the security boundary.
+
+- Strip any client-supplied certificate fingerprint header before forwarding requests.
+- Inject the configured fingerprint header only after successful client certificate validation.
+- Keep `/metrics` on an internal-only route or behind the same mTLS gate.
+- In `mtls` mode, protect `/binpkgs` with the same verified client certificate path.
+
+If the proxy forwards untrusted fingerprint headers, remerge cannot distinguish a real client certificate from a spoofed one.
+
+## Rate limiting expectations
+
+remerge does not implement in-process request rate limiting. Deployments are expected to enforce it at the reverse proxy or edge load balancer.
+
+Minimum recommendation:
+
+- throttle `POST /api/v1/workorders` per client identity and source IP
+- tightly bound `GET /metrics` to trusted scrapers
+- cap `GET /binpkgs/...` bandwidth or request rate per source IP
+
+The server enforces request-size, queue-capacity, build-timeout, and container CPU/memory/network settings, but those are containment controls rather than internet-facing abuse protection.

@@ -9,6 +9,7 @@
 # Prerequisites:
 #   - Docker with compose v2
 #   - The server needs access to the Docker socket to manage worker containers.
+#   - The server image does not bundle `remerge-worker`; mount it from the host.
 
 services:
   server:
@@ -20,10 +21,16 @@ services:
     volumes:
       # Docker socket — the server creates worker containers.
       - /var/run/docker.sock:/var/run/docker.sock
+      # Worker binary mounted into the container for dynamic worker-image builds.
+      - /usr/local/bin/remerge-worker:/usr/local/bin/remerge-worker:ro
       # Persistent binpkg storage.
       - remerge-binpkgs:/var/cache/remerge/binpkgs
       # Persistent state (workorders, results, client registry).
       - remerge-state:/var/lib/remerge
+      # Uncomment if using binpkg signing:
+      # - /path/to/gnupg:/var/cache/remerge/gnupg:ro
+      # Uncomment if using a host-synced Portage tree:
+      # - /var/db/repos:/var/db/repos:ro
     environment:
       RUST_LOG: "remerge_server=info,tower_http=info"
 
@@ -35,14 +42,31 @@ services:
       # Set this to your server's public address.
       REMERGE_BINHOST_URL: "http://remerge.example.com:7654/binpkgs"
 
+      # Worker binary path inside the container.
+      REMERGE_WORKER_BINARY: "/usr/local/bin/remerge-worker"
+
       # Maximum concurrent worker containers.
       REMERGE_MAX_WORKERS: "4"
+
+      # Maximum accepted non-terminal workorders.
+      # REMERGE_MAX_ACTIVE_WORKORDERS: "256"
+
+      # Maximum request body size in bytes.
+      # REMERGE_REQUEST_BODY_SIZE_BYTES: "2097152"
+
+      # Maximum build duration in seconds.
+      # REMERGE_BUILD_TIMEOUT_SECS: "14400"
 
       # Seconds to keep idle worker containers before removing them.
       REMERGE_WORKER_IDLE_TIMEOUT: "3600"
 
       # Docker image prefix for worker images.
       REMERGE_WORKER_IMAGE_PREFIX: "remerge-worker"
+
+      # Worker container resource controls.
+      # REMERGE_WORKER_MEMORY_BYTES: "4294967296"
+      # REMERGE_WORKER_CPU_SHARES: "1024"
+      # REMERGE_WORKER_NETWORK_MODE: "bridge"
 
       # ── State & retention ─────────────────────────────────────
       # REMERGE_STATE_DIR: "/var/lib/remerge"
@@ -62,9 +86,13 @@ services:
       # Uncomment to enable GPG signing of binary packages.
       # REMERGE_GPG_KEY: "0x1234567890ABCDEF"
       # REMERGE_GPG_HOME: "/var/cache/remerge/gnupg"
-    # volumes:
-    #   # Uncomment if using binpkg signing:
-    #   - /path/to/gnupg:/var/cache/remerge/gnupg:ro
+
+      # ── Optional host-synced ebuild mirror ────────────────────
+      # REMERGE_REPOS_DIR: "/var/db/repos"
+
+      # ── Authentication and reverse proxy ──────────────────────
+      # REMERGE_AUTH_MODE: "mixed"
+      # REMERGE_AUTH_CERT_HEADER: "X-Client-Cert-Fingerprint"
 
 volumes:
   remerge-binpkgs:

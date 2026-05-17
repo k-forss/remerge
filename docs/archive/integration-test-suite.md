@@ -37,6 +37,17 @@ always-pass branches.
 - If a test is correct but depends on unavailable external state, document the
   prerequisite or known failure explicitly.
 
+## Current verification notes
+
+- `cargo test --workspace` remains the ungated local verification command.
+- `cargo test --workspace --features integration` still requires Docker.
+- `cargo test --workspace --features integration --test load_test` exercises
+  concurrent submission pressure without needing the slower E2E pipeline.
+- `cargo test --workspace --features integration,e2e` still requires Docker,
+  a usable `remerge-worker` binary, and the `remerge/test-stage3:latest`
+  image. CI first tries to pull that image from GHCR and falls back to the
+  local test harness build path when it is absent.
+
 ## Historical source
 
 The original checklist was removed from the repository root to avoid maintaining

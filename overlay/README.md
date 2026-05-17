@@ -78,6 +78,21 @@ Signing key fingerprint:
 C075 B1EF DC2E 4D23 817A  1BB3 F5B0 BB05 FABD 6151
 ```
 
+This key verifies remerge release artifacts. It does not replace the public key
+used by a running remerge server for signed `.gpkg` binpkgs.
+
+For binpkg verification against a deployed remerge server:
+
+```sh
+curl -fsS https://remerge.example.com/api/v1/signing-key \
+  -o /etc/portage/gnupg/remerge-binpkg.asc
+gpg --homedir /etc/portage/gnupg --import /etc/portage/gnupg/remerge-binpkg.asc
+curl -fsS https://remerge.example.com/api/v1/info
+```
+
+If the server reports `binpkg_signing = true`, import that key and enable
+Portage binpkg signature verification before consuming its binary packages.
+
 ## Server installation
 
 The server ebuilds include OpenRC and systemd service files:

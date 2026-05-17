@@ -2,6 +2,8 @@
 
 Internal documentation for maintainers and contributors.  For user-facing
 installation and usage instructions, see [README.md](README.md).
+For operator deployment, backup, rollback, and monitoring guidance, see
+[docs/operations.md](docs/operations.md).
 For contribution guidelines, see [CONTRIBUTING.md](CONTRIBUTING.md).
 For current project status, release-readiness gates, and implementation-ordered
 future work, see [ROADMAP.md](ROADMAP.md).
@@ -26,7 +28,7 @@ All workflows live in `.github/workflows/`:
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
-| `ci.yml` | push / PR to `main`, `rc-*` | `cargo fmt`, `clippy`, `test` |
+| `ci.yml` | push / PR to `main`, `rc-*` | `cargo fmt`, `clippy`, unit tests, fuzz smoke, and full-stack Docker tests |
 | `audit.yml` | push / schedule | `cargo deny check` (licenses + advisories) |
 | `docker.yml` | push to `main` | Build + push multi-arch Docker image to GHCR |
 | `release.yml` | tag `v*` | Multi-arch binary builds, packaging, SLSA attestation, GitHub Release |
@@ -35,12 +37,70 @@ All workflows live in `.github/workflows/`:
 | `rc-prepare.yml` | push to `rc-*` branch | Auto-update changelog and create versioned overlay ebuilds |
 | `release-tag.yml` | PR merge from `rc-*` to `main` | Auto-create release tag |
 
+### Test organization and prerequisites
+
+- `cargo test --workspace` covers the ungated unit/filesystem suites.
+- `cargo test --workspace --features integration` enables the Docker-backed
+  server API and container integration tests.
+- `cargo test --workspace --features integration --test load_test` runs the
+  concurrent submission/load suite that exercises queue-capacity behavior.
+- `cargo test --workspace --features integration,e2e` enables the full
+  CLI to server to worker pipeline and is the Docker-backed CI stack on both
+  pushes and PRs.
+- The main `test` job uses `cargo nextest run --workspace --profile ci`, which
+  emits JUnit output via `.config/nextest.toml`.
+- CI compares that JUnit output against `.config/test-duration-baseline.json`
+  with `scripts/test_duration_baseline.py` and fails when a tracked test slows
+  down by 25% or more.
+- Integration and E2E runs require Docker. The full-stack CI run also requires
+  the `remerge/test-stage3:latest` image; CI pulls it from GHCR first and the
+  test harness lazily builds it from `docker/test-stage3.Dockerfile` if needed.
+- The fuzz smoke job runs on every push and PR from `fuzz/` with short
+  libFuzzer budgets. For deeper local runs, use `cargo fuzz run <target>` from
+  the `fuzz/` directory.
+
+### Refreshing the duration baseline
+
+- Run `cargo nextest run --workspace --profile ci`.
+- Update the checked-in baseline with:
+  `python3 scripts/test_duration_baseline.py --junit target/nextest/ci/junit.xml --baseline .config/test-duration-baseline.json --write-baseline`.
+- Review the diff before committing so transient local outliers do not become
+  the new baseline.
+
 ### Dependency management
 
 - **Dependabot** (`.github/dependabot.yml`) monitors Cargo, GitHub Actions,
   and Docker dependencies with weekly checks.
 - **`cargo deny`** (`deny.toml`) enforces license allowlist and advisory
   database checks.
+
+### Worker binary deployment prerequisite
+
+- `remerge-server` requires a readable `remerge-worker` binary before startup.
+- Set `worker_binary` in the server config or `REMERGE_WORKER_BINARY` in the
+  environment to the installed binary path.
+- The server now exits early if the path is missing or unreadable instead of
+  waiting for the first worker-image build to fail.
+
+### Client identity contract
+
+- The CLI persists `client_id` in `/etc/remerge.conf` on first run whenever the
+  config file is writable.
+- If a config file exists without `client_id`, the CLI backfills and rewrites
+  one so identities do not drift across restarts.
+- Shared identities remain operator-managed: if multiple hosts intentionally use
+  the same `client_id`, exactly one should be `main` and the rest should be
+  `follower`.
+
+### Deployment hardening notes
+
+- `auth.mode=mtls` protects all certificate-aware endpoints, including `/metrics` and `/binpkgs`.
+- `auth.mode=mixed` keeps `/metrics` behind mTLS but intentionally leaves `/binpkgs` public for client binhost downloads.
+- Reverse proxies must strip inbound certificate fingerprint headers and re-inject them only after successful client certificate verification.
+- Rate limiting is intentionally delegated to the reverse proxy. Apply path-specific policies for workorder submissions, metrics scraping, and binpkg downloads.
+- Binary package signing startup validation now fails fast when `gpg_key` / `gpg_home` are partially configured or when the configured secret key is absent from the keyring.
+- The example server config now documents request body, queue depth, build timeout, and worker CPU/memory/network limits. Keep those aligned with the reverse-proxy ceilings.
+- remerge intentionally does not implement a server-side package-category allowlist. Constrain submissions with auth, proxy policy, and rate limits rather than atom-category gating.
 
 ---
 
@@ -355,3 +415,13 @@ docker compose build
 ```
 
 Push workflow is in `.github/workflows/docker.yml`.
+
+Worker image layering notes:
+
+- At runtime, the server now builds worker images in two layers: a cached base
+  image per system identity plus a thin layer that only injects the current
+  `remerge-worker` binary.
+- `worker_base_image` seeds the cached base-layer build. Use it for pre-synced
+  stage3 images in CI or controlled deployments.
+- The cached base layer is disposable and may be rebuilt; it is not part of the
+  persistent backup set.

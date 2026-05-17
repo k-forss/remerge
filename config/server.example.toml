@@ -5,6 +5,7 @@
 
 # Directory where binary packages are stored.
 # This is also served over HTTP as the binhost.
+# Back this up if you want to preserve built packages across host loss.
 binpkg_dir = "/var/cache/remerge/binpkgs"
 
 # Base URL that clients use to reach the binhost repository.
@@ -21,10 +22,32 @@ worker_image_prefix = "remerge-worker"
 # Maximum concurrent worker containers.
 max_workers = 4
 
+# Maximum number of non-terminal workorders accepted at once.
+# Additional submissions return HTTP 503 until capacity frees up.
+max_active_workorders = 256
+
+# Maximum JSON request body size in bytes.
+# Oversized workorder submissions are rejected before parsing.
+request_body_size_bytes = 2097152
+
+# Maximum build duration in seconds.
+# Set to 0 to disable, but keeping a finite timeout is strongly recommended.
+build_timeout_secs = 14400
+
 # Seconds to keep idle worker containers before removing them.
 # The reaper preserves the most recently used image per
 # (CHOST, profile, GCC) tuple and only evicts duplicates.
 worker_idle_timeout = 3600
+
+# Worker container memory limit in bytes.
+worker_memory_bytes = 4294967296
+
+# Worker container CPU share weight.
+worker_cpu_shares = 1024
+
+# Docker network mode for worker containers.
+# Use "none" if you provide all sources and overlays out-of-band.
+worker_network_mode = "bridge"
 
 # Path inside worker containers where binpkgs are written.
 # This is bind-mounted from the host's binpkg_dir.
@@ -42,6 +65,7 @@ worker_binpkg_mount = "/var/cache/binpkgs"
 # ── State & retention ───────────────────────────────────────────
 # Directory for persisting workorders, results, and client registry
 # across server restarts.
+# Back this up before upgrades if you want rollback to restore state cleanly.
 state_dir = "/var/lib/remerge"
 
 # How many hours to keep completed/failed workorders before automatic
@@ -65,8 +89,24 @@ max_retained_workorders = 1000
 
 # ── Worker binary ───────────────────────────────────────────────
 # Path to the remerge-worker binary on the host.
-# When set, it is COPY'd into Docker images during build.
+# The server now fails fast at startup if this path is missing or unreadable.
+# Build/install remerge-worker first, then point this at the installed binary.
+# A typical source-build path is target/release/remerge-worker; a typical
+# packaged install path is /usr/local/bin/remerge-worker.
 # worker_binary = "/usr/local/bin/remerge-worker"
+
+# Optional root image for cached worker base layers.
+# The server builds worker images in two steps:
+#   1. a cached base layer per (CHOST, profile, GCC)
+#   2. a thin runtime layer that injects remerge-worker
+# Set this to a pre-synced stage3 or other curated base image if you want to
+# avoid `emerge --sync` while building cached worker base layers.
+# worker_base_image = "ghcr.io/k-forss/remerge/test-stage3:latest"
+
+# Force cached worker base layers to skip the initial sync step.
+# Safe only when worker_base_image or the chosen base already has a usable
+# Portage tree.
+# skip_worker_sync = false
 
 # ── Native TLS (optional) ───────────────────────────────────────
 # For direct HTTPS without a reverse proxy.
@@ -86,15 +126,29 @@ max_retained_workorders = 1000
 # [signing]
 # gpg_key = "0x1234567890ABCDEF"
 # gpg_home = "/var/cache/remerge/gnupg"
+# Back up gpg_home if the signing key is not recoverable elsewhere.
+# The server validates this key at startup and exits if the secret key is
+# missing from gpg_home.
 
 # ── Authentication (optional) ───────────────────────────────────
 # Three modes: "none" (default), "mtls", "mixed".
+# Endpoint exposure is derived from this mode:
+#   none  -> /metrics public, /binpkgs public
+#   mtls  -> /metrics protected, /binpkgs protected
+#   mixed -> /metrics protected, /binpkgs public
+#
+# The reverse proxy must strip any inbound certificate header and inject the
+# configured one only after successful client certificate verification.
+# Rate limiting is expected at the reverse proxy layer, especially for
+# POST /api/v1/workorders, GET /metrics, and GET /binpkgs/...
+# remerge intentionally does not enforce a server-side package-category
+# allowlist; restrict access with auth and reverse-proxy policy instead.
 #
 # [auth]
 # mode = "none"
 # cert_header = "X-Client-Cert-Fingerprint"
 #
-# [[auth.certs]]
+# [[auth.clients]]
 # fingerprint = "SHA256:..."
 # client_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 # role = "main"
