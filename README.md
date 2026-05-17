@@ -10,6 +10,12 @@ Distributed binary package builder for Gentoo Linux.
 to a remote build server running Docker workers, then installs the resulting
 binary packages locally via portage's native binhost support.
 
+## Project status and roadmap
+
+Current project status, release-readiness gates, and implementation-ordered
+future work are tracked in [`ROADMAP.md`](ROADMAP.md).  Historical integration
+test planning has been archived under [`docs/archive/`](docs/archive/).
+
 ## Architecture
 
 ```

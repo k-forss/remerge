@@ -3,6 +3,8 @@
 Internal documentation for maintainers and contributors.  For user-facing
 installation and usage instructions, see [README.md](README.md).
 For contribution guidelines, see [CONTRIBUTING.md](CONTRIBUTING.md).
+For current project status, release-readiness gates, and implementation-ordered
+future work, see [ROADMAP.md](ROADMAP.md).
 
 ## Table of contents
 

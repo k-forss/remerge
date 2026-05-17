@@ -120,7 +120,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Known limitations
 
-- No integration or end-to-end tests — unit tests only
-- OpenTelemetry trace propagation not implemented
-- `remerge_queue_depth` metric defined but not wired to the queue processor
-- `@system` set expansion does not resolve virtual packages
+- OpenTelemetry trace propagation is not implemented.
+- `remerge_queue_depth` needs a fresh audit before release readiness is claimed.
+- `@system` set expansion does not resolve virtual packages.
+- Production deployment hardening and operator runbooks are tracked in
+  [`ROADMAP.md`](ROADMAP.md).
