@@ -1,0 +1,30 @@
+[package]
+name = "remerge-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+remerge = { path = "../crates/cli" }
+remerge-types = { path = "../crates/types" }
+
+[[bin]]
+name = "make_conf_vars"
+path = "fuzz_targets/make_conf_vars.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "emerge_arg_filtering"
+path = "fuzz_targets/emerge_arg_filtering.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = []

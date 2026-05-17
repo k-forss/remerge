@@ -4,9 +4,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bytes::Bytes;
-use tokio::sync::{RwLock, Semaphore, broadcast, mpsc};
+use tokio::sync::{Mutex, RwLock, Semaphore, broadcast, mpsc};
+use tokio::task;
 
 use remerge_types::workorder::{BuildProgress, Workorder, WorkorderId, WorkorderResult};
 
@@ -16,6 +17,7 @@ use crate::docker::DockerManager;
 use crate::metrics::Metrics;
 use crate::registry::ClientRegistry;
 use crate::repo::BinpkgRepo;
+use crate::signing::ExportedSigningKey;
 
 /// Central application state shared across handlers and the queue processor.
 pub struct AppState {
@@ -30,6 +32,9 @@ pub struct AppState {
 
     /// Pending + active workorders.
     pub workorders: RwLock<HashMap<WorkorderId, Workorder>>,
+
+    /// Serializes submission admission so capacity checks and inserts stay atomic.
+    pub submission_lock: Mutex<()>,
 
     /// Completed workorder results.
     pub results: RwLock<HashMap<WorkorderId, WorkorderResult>>,
@@ -63,12 +68,20 @@ pub struct AppState {
 
     /// Binary package repository.
     pub binpkg_repo: BinpkgRepo,
+
+    /// Exported public signing key, if binpkg signing is enabled.
+    pub signing_key: Option<ExportedSigningKey>,
 }
 
 impl AppState {
     pub async fn new(config: ServerConfig) -> Result<Self> {
         let docker = DockerManager::new(&config).await?;
         let auth = CertRegistry::new(&config.auth);
+        let signing_config = config.signing.clone();
+        let signing_key =
+            task::spawn_blocking(move || crate::signing::export_public_key(&signing_config))
+                .await
+                .context("signing-key export task panicked")??;
 
         // Ensure binpkg directory exists.
         tokio::fs::create_dir_all(&config.binpkg_dir).await?;
@@ -93,6 +106,7 @@ impl AppState {
             auth,
             clients: ClientRegistry::from_persisted(persisted_clients),
             workorders: RwLock::new(HashMap::new()),
+            submission_lock: Mutex::new(()),
             results: RwLock::new(persisted_results),
             progress_txs: RwLock::new(HashMap::new()),
             raw_output_txs: RwLock::new(HashMap::new()),
@@ -103,6 +117,7 @@ impl AppState {
             started_at: Instant::now(),
             metrics: Metrics::new(),
             binpkg_repo,
+            signing_key,
         })
     }
 

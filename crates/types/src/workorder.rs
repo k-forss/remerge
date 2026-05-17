@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use crate::client::{ClientId, ClientRole};
 use crate::portage::{PortageConfig, SystemIdentity};
+use crate::trace::TraceContext;
 
 /// Unique identifier for a workorder.
 pub type WorkorderId = Uuid;
@@ -39,6 +40,10 @@ pub struct Workorder {
 
     /// System identity of the requesting host (determines worker image).
     pub system_id: SystemIdentity,
+
+    /// Root distributed-trace context for this workorder.
+    #[serde(default)]
+    pub trace_context: Option<TraceContext>,
 
     /// Current status.
     pub status: WorkorderStatus,
@@ -73,6 +78,9 @@ pub enum WorkorderStatus {
 pub struct BuildProgress {
     /// Which workorder this belongs to.
     pub workorder_id: WorkorderId,
+    /// Root trace ID for correlating progress with CLI, server, and worker logs.
+    #[serde(default)]
+    pub trace_id: Option<String>,
     /// The event payload.
     pub event: BuildEvent,
     /// Timestamp.

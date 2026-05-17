@@ -5,9 +5,10 @@ use std::sync::atomic::Ordering;
 
 use axum::{
     Router,
-    extract::{Path, State, WebSocketUpgrade, ws},
-    http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    extract::{DefaultBodyLimit, Path, Request, State, WebSocketUpgrade, ws},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
 use tracing::{info, warn};
@@ -15,6 +16,7 @@ use uuid::Uuid;
 
 use futures::StreamExt;
 
+use remerge_types::trace::TRACEPARENT_HEADER;
 use remerge_types::validation::validate_atom;
 use remerge_types::{api::*, workorder::*};
 
@@ -24,9 +26,10 @@ type SharedState = Arc<AppState>;
 
 /// Build the axum router.
 pub fn router(state: SharedState) -> Router {
-    Router::new()
+    let public_router = Router::new()
         // Public API
         .route("/api/v1/info", get(server_info))
+        .route("/api/v1/signing-key", get(signing_key))
         .route("/api/v1/health", get(health))
         .route("/api/v1/workorders", post(submit_workorder))
         .route("/api/v1/workorders", get(list_workorders))
@@ -35,16 +38,43 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/v1/workorders/{id}/progress", get(ws_progress))
         // Admin / status endpoints.
         .route("/api/v1/clients", get(list_clients))
-        .route("/api/v1/clients/{id}", get(get_client))
-        // Observability.
+        .route("/api/v1/clients/{id}", get(get_client));
+
+    let observability_router = Router::new()
         .route("/metrics", get(metrics))
-        // Static file serving for binpkgs.
         .nest_service(
             "/binpkgs",
             tower_http::services::ServeDir::new(&state.config.binpkg_dir),
         )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            protect_observability_and_binpkgs,
+        ));
+
+    public_router
+        .merge(observability_router)
+        .layer(DefaultBodyLimit::max(state.config.request_body_size_bytes))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
+}
+
+async fn protect_observability_and_binpkgs(
+    State(state): State<SharedState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let path = request.uri().path();
+    let requires_auth = match state.auth.mode() {
+        remerge_types::auth::AuthMode::None => false,
+        remerge_types::auth::AuthMode::Mtls => path == "/metrics" || path.starts_with("/binpkgs"),
+        remerge_types::auth::AuthMode::Mixed => path == "/metrics",
+    };
+
+    if requires_auth && state.auth.resolve_header_only(request.headers()).is_none() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    Ok(next.run(request).await)
 }
 
 // ─── Handlers ───────────────────────────────────────────────────────
@@ -72,7 +102,27 @@ async fn server_info(State(state): State<SharedState>) -> impl IntoResponse {
         queued_workorders: queued,
         auth_mode: state.auth.mode(),
         binpkg_signing: state.config.signing.enabled(),
+        signing_key_fingerprint: state
+            .signing_key
+            .as_ref()
+            .map(|key| key.fingerprint.clone()),
+        signing_key_endpoint: state
+            .signing_key
+            .as_ref()
+            .map(|_| "/api/v1/signing-key".to_string()),
     })
+}
+
+async fn signing_key(State(state): State<SharedState>) -> Result<impl IntoResponse, StatusCode> {
+    let signing_key = state.signing_key.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+
+    Ok((
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/pgp-keys; charset=utf-8"),
+        )],
+        signing_key.armored_key.clone(),
+    ))
 }
 
 async fn health(State(state): State<SharedState>) -> impl IntoResponse {
@@ -115,67 +165,100 @@ async fn submit_workorder(
 
     let client_id = identity.client_id;
     let role = identity.role;
+    let trace_context = resolve_request_trace_context(&headers);
+    let trace_id = trace_context.trace_id.clone();
 
     tracing::info!(
         %client_id,
         %role,
+        trace_id,
         auth_method = %identity.method,
         "Request authenticated"
     );
 
-    // ── Validate client role and check for active workorders ────────
-    let diff = state
-        .clients
-        .update(client_id, role, &req.portage_config, &req.system_id)
-        .await
-        .map_err(|e| {
-            tracing::warn!(
-                %client_id,
-                %role,
-                "Workorder rejected: {e}"
-            );
-            (StatusCode::CONFLICT, e.to_string())
-        })?;
-
     let id = Uuid::new_v4();
     let now = chrono::Utc::now();
+
+    let (diff, workorder) = {
+        let _submission_guard = state.submission_lock.lock().await;
+
+        if state.config.max_active_workorders > 0 {
+            let active_workorders = state
+                .workorders
+                .read()
+                .await
+                .values()
+                .filter(|w| {
+                    matches!(
+                        w.status,
+                        WorkorderStatus::Pending
+                            | WorkorderStatus::Provisioning
+                            | WorkorderStatus::Building
+                    )
+                })
+                .count();
+            if active_workorders >= state.config.max_active_workorders {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "Workorder capacity reached (limit {}). Retry later.",
+                        state.config.max_active_workorders
+                    ),
+                ));
+            }
+        }
+
+        let diff = state
+            .clients
+            .update(client_id, role, &req.portage_config, &req.system_id)
+            .await
+            .map_err(|e| {
+                tracing::warn!(
+                    %client_id,
+                    %role,
+                    "Workorder rejected: {e}"
+                );
+                (StatusCode::CONFLICT, e.to_string())
+            })?;
+
+        let workorder = Workorder {
+            id,
+            client_id,
+            role,
+            atoms: req.atoms,
+            emerge_args: req.emerge_args,
+            portage_config: req.portage_config,
+            system_id: req.system_id,
+            trace_context: Some(trace_context.clone()),
+            status: WorkorderStatus::Pending,
+            created_at: now,
+            updated_at: now,
+        };
+
+        state.create_progress_channel(id).await;
+        state.workorders.write().await.insert(id, workorder.clone());
+        state.clients.set_active_workorder(&client_id, id).await;
+
+        (diff, workorder)
+    };
 
     info!(
         ?id,
         %client_id,
         %role,
-        atoms = ?req.atoms,
+        trace_id,
+        atoms = ?workorder.atoms,
         portage_changed = diff.portage_changed,
         system_changed = diff.system_changed,
         "New workorder submitted"
     );
-
-    let workorder = Workorder {
-        id,
-        client_id,
-        role,
-        atoms: req.atoms,
-        emerge_args: req.emerge_args,
-        portage_config: req.portage_config,
-        system_id: req.system_id,
-        status: WorkorderStatus::Pending,
-        created_at: now,
-        updated_at: now,
-    };
-
-    // Mark this client as having an active workorder.
-    state.clients.set_active_workorder(&client_id, id).await;
-
-    // Create the progress channel BEFORE inserting the workorder so the
-    // queue processor never finds a workorder without its channel.
-    state.create_progress_channel(id).await;
-    state.workorders.write().await.insert(id, workorder);
 
     // Track submission in metrics.
     state
         .metrics
         .workorders_submitted
         .fetch_add(1, Ordering::Relaxed);
+    state.metrics.queue_depth.fetch_add(1, Ordering::Relaxed);
 
     // Build the WebSocket URL from the request's Host header.
     // Detect TLS from X-Forwarded-Proto (set by reverse proxies).
@@ -199,6 +282,7 @@ async fn submit_workorder(
     Ok(axum::Json(SubmitWorkorderResponse {
         workorder_id: id,
         progress_ws_url,
+        trace_id: Some(trace_context.trace_id),
     }))
 }
 
@@ -263,6 +347,10 @@ async fn get_workorder(
         workorder_id: id,
         status: workorder.status.clone(),
         result,
+        trace_id: workorder
+            .trace_context
+            .as_ref()
+            .map(|ctx| ctx.trace_id.clone()),
     }))
 }
 
@@ -309,6 +397,11 @@ async fn cancel_workorder(
     if was_cancellable {
         let old_status = workorder.status.clone();
         let was_building = matches!(old_status, WorkorderStatus::Building);
+        let was_pending = matches!(old_status, WorkorderStatus::Pending);
+        let trace_id = workorder
+            .trace_context
+            .as_ref()
+            .map(|ctx| ctx.trace_id.clone());
         workorder.status = WorkorderStatus::Cancelled;
         let client_id = workorder.client_id;
         drop(workorders); // Release the write lock before async calls.
@@ -317,6 +410,7 @@ async fn cancel_workorder(
         if let Some(tx) = state.progress_txs.read().await.get(&id) {
             let _ = tx.send(BuildProgress {
                 workorder_id: id,
+                trace_id,
                 event: BuildEvent::StatusChanged {
                     from: old_status,
                     to: WorkorderStatus::Cancelled,
@@ -326,6 +420,10 @@ async fn cancel_workorder(
         }
 
         state.clients.clear_active_workorder(&client_id).await;
+
+        if was_pending {
+            state.metrics.queue_depth.fetch_sub(1, Ordering::Relaxed);
+        }
 
         // If the workorder was Building, stop the Docker container.
         if was_building && let Some(container_id) = state.container_ids.read().await.get(&id) {
@@ -345,6 +443,25 @@ async fn cancel_workorder(
         workorder_id: id,
         cancelled: was_cancellable,
     }))
+}
+
+fn resolve_request_trace_context(headers: &HeaderMap) -> remerge_types::trace::TraceContext {
+    let header_value = headers
+        .get(TRACEPARENT_HEADER)
+        .and_then(|value| value.to_str().ok());
+
+    if let Some(traceparent) = header_value {
+        if let Some(trace_context) = remerge_observability::parse_trace_context(traceparent) {
+            return trace_context;
+        }
+
+        warn!(
+            traceparent,
+            "Ignoring invalid traceparent header on workorder submission"
+        );
+    }
+
+    remerge_observability::new_trace_context()
 }
 
 // ─── Admin / Status ─────────────────────────────────────────────────

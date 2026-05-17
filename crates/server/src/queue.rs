@@ -5,19 +5,126 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use futures::StreamExt;
 use regex::Regex;
 use tokio::io::AsyncWriteExt;
 
-use tracing::{error, info, warn};
+use tracing::{Instrument, error, info, warn};
 
 use remerge_types::workorder::*;
 
 use crate::repo::BinpkgRepo;
 use crate::state::AppState;
+
+fn failed_packages_for_atoms(atoms: &[String], reason: &str) -> Vec<FailedPackage> {
+    atoms
+        .iter()
+        .map(|atom| FailedPackage {
+            atom: atom.clone(),
+            reason: reason.to_string(),
+            build_log: None,
+        })
+        .collect()
+}
+
+fn workorder_trace_id(workorder: &Workorder) -> Option<String> {
+    workorder
+        .trace_context
+        .as_ref()
+        .map(|ctx| ctx.trace_id.clone())
+}
+
+fn build_progress(
+    workorder_id: WorkorderId,
+    trace_id: &Option<String>,
+    event: BuildEvent,
+) -> BuildProgress {
+    BuildProgress {
+        workorder_id,
+        trace_id: trace_id.clone(),
+        event,
+        timestamp: Utc::now(),
+    }
+}
+
+async fn set_workorder_status(
+    state: &Arc<AppState>,
+    tx: &tokio::sync::broadcast::Sender<BuildProgress>,
+    workorder_id: WorkorderId,
+    trace_id: &Option<String>,
+    new_status: WorkorderStatus,
+) {
+    let old_status = {
+        let mut workorders = state.workorders.write().await;
+        if let Some(workorder) = workorders.get_mut(&workorder_id) {
+            let old = workorder.status.clone();
+            workorder.status = new_status.clone();
+            workorder.updated_at = Utc::now();
+            old
+        } else {
+            return;
+        }
+    };
+
+    let _ = tx.send(build_progress(
+        workorder_id,
+        trace_id,
+        BuildEvent::StatusChanged {
+            from: old_status,
+            to: new_status,
+        },
+    ));
+}
+
+async fn cleanup_workorder_runtime(
+    state: &Arc<AppState>,
+    workorder: &Workorder,
+    id: WorkorderId,
+    container_id: Option<&str>,
+) {
+    state.container_ids.write().await.remove(&id);
+    state.remove_workorder_channels(&id).await;
+    state
+        .clients
+        .clear_active_workorder(&workorder.client_id)
+        .await;
+
+    let cleanup_success = if let Some(container_id) = container_id {
+        match state.docker.remove_container(container_id).await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(
+                    ?id,
+                    trace_id = workorder
+                        .trace_context
+                        .as_ref()
+                        .map(|ctx| ctx.trace_id.as_str())
+                        .unwrap_or("unknown"),
+                    "Failed to remove container: {e}"
+                );
+                false
+            }
+        }
+    } else {
+        true
+    };
+
+    state.metrics.record_cleanup(cleanup_success);
+    if cleanup_success {
+        info!(
+            ?id,
+            trace_id = workorder
+                .trace_context
+                .as_ref()
+                .map(|ctx| ctx.trace_id.as_str())
+                .unwrap_or("unknown"),
+            "Cleaned up workorder runtime resources"
+        );
+    }
+}
 
 /// Main queue loop — polls for pending workorders and processes them (FIFO).
 ///
@@ -39,16 +146,37 @@ pub async fn process_queue(state: Arc<AppState>) {
         if let Some(workorder) = next {
             // Mark as Provisioning *before* spawning so the queue loop
             // never picks up the same workorder on the next iteration.
-            {
+            let claimed = {
                 let mut workorders = state.workorders.write().await;
                 if let Some(w) = workorders.get_mut(&workorder.id) {
                     if w.status != WorkorderStatus::Pending {
-                        // Another task already claimed it — skip.
-                        continue;
+                        false
+                    } else {
+                        w.status = WorkorderStatus::Provisioning;
+                        w.updated_at = chrono::Utc::now();
+                        true
                     }
-                    w.status = WorkorderStatus::Provisioning;
-                    w.updated_at = chrono::Utc::now();
+                } else {
+                    false
                 }
+            };
+
+            if !claimed {
+                continue;
+            }
+
+            state.metrics.queue_depth.fetch_sub(1, Ordering::Relaxed);
+
+            if let Some(tx) = state.progress_txs.read().await.get(&workorder.id).cloned() {
+                let trace_id = workorder_trace_id(&workorder);
+                let _ = tx.send(build_progress(
+                    workorder.id,
+                    &trace_id,
+                    BuildEvent::StatusChanged {
+                        from: WorkorderStatus::Pending,
+                        to: WorkorderStatus::Provisioning,
+                    },
+                ));
             }
 
             // Acquire a semaphore permit before starting the container.
@@ -56,12 +184,23 @@ pub async fn process_queue(state: Arc<AppState>) {
             match permit {
                 Ok(permit) => {
                     let state = state.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = process_workorder(&state, workorder).await {
-                            error!("Workorder processing failed: {e:#}");
+                    let trace_id = workorder_trace_id(&workorder);
+                    let span = tracing::info_span!(
+                        "process_workorder",
+                        workorder_id = %workorder.id,
+                        trace_id = trace_id.as_deref().unwrap_or("unknown")
+                    );
+                    remerge_observability::set_span_parent(&span, workorder.trace_context.as_ref());
+
+                    tokio::spawn(
+                        async move {
+                            if let Err(e) = process_workorder(&state, workorder).await {
+                                error!("Workorder processing failed: {e:#}");
+                            }
+                            drop(permit); // Release the worker slot.
                         }
-                        drop(permit); // Release the worker slot.
-                    });
+                        .instrument(span),
+                    );
                 }
                 Err(_) => {
                     error!("Worker semaphore closed — shutting down queue processor");
@@ -79,7 +218,12 @@ pub async fn process_queue(state: Arc<AppState>) {
 async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyhow::Result<()> {
     let id = workorder.id;
     let build_start = Instant::now();
-    info!(?id, "Processing workorder");
+    let trace_id = workorder_trace_id(&workorder);
+    info!(
+        ?id,
+        trace_id = trace_id.as_deref().unwrap_or("unknown"),
+        "Processing workorder"
+    );
 
     state.metrics.builds_active.fetch_add(1, Ordering::Relaxed);
 
@@ -92,69 +236,63 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
         }
     };
 
-    // Helper to update status.
-    let set_status = |new_status: WorkorderStatus| {
-        let state = state.clone();
-        let tx = tx.clone();
-        async move {
-            let old_status = {
-                let mut workorders = state.workorders.write().await;
-                if let Some(w) = workorders.get_mut(&id) {
-                    let old = w.status.clone();
-                    w.status = new_status.clone();
-                    w.updated_at = Utc::now();
-                    old
-                } else {
-                    return;
-                }
-            };
-            let _ = tx.send(BuildProgress {
-                workorder_id: id,
-                event: BuildEvent::StatusChanged {
-                    from: old_status,
-                    to: new_status,
-                },
-                timestamp: Utc::now(),
-            });
-        }
-    };
-
-    // ── 1. Provisioning ─────────────────────────────────────────────
-    set_status(WorkorderStatus::Provisioning).await;
-
+    // ── 1. Worker image prep ───────────────────────────────────────
     let image_tag = state.docker.image_tag(&workorder.system_id);
 
     // Build image if it doesn't exist or the worker binary has changed.
     if state.docker.image_needs_rebuild(&image_tag).await {
         info!(%image_tag, "Worker image needs (re)building");
-        if let Err(e) = state
+        let image_build_start = Instant::now();
+        let image_build_result = state
             .docker
             .build_worker_image(&workorder.system_id, &image_tag)
-            .await
-        {
-            let reason = format!("Failed to build worker image: {e:#}");
-            set_status(WorkorderStatus::Failed {
-                reason: reason.clone(),
-            })
             .await;
-            let _ = tx.send(BuildProgress {
-                workorder_id: id,
-                event: BuildEvent::Finished {
+        state
+            .metrics
+            .record_worker_image_build(image_build_start.elapsed().as_secs());
+
+        if let Err(e) = image_build_result {
+            let reason = format!("Failed to build worker image: {e:#}");
+            set_workorder_status(
+                state,
+                &tx,
+                id,
+                &trace_id,
+                WorkorderStatus::Failed {
+                    reason: reason.clone(),
+                },
+            )
+            .await;
+            let _ = tx.send(build_progress(
+                id,
+                &trace_id,
+                BuildEvent::Finished {
                     built: Vec::new(),
                     failed: workorder.atoms.clone(),
                 },
-                timestamp: Utc::now(),
-            });
+            ));
+
+            state.results.write().await.insert(
+                id,
+                WorkorderResult {
+                    workorder_id: id,
+                    built_packages: Vec::new(),
+                    failed_packages: failed_packages_for_atoms(&workorder.atoms, &reason),
+                    binhost_uri: state.config.binhost_url.clone(),
+                },
+            );
+
+            state
+                .metrics
+                .builds_total_duration_secs
+                .fetch_add(build_start.elapsed().as_secs(), Ordering::Relaxed);
             state.metrics.builds_active.fetch_sub(1, Ordering::Relaxed);
             state
                 .metrics
                 .workorders_failed
                 .fetch_add(1, Ordering::Relaxed);
-            state
-                .clients
-                .clear_active_workorder(&workorder.client_id)
-                .await;
-            return Err(e);
+            cleanup_workorder_runtime(state, &workorder, id, None).await;
+            return Ok(());
         }
     }
 
@@ -166,41 +304,73 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
         .insert(image_tag.clone(), Instant::now());
 
     // ── 2. Start worker container ───────────────────────────────────
-    set_status(WorkorderStatus::Building).await;
+    set_workorder_status(state, &tx, id, &trace_id, WorkorderStatus::Building).await;
 
     let container_name = format!("remerge-worker-{}", id.as_simple());
     let workorder_json = serde_json::to_string(&workorder)?;
 
-    let container_id = match state
+    let container_start = Instant::now();
+    let container_result = state
         .docker
-        .start_worker(&container_name, &image_tag, &workorder_json, &state.config)
-        .await
-    {
+        .start_worker(
+            &container_name,
+            &image_tag,
+            &workorder_json,
+            workorder
+                .trace_context
+                .as_ref()
+                .map(|ctx| ctx.traceparent.as_str()),
+            &state.config,
+        )
+        .await;
+    state
+        .metrics
+        .record_worker_container_start(container_start.elapsed().as_secs());
+
+    let container_id = match container_result {
         Ok(id) => id,
         Err(e) => {
             let reason = format!("Failed to start worker: {e:#}");
-            set_status(WorkorderStatus::Failed {
-                reason: reason.clone(),
-            })
+            set_workorder_status(
+                state,
+                &tx,
+                id,
+                &trace_id,
+                WorkorderStatus::Failed {
+                    reason: reason.clone(),
+                },
+            )
             .await;
-            let _ = tx.send(BuildProgress {
-                workorder_id: id,
-                event: BuildEvent::Finished {
+            let _ = tx.send(build_progress(
+                id,
+                &trace_id,
+                BuildEvent::Finished {
                     built: Vec::new(),
                     failed: workorder.atoms.clone(),
                 },
-                timestamp: Utc::now(),
-            });
+            ));
+
+            state.results.write().await.insert(
+                id,
+                WorkorderResult {
+                    workorder_id: id,
+                    built_packages: Vec::new(),
+                    failed_packages: failed_packages_for_atoms(&workorder.atoms, &reason),
+                    binhost_uri: state.config.binhost_url.clone(),
+                },
+            );
+
+            state
+                .metrics
+                .builds_total_duration_secs
+                .fetch_add(build_start.elapsed().as_secs(), Ordering::Relaxed);
             state.metrics.builds_active.fetch_sub(1, Ordering::Relaxed);
             state
                 .metrics
                 .workorders_failed
                 .fetch_add(1, Ordering::Relaxed);
-            state
-                .clients
-                .clear_active_workorder(&workorder.client_id)
-                .await;
-            return Err(e);
+            cleanup_workorder_runtime(state, &workorder, id, None).await;
+            return Ok(());
         }
     };
 
@@ -380,7 +550,46 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
     });
 
     // ── 4. Wait for container to finish ─────────────────────────────
-    let exit_code = state.docker.wait_container(&container_id).await?;
+    let wait_outcome = if state.config.build_timeout_secs == 0 {
+        match state.docker.wait_container(&container_id).await {
+            Ok(exit_code) => {
+                info!(?id, exit_code, "Worker container finished");
+                Ok(exit_code)
+            }
+            Err(e) => {
+                warn!(?id, "Failed to wait for worker container: {e:#}");
+                Err(format!("Failed to wait for worker container: {e:#}"))
+            }
+        }
+    } else {
+        match tokio::time::timeout(
+            Duration::from_secs(state.config.build_timeout_secs),
+            state.docker.wait_container(&container_id),
+        )
+        .await
+        {
+            Ok(Ok(exit_code)) => {
+                info!(?id, exit_code, "Worker container finished");
+                Ok(exit_code)
+            }
+            Ok(Err(e)) => {
+                warn!(?id, "Failed to wait for worker container: {e:#}");
+                Err(format!("Failed to wait for worker container: {e:#}"))
+            }
+            Err(_) => {
+                warn!(
+                    ?id,
+                    timeout_secs = state.config.build_timeout_secs,
+                    "Worker build exceeded timeout"
+                );
+                let _ = state.docker.stop_container(&container_id).await;
+                Err(format!(
+                    "Build exceeded configured timeout of {} seconds",
+                    state.config.build_timeout_secs
+                ))
+            }
+        }
+    };
 
     // Give the log stream a moment to flush final lines, then abort if
     // it hasn't finished.  This avoids losing the last few log lines.
@@ -407,8 +616,6 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
     // up the Finished event on the progress channel.
     state.raw_output_txs.write().await.remove(&id);
 
-    info!(?id, exit_code, "Worker container finished");
-
     // ── 5. Collect structured events ────────────────────────────────
     let mut built_atoms = Vec::new();
     let mut failed_atoms = Vec::new();
@@ -423,23 +630,25 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
             } => {
                 let _ = tx.send(BuildProgress {
                     workorder_id: id,
+                    trace_id: trace_id.clone(),
                     event: BuildEvent::PackageBuilt {
                         atom: atom.clone(),
                         duration_secs,
                     },
                     timestamp: Utc::now(),
                 });
+                state.metrics.record_package_build(&atom, duration_secs);
                 built_atoms.push(atom);
             }
             WorkerEvent::PackageFailed { atom, reason } => {
-                let _ = tx.send(BuildProgress {
-                    workorder_id: id,
-                    event: BuildEvent::PackageFailed {
+                let _ = tx.send(build_progress(
+                    id,
+                    &trace_id,
+                    BuildEvent::PackageFailed {
                         atom: atom.clone(),
                         reason: reason.clone(),
                     },
-                    timestamp: Utc::now(),
-                });
+                ));
                 failed_atoms.push(FailedPackage {
                     atom,
                     reason,
@@ -452,8 +661,8 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
     // ── 6. Scan binpkg directory for real results ───────────────────
     let build_duration = build_start.elapsed().as_secs();
 
-    if exit_code == 0 {
-        set_status(WorkorderStatus::Completed).await;
+    if matches!(wait_outcome, Ok(0)) {
+        set_workorder_status(state, &tx, id, &trace_id, WorkorderStatus::Completed).await;
 
         // Scan the binpkg directory for actual files and compute hashes.
         let repo = BinpkgRepo::new(state.config.binpkg_dir.clone());
@@ -533,24 +742,33 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
         // REST fetch (triggered by the Finished event) always finds it.
         state.results.write().await.insert(id, result);
 
-        let _ = tx.send(BuildProgress {
-            workorder_id: id,
-            event: BuildEvent::Finished {
+        let _ = tx.send(build_progress(
+            id,
+            &trace_id,
+            BuildEvent::Finished {
                 built: built_list,
                 failed: failed_list,
             },
-            timestamp: Utc::now(),
-        });
+        ));
 
         state
             .metrics
             .workorders_completed
             .fetch_add(1, Ordering::Relaxed);
     } else {
-        let reason = format!("Worker exited with code {exit_code}");
-        set_status(WorkorderStatus::Failed {
-            reason: reason.clone(),
-        })
+        let reason = match wait_outcome {
+            Ok(exit_code) => format!("Worker exited with code {exit_code}"),
+            Err(reason) => reason,
+        };
+        set_workorder_status(
+            state,
+            &tx,
+            id,
+            &trace_id,
+            WorkorderStatus::Failed {
+                reason: reason.clone(),
+            },
+        )
         .await;
 
         // Store a result even on failure so the client's REST fetch
@@ -568,15 +786,7 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
                 .collect(),
             failed_packages: if failed_atoms.is_empty() {
                 // No structured failure events — report all atoms as failed.
-                workorder
-                    .atoms
-                    .iter()
-                    .map(|atom| FailedPackage {
-                        atom: atom.clone(),
-                        reason: reason.clone(),
-                        build_log: None,
-                    })
-                    .collect()
+                failed_packages_for_atoms(&workorder.atoms, &reason)
             } else {
                 failed_atoms
             },
@@ -598,14 +808,14 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
         // REST fetch (triggered by the Finished event) always finds it.
         state.results.write().await.insert(id, result);
 
-        let _ = tx.send(BuildProgress {
-            workorder_id: id,
-            event: BuildEvent::Finished {
+        let _ = tx.send(build_progress(
+            id,
+            &trace_id,
+            BuildEvent::Finished {
                 built: built_list,
                 failed: failed_list,
             },
-            timestamp: Utc::now(),
-        });
+        ));
 
         state
             .metrics
@@ -620,16 +830,7 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
     state.metrics.builds_active.fetch_sub(1, Ordering::Relaxed);
 
     // ── 7. Cleanup ──────────────────────────────────────────────────
-    state.container_ids.write().await.remove(&id);
-    state.remove_workorder_channels(&id).await;
-    state
-        .clients
-        .clear_active_workorder(&workorder.client_id)
-        .await;
-
-    if let Err(e) = state.docker.remove_container(&container_id).await {
-        warn!("Failed to remove container: {e}");
-    }
+    cleanup_workorder_runtime(state, &workorder, id, Some(&container_id)).await;
 
     Ok(())
 }

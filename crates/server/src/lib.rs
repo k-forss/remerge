@@ -7,4 +7,5 @@ pub mod persistence;
 pub mod queue;
 pub mod registry;
 pub mod repo;
+pub mod signing;
 pub mod state;

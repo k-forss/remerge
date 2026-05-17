@@ -4,10 +4,10 @@ use anyhow::{Context, Result};
 use bollard::{
     Docker,
     container::AttachContainerResults,
-    models::{ContainerCreateBody, HostConfig},
+    models::{ContainerCreateBody, ContainerStateStatusEnum, HostConfig},
     query_parameters::{
         AttachContainerOptionsBuilder, BuildImageOptions, CreateContainerOptions,
-        RemoveContainerOptions, StartContainerOptions,
+        InspectContainerOptions, RemoveContainerOptions, StartContainerOptions,
     },
 };
 use futures::StreamExt;
@@ -18,15 +18,15 @@ use remerge_types::portage::SystemIdentity;
 
 use crate::config::ServerConfig;
 
+const BASE_DOCKERFILE_HASH_LABEL: &str = "remerge.base.dockerfile.sha256";
+
 /// Manages Docker containers for build workers.
 pub struct DockerManager {
     docker: Docker,
     image_prefix: String,
+    base_image_prefix: String,
     binpkg_dir: String,
     worker_binpkg_mount: String,
-    /// Maximum concurrent worker containers (enforced via semaphore in AppState).
-    #[allow(dead_code)]
-    max_workers: usize,
     /// GPG key fingerprint for binary package signing.
     gpg_key: Option<String>,
     /// Host path to the GPG keyring directory.
@@ -80,9 +80,9 @@ impl DockerManager {
         Ok(Self {
             docker,
             image_prefix: config.worker_image_prefix.clone(),
+            base_image_prefix: format!("{}-base", config.worker_image_prefix),
             binpkg_dir: config.binpkg_dir.to_string_lossy().to_string(),
             worker_binpkg_mount: config.worker_binpkg_mount.clone(),
-            max_workers: config.max_workers,
             gpg_key: config.signing.gpg_key.clone(),
             gpg_home: config.signing.gpg_home.clone(),
             worker_binary,
@@ -96,6 +96,15 @@ impl DockerManager {
     /// Each unique `(CHOST, profile, gcc_version)` combination gets its own
     /// image so the toolchain matches the requester.
     pub fn image_tag(&self, sys: &SystemIdentity) -> String {
+        format!("{}:{}", self.image_prefix, self.image_tag_suffix(sys))
+    }
+
+    /// Derive the cached worker base-image tag from the system identity.
+    pub fn base_image_tag(&self, sys: &SystemIdentity) -> String {
+        format!("{}:{}", self.base_image_prefix, self.image_tag_suffix(sys))
+    }
+
+    fn image_tag_suffix(&self, sys: &SystemIdentity) -> String {
         // Sanitise for Docker tag rules.
         let chost_slug = sys.chost.replace('.', "_");
         let profile_slug = sys.profile.replace('/', "-");
@@ -107,13 +116,37 @@ impl DockerManager {
             .replace('.', "_");
 
         format!(
-            "{}:{}-{}-gcc{}-v{}",
-            self.image_prefix,
+            "{}-{}-gcc{}-v{}",
             chost_slug,
             profile_slug,
             gcc_short,
             env!("CARGO_PKG_VERSION"),
         )
+    }
+
+    async fn base_image_needs_rebuild(&self, tag: &str, expected_hash: &str) -> bool {
+        let info = match self.docker.inspect_image(tag).await {
+            Ok(info) => info,
+            Err(_) => return true,
+        };
+
+        let stored = info
+            .config
+            .as_ref()
+            .and_then(|c| c.labels.as_ref())
+            .and_then(|l| l.get(BASE_DOCKERFILE_HASH_LABEL));
+
+        match stored {
+            Some(hash) if hash == expected_hash => false,
+            Some(_) => {
+                info!(%tag, "Base Dockerfile inputs changed — base image rebuild needed");
+                true
+            }
+            None => {
+                info!(%tag, "Base image missing Dockerfile hash label — rebuild needed");
+                true
+            }
+        }
     }
 
     /// Check whether a worker image needs to be (re)built.
@@ -155,12 +188,38 @@ impl DockerManager {
 
     /// Build a worker image from the bundled Dockerfile.
     pub async fn build_worker_image(&self, sys: &SystemIdentity, tag: &str) -> Result<()> {
-        info!(%tag, "Building worker image");
+        let base_tag = self.base_image_tag(sys);
+        let base_dockerfile = self.generate_dockerfile(sys);
+        let base_hash = hex::encode(Sha256::digest(base_dockerfile.as_bytes()));
+        let labeled_base_dockerfile =
+            format!("{base_dockerfile}\nLABEL {BASE_DOCKERFILE_HASH_LABEL}=\"{base_hash}\"\n");
 
-        // The Dockerfile is generated dynamically based on the system identity.
-        let dockerfile = self.generate_dockerfile(sys);
+        if self.base_image_needs_rebuild(&base_tag, &base_hash).await {
+            info!(%base_tag, "Building cached worker base image");
+            self.build_image_from_context(&base_tag, &labeled_base_dockerfile, None)
+                .await?;
+        }
 
-        // Create a tar archive containing only the Dockerfile.
+        info!(%tag, base_image = %base_tag, "Building worker runtime image");
+        let dockerfile = self.generate_runtime_dockerfile(&base_tag);
+
+        let binary_path = self.worker_binary.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "No worker binary configured or discovered.  Set `worker_binary` \
+                 in server.toml or install the remerge-worker package alongside \
+                 the server."
+            )
+        })?;
+        self.build_image_from_context(tag, &dockerfile, Some(binary_path))
+            .await
+    }
+
+    async fn build_image_from_context(
+        &self,
+        tag: &str,
+        dockerfile: &str,
+        worker_binary_path: Option<&str>,
+    ) -> Result<()> {
         let mut ar = tar::Builder::new(Vec::new());
         let dockerfile_bytes = dockerfile.as_bytes();
         let mut header = tar::Header::new_gnu();
@@ -170,18 +229,9 @@ impl DockerManager {
         header.set_cksum();
         ar.append(&header, dockerfile_bytes)?;
 
-        // Include the worker binary in the build context.  Without it the
-        // image's ENTRYPOINT cannot start and every container will fail.
-        let binary_path = self.worker_binary.as_deref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "No worker binary configured or discovered.  Set `worker_binary` \
-                 in server.toml or install the remerge-worker package alongside \
-                 the server."
-            )
-        })?;
-        let binary_data = std::fs::read(binary_path)
-            .with_context(|| format!("Failed to read worker binary at {binary_path}"))?;
-        {
+        if let Some(binary_path) = worker_binary_path {
+            let binary_data = std::fs::read(binary_path)
+                .with_context(|| format!("Failed to read worker binary at {binary_path}"))?;
             let mut bin_header = tar::Header::new_gnu();
             bin_header.set_path("remerge-worker")?;
             bin_header.set_size(binary_data.len() as u64);
@@ -216,11 +266,11 @@ impl DockerManager {
             }
         }
 
-        info!(%tag, "Worker image built successfully");
+        info!(%tag, "Docker image built successfully");
         Ok(())
     }
 
-    /// Generate a Dockerfile for a worker matching the given system identity.
+    /// Generate the cached worker base-image Dockerfile for the given system identity.
     ///
     /// For native builds, uses the matching `gentoo/stage3` variant.
     /// For cross-architecture builds, uses an `amd64` stage3 with `crossdev`
@@ -267,14 +317,6 @@ RUN echo 'CHOST="{chost}"' >> /etc/portage/make.conf && \
             String::new()
         };
 
-        let binary_install = "# Install remerge-worker binary from build context.\nCOPY remerge-worker /usr/local/bin/remerge-worker\nRUN chmod +x /usr/local/bin/remerge-worker";
-
-        let hash_label = self
-            .worker_binary_hash
-            .as_ref()
-            .map(|h| format!("LABEL remerge.worker.sha256=\"{h}\""))
-            .unwrap_or_default();
-
         // When a custom base image is provided (e.g. a pre-synced test
         // image), skip the slow emerge --sync and git install steps — the
         // image is assumed to be ready.
@@ -292,25 +334,42 @@ RUN echo 'CHOST="{chost}"' >> /etc/portage/make.conf && \
         format!(
             r#"FROM {base_image}
 
-{binary_install}
-{hash_label}
-
 {sync_block}
 {crossdev_block}
 # Create binpkg output directory.
 RUN mkdir -p {binpkg_mount}
 
 WORKDIR /root
-
-# The entrypoint will be the remerge-worker binary.
-ENTRYPOINT ["/usr/local/bin/remerge-worker"]
 "#,
             base_image = base_image,
-            binary_install = binary_install,
-            hash_label = hash_label,
             sync_block = sync_block,
             crossdev_block = crossdev_block,
             binpkg_mount = self.worker_binpkg_mount,
+        )
+    }
+
+    fn generate_runtime_dockerfile(&self, base_tag: &str) -> String {
+        let hash_label = self
+            .worker_binary_hash
+            .as_ref()
+            .map(|h| format!("LABEL remerge.worker.sha256=\"{h}\""))
+            .unwrap_or_default();
+
+        format!(
+            r#"FROM {base_tag}
+
+# Install remerge-worker binary from build context.
+COPY remerge-worker /usr/local/bin/remerge-worker
+RUN chmod +x /usr/local/bin/remerge-worker
+
+{hash_label}
+
+WORKDIR /root
+
+ENTRYPOINT ["/usr/local/bin/remerge-worker"]
+"#,
+            base_tag = base_tag,
+            hash_label = hash_label,
         )
     }
 
@@ -322,6 +381,7 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
         container_name: &str,
         image_tag: &str,
         workorder_json: &str,
+        traceparent: Option<&str>,
         server_config: &ServerConfig,
     ) -> Result<String> {
         info!(%container_name, %image_tag, "Starting worker container");
@@ -341,28 +401,26 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
 
         let host_config = HostConfig {
             binds: Some(binds),
+            memory: Some(server_config.worker_memory_bytes),
+            cpu_shares: Some(server_config.worker_cpu_shares),
+            network_mode: Some(server_config.worker_network_mode.clone()),
             ..Default::default()
         };
 
         let mut env = vec![format!("REMERGE_WORKORDER={workorder_json}")];
+        if let Some(traceparent) = traceparent {
+            env.push(format!("REMERGE_TRACEPARENT={traceparent}"));
+        }
         if let Some(ref key) = self.gpg_key {
             env.push(format!("REMERGE_GPG_KEY={key}"));
         }
         if self.gpg_home.is_some() {
             env.push("REMERGE_GPG_HOME=/var/cache/remerge/gnupg".to_string());
         }
-        // Tell the worker to skip the full `emerge --sync` when:
-        //  - repos are bind-mounted from the server (`repos_dir`),
-        //  - the config explicitly requests it (`skip_worker_sync`), OR
-        //  - a custom base image is used (assumed to be pre-synced).
-        //
-        // In all three cases the container's portage tree is already
-        // usable.  Missing overlays are still synced individually by
-        // `sync_missing_repos()` inside the worker.
-        if server_config.repos_dir.is_some()
-            || server_config.skip_worker_sync
-            || self.worker_base_image.is_some()
-        {
+        if server_config.skip_worker_sync || server_config.repos_dir.is_some() {
+            // Either the operator explicitly disabled sync or the worker is
+            // consuming the server's bind-mounted repos tree, so the initial
+            // in-container sync should be skipped.
             env.push("REMERGE_SKIP_SYNC=1".to_string());
         }
 
@@ -451,7 +509,11 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
         use bollard::query_parameters::WaitContainerOptions;
         use futures::TryStreamExt;
 
-        let exit = self
+        if let Some(exit_code) = self.inspect_exited_container(container_id).await? {
+            return Ok(exit_code);
+        }
+
+        let wait_result = self
             .docker
             .wait_container(
                 container_id,
@@ -460,10 +522,46 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
                 }),
             )
             .try_next()
-            .await?
-            .context("Container wait stream ended without result")?;
+            .await;
 
-        Ok(exit.status_code)
+        match wait_result {
+            Ok(Some(exit)) => Ok(exit.status_code),
+            Ok(None) => self
+                .inspect_exited_container(container_id)
+                .await?
+                .context("Container wait stream ended without result"),
+            Err(err) => {
+                if let Some(exit_code) = self.inspect_exited_container(container_id).await? {
+                    Ok(exit_code)
+                } else {
+                    Err(err).context("Failed to wait for worker container")
+                }
+            }
+        }
+    }
+
+    async fn inspect_exited_container(&self, container_id: &str) -> Result<Option<i64>> {
+        let inspect = self
+            .docker
+            .inspect_container(container_id, None::<InspectContainerOptions>)
+            .await
+            .with_context(|| format!("Failed to inspect worker container {container_id}"))?;
+
+        let state = match inspect.state {
+            Some(state) => state,
+            None => return Ok(None),
+        };
+
+        if state.running == Some(false)
+            || matches!(
+                state.status,
+                Some(ContainerStateStatusEnum::EXITED | ContainerStateStatusEnum::DEAD)
+            )
+        {
+            return Ok(state.exit_code);
+        }
+
+        Ok(None)
     }
 
     /// Remove a container.
@@ -512,11 +610,5 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
             .await
             .context("Failed to stop container")?;
         Ok(())
-    }
-
-    /// Get the configured maximum number of workers.
-    #[allow(dead_code)]
-    pub fn max_workers(&self) -> usize {
-        self.max_workers
     }
 }

@@ -1,7 +1,8 @@
 # nextest configuration for remerge.
 #
 # The `ci` profile is used in GitHub Actions to produce JUnit XML output
-# for test duration tracking (task 8.5).
+# for test duration tracking. `scripts/test_duration_baseline.py` compares
+# the emitted timings against the checked-in baseline.
 
 [profile.default]
 # Show slow tests after this threshold.

@@ -9,16 +9,20 @@ mod common;
 mod docker_tests {
     use super::common;
 
+    fn require_docker() {
+        assert!(
+            common::server::docker_available(),
+            "Docker is required for integration tests but was not found"
+        );
+    }
+
     /// Helper: create a DockerManager with default config.
-    async fn make_manager() -> Option<(
+    async fn make_manager() -> (
         remerge_server::docker::DockerManager,
         tempfile::TempDir,
         tempfile::TempDir,
-    )> {
-        if !common::server::docker_available() {
-            eprintln!("Docker not available — skipping");
-            return None;
-        }
+    ) {
+        require_docker();
         let tmp_binpkg = tempfile::TempDir::new().expect("temp dir");
         let tmp_state = tempfile::TempDir::new().expect("temp dir");
         let config = remerge_server::config::ServerConfig {
@@ -29,16 +33,13 @@ mod docker_tests {
         let manager = remerge_server::docker::DockerManager::new(&config)
             .await
             .expect("connect");
-        Some((manager, tmp_binpkg, tmp_state))
+        (manager, tmp_binpkg, tmp_state)
     }
 
     /// DockerManager can connect to local Docker socket.
     #[tokio::test]
     async fn docker_manager_connects() {
-        if !common::server::docker_available() {
-            eprintln!("Docker not available — skipping");
-            return;
-        }
+        require_docker();
 
         let tmp_binpkg = tempfile::TempDir::new().unwrap();
         let tmp_state = tempfile::TempDir::new().unwrap();
@@ -58,9 +59,7 @@ mod docker_tests {
     /// Image tag derivation from SystemIdentity.
     #[tokio::test]
     async fn image_tag_from_system_identity() {
-        let Some((manager, _b, _s)) = make_manager().await else {
-            return;
-        };
+        let (manager, _b, _s) = make_manager().await;
 
         let sys = common::fixtures::minimal_system_identity();
         let tag = manager.image_tag(&sys);
@@ -69,14 +68,18 @@ mod docker_tests {
             tag.contains("remerge-worker"),
             "tag should contain image prefix"
         );
+
+        let base_tag = manager.base_image_tag(&sys);
+        assert!(
+            base_tag.contains("remerge-worker-base"),
+            "base tag should use the base-image prefix"
+        );
     }
 
     /// `image_needs_rebuild` returns true for a nonexistent image.
     #[tokio::test]
     async fn needs_rebuild_nonexistent_image() {
-        let Some((manager, _b, _s)) = make_manager().await else {
-            return;
-        };
+        let (manager, _b, _s) = make_manager().await;
 
         let needs = manager
             .image_needs_rebuild("remerge-test-nonexistent:latest")
@@ -87,9 +90,7 @@ mod docker_tests {
     /// `remove_container` on a nonexistent container returns an error.
     #[tokio::test]
     async fn remove_nonexistent_container_errors() {
-        let Some((manager, _b, _s)) = make_manager().await else {
-            return;
-        };
+        let (manager, _b, _s) = make_manager().await;
 
         let result = manager.remove_container("nonexistent-container-id").await;
         assert!(
@@ -101,9 +102,7 @@ mod docker_tests {
     /// `remove_image` on a nonexistent image returns an error.
     #[tokio::test]
     async fn remove_nonexistent_image_errors() {
-        let Some((manager, _b, _s)) = make_manager().await else {
-            return;
-        };
+        let (manager, _b, _s) = make_manager().await;
 
         let result = manager
             .remove_image("remerge-test-nonexistent:latest")
@@ -114,9 +113,7 @@ mod docker_tests {
     /// `stop_container` on a nonexistent container returns an error.
     #[tokio::test]
     async fn stop_nonexistent_container_errors() {
-        let Some((manager, _b, _s)) = make_manager().await else {
-            return;
-        };
+        let (manager, _b, _s) = make_manager().await;
 
         let result = manager.stop_container("nonexistent-container-id").await;
         assert!(
@@ -130,10 +127,7 @@ mod docker_tests {
     /// Requires the Gentoo stage3 image (pulled automatically if missing).
     #[tokio::test]
     async fn build_worker_image_with_label() {
-        if !common::server::docker_available() {
-            eprintln!("Docker not available — skipping");
-            return;
-        }
+        require_docker();
 
         common::server::ensure_test_stage3();
 
@@ -167,6 +161,7 @@ mod docker_tests {
 
         let sys = common::fixtures::minimal_system_identity();
         let tag = format!("remerge-test-build:{}", uuid::Uuid::new_v4());
+        let base_tag = manager.base_image_tag(&sys);
 
         let result = manager.build_worker_image(&sys, &tag).await;
 
@@ -178,6 +173,10 @@ mod docker_tests {
             .inspect_image(&tag)
             .await
             .expect("image should exist after build");
+        docker
+            .inspect_image(&base_tag)
+            .await
+            .expect("cached base image should exist after build");
 
         let labels = image_info
             .config
@@ -206,9 +205,7 @@ mod docker_tests {
     /// binfmt_misc / QEMU user-static is needed for the build itself.
     #[tokio::test]
     async fn crossdev_dockerfile_for_cross_arch() {
-        let Some((manager, _b, _s)) = make_manager().await else {
-            return;
-        };
+        let (manager, _b, _s) = make_manager().await;
 
         let cross_sys = common::fixtures::cross_arch_system_identity();
 
@@ -262,22 +259,12 @@ mod docker_tests {
     #[tokio::test]
     #[ignore = "crossdev install is fragile in CI — run manually with --ignored"]
     async fn cross_arch_image_build() {
-        if !common::server::docker_available() {
-            eprintln!("Docker not available — skipping");
-            return;
-        }
+        require_docker();
 
-        // Check that stage3 base image exists — skip if not.
+        common::server::ensure_stage3();
+
         let docker = bollard::Docker::connect_with_local_defaults()
             .expect("connect to Docker for pre-check");
-        if docker.inspect_image("gentoo/stage3:latest").await.is_err() {
-            eprintln!(
-                "gentoo/stage3:latest not available — skipping cross-arch build. \
-                 Build with: docker build -f docker/test-stage3.Dockerfile \
-                 -t ghcr.io/k-forss/remerge/test-stage3:latest ."
-            );
-            return;
-        }
 
         // Create a dummy worker binary.
         let tmp_dir = tempfile::TempDir::new().expect("temp dir");
@@ -338,22 +325,12 @@ mod docker_tests {
     /// Requires a valid worker image (depends on 5.3 / stage3 available).
     #[tokio::test]
     async fn start_worker_container() {
-        if !common::server::docker_available() {
-            eprintln!("Docker not available — skipping");
-            return;
-        }
+        require_docker();
 
-        // Check that the base image is available — skip if not.
+        common::server::ensure_stage3();
+
         let docker = bollard::Docker::connect_with_local_defaults()
             .expect("connect to Docker for pre-check");
-        if docker.inspect_image("gentoo/stage3:latest").await.is_err() {
-            eprintln!(
-                "gentoo/stage3:latest not available — skipping start_worker test. \
-                 Build with: docker build -f docker/test-stage3.Dockerfile \
-                 -t ghcr.io/k-forss/remerge/test-stage3:latest ."
-            );
-            return;
-        }
 
         // Build an image first (depends on 5.3).
         let tmp_dir = tempfile::TempDir::new().expect("temp dir");
@@ -393,7 +370,7 @@ mod docker_tests {
         let container_name = format!("remerge-test-{}", uuid::Uuid::new_v4());
 
         let container_id = manager
-            .start_worker(&container_name, &tag, &workorder_json, &config)
+            .start_worker(&container_name, &tag, &workorder_json, None, &config)
             .await
             .expect("start_worker should succeed with built image");
 
@@ -444,14 +421,9 @@ mod docker_tests {
     /// that `remove_image` works on expired images while tracking state.
     #[tokio::test]
     async fn image_last_used_tracking_and_eviction() {
-        if !common::server::docker_available() {
-            eprintln!("Docker not available — skipping");
-            return;
-        }
+        require_docker();
 
-        let Some(server) = common::server::TestServer::start().await else {
-            return;
-        };
+        let server = common::server::TestServer::start().await;
 
         // Create two lightweight test images by tagging the existing
         // busybox or alpine image. We use `docker tag` to avoid needing
@@ -459,14 +431,12 @@ mod docker_tests {
         let docker = bollard::Docker::connect_with_local_defaults().expect("connect to Docker");
 
         // Use a very small image (hello-world) that's likely cached or fast to pull.
-        // If not available, skip.
         let tag_new = format!("remerge-test-eviction-new:{}", uuid::Uuid::new_v4());
         let tag_old = format!("remerge-test-eviction-old:{}", uuid::Uuid::new_v4());
 
-        // Try to use hello-world as base. If it doesn't exist, skip.
+        // Pull hello-world if it is not already cached locally.
         let base = "hello-world:latest";
         if docker.inspect_image(base).await.is_err() {
-            // Try pulling it.
             use futures_util::StreamExt;
             let mut stream = docker.create_image(
                 Some(bollard::query_parameters::CreateImageOptions {
@@ -477,10 +447,7 @@ mod docker_tests {
                 None,
             );
             while let Some(r) = stream.next().await {
-                if r.is_err() {
-                    eprintln!("Cannot pull hello-world — skipping eviction test");
-                    return;
-                }
+                r.expect("pull hello-world for eviction test");
             }
         }
 

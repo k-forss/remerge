@@ -53,6 +53,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install test prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gnupg
+
       # 8.5: Install nextest for test duration tracking and JUnit output.
       - name: Install nextest
         uses: taiki-e/install-action@nextest
@@ -60,40 +65,58 @@ jobs:
       - name: Run tests (nextest)
         run: cargo nextest run --workspace --profile ci
 
+      - name: Check duration baseline
+        run: |
+          python3 scripts/test_duration_baseline.py \
+            --junit target/nextest/ci/junit.xml \
+            --baseline .config/test-duration-baseline.json \
+            --minimum-duration 0.1 \
+            --minimum-regression 0.5 \
+            --threshold 1.25 \
+            --report target/nextest/ci/duration-report.txt
+
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: test-results
-          path: target/nextest/ci/junit.xml
+          path: |
+            target/nextest/ci/junit.xml
+            target/nextest/ci/duration-report.txt
           if-no-files-found: ignore
 
-  integration-test:
-    name: Integration Test
+  fuzz:
+    name: Fuzz Smoke Test
     runs-on: ubuntu-latest
-    needs: [check, test]
+    needs: [check]
     steps:
       - uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@nightly
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz-nightly
 
-      - name: Pull test stage3 image from GHCR
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Verify cargo-fuzz is available
+        run: rustup run nightly cargo fuzz --help >/dev/null
+
+      - name: Run parser and arg-filter fuzzers
+        working-directory: fuzz
         run: |
-          docker pull ghcr.io/k-forss/remerge/test-stage3:latest || true
-          docker tag ghcr.io/k-forss/remerge/test-stage3:latest gentoo/stage3:latest || true
-          docker tag ghcr.io/k-forss/remerge/test-stage3:latest remerge/test-stage3:latest || true
+          HOST_TARGET=$(rustup run nightly rustc -vV | sed -n 's/^host: //p')
+          rustup run nightly cargo fuzz run make_conf_vars --target "$HOST_TARGET" --sanitizer none -- -max_total_time=15
+          rustup run nightly cargo fuzz run emerge_arg_filtering --target "$HOST_TARGET" --sanitizer none -- -max_total_time=15
 
-      - name: Run integration tests
-        run: cargo test --workspace --features integration
-
-  # E2E test: runs on push to main, covers Phases 4-7 with Docker + stage3.
-  e2e-test:
-    name: E2E Test
+  full-stack-test:
+    name: Full Stack Test
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [check, test]
+    needs: [check, test, fuzz]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
@@ -102,13 +125,24 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # 8.2: Pull the pre-built test stage3 image from GHCR instead of
-      # rebuilding it. test-image.yml builds and pushes on Dockerfile change.
-      - name: Pull test stage3 image from GHCR
+      - name: Install test prerequisites
         run: |
-          docker pull ghcr.io/k-forss/remerge/test-stage3:latest || true
-          docker tag ghcr.io/k-forss/remerge/test-stage3:latest gentoo/stage3:latest || true
-          docker tag ghcr.io/k-forss/remerge/test-stage3:latest remerge/test-stage3:latest || true
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gnupg
 
-      - name: Run E2E tests
+      - name: Prepare test stage3 image
+        run: |
+          image="ghcr.io/${{ github.repository }}/test-stage3:latest"
+          if docker pull "$image"; then
+            docker tag "$image" gentoo/stage3:latest
+            docker tag "$image" remerge/test-stage3:latest
+            echo "Using prebuilt $image for full-stack tests"
+          else
+            echo "::warning::Could not pull $image. Full-stack tests will trigger the explicit local fallback build in tests/common/server.rs."
+          fi
+
+      - name: Build worker binary for queue-driven E2E tests
+        run: cargo build -p remerge-worker
+
+      - name: Run full stack tests
         run: cargo test --workspace --features integration,e2e

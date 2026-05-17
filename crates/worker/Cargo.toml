@@ -11,6 +11,7 @@ name = "remerge-worker"
 path = "src/main.rs"
 
 [dependencies]
+remerge-observability = { path = "../observability" }
 remerge-types = { workspace = true }
 
 tokio = { workspace = true }

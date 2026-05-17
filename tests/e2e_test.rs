@@ -12,6 +12,13 @@ mod e2e_tests {
     use super::common;
     use remerge_types::api::*;
 
+    fn require_docker() {
+        assert!(
+            common::server::docker_available(),
+            "Docker is required for E2E tests but was not found"
+        );
+    }
+
     /// Sentinel: Docker must be available when running E2E tests.
     #[test]
     fn docker_must_be_available_for_e2e() {
@@ -26,9 +33,7 @@ mod e2e_tests {
     /// and verify binpkg output (or that the build actually ran).
     #[tokio::test]
     async fn build_single_package() {
-        let Some(server) = common::server::TestServer::start_with_queue().await else {
-            return;
-        };
+        let server = common::server::TestServer::start_with_queue().await;
 
         // Submit WITHOUT --pretend — we want a real build attempt.
         let req = SubmitWorkorderRequest {
@@ -145,9 +150,7 @@ mod e2e_tests {
     /// --ask should be filtered/rejected (single expected outcome).
     #[tokio::test]
     async fn build_with_pretend_flag() {
-        let Some(server) = common::server::TestServer::start_with_queue().await else {
-            return;
-        };
+        let server = common::server::TestServer::start_with_queue().await;
 
         // Submit with --pretend (should be accepted and passed through).
         let req = SubmitWorkorderRequest {
@@ -311,9 +314,7 @@ mod e2e_tests {
             system_id: common::fixtures::minimal_system_identity(),
         };
 
-        let Some(server) = common::server::TestServer::start().await else {
-            return;
-        };
+        let server = common::server::TestServer::start().await;
 
         let client = reqwest::Client::new();
         let resp = client
@@ -364,9 +365,7 @@ mod e2e_tests {
     /// 6.7: Concurrent workorder rejection — submit while another is active.
     #[tokio::test]
     async fn concurrent_workorder_rejection() {
-        let Some(server) = common::server::TestServer::start().await else {
-            return;
-        };
+        let server = common::server::TestServer::start().await;
 
         let client_id = uuid::Uuid::new_v4();
         let req = SubmitWorkorderRequest {
@@ -406,9 +405,7 @@ mod e2e_tests {
     /// 6.9: Cancellation — submit, cancel via API, verify cancelled status.
     #[tokio::test]
     async fn cancellation_flow() {
-        let Some(server) = common::server::TestServer::start().await else {
-            return;
-        };
+        let server = common::server::TestServer::start().await;
 
         let req = SubmitWorkorderRequest {
             client_id: uuid::Uuid::new_v4(),
@@ -464,9 +461,7 @@ mod e2e_tests {
     /// the workorder was accepted and the atoms field contains @world.
     #[tokio::test]
     async fn build_with_world_set() {
-        let Some(server) = common::server::TestServer::start().await else {
-            return;
-        };
+        let server = common::server::TestServer::start().await;
 
         let req = SubmitWorkorderRequest {
             client_id: uuid::Uuid::new_v4(),
@@ -526,9 +521,7 @@ mod e2e_tests {
     /// using the same config (followers cannot change config).
     #[tokio::test]
     async fn follower_inherits_main_config() {
-        let Some(server) = common::server::TestServer::start().await else {
-            return;
-        };
+        let server = common::server::TestServer::start().await;
 
         let client = reqwest::Client::new();
         let shared_client_id = uuid::Uuid::new_v4();
@@ -615,9 +608,7 @@ mod e2e_tests {
     /// should detect a mismatch.
     #[tokio::test]
     async fn worker_binary_upgrade_detection() {
-        if !common::server::docker_available() {
-            return;
-        }
+        require_docker();
 
         common::server::ensure_test_stage3();
 
@@ -694,9 +685,7 @@ mod e2e_tests {
     /// and verify events are received after reconnection.
     #[tokio::test]
     async fn websocket_reconnect() {
-        let Some(server) = common::server::TestServer::start().await else {
-            return;
-        };
+        let server = common::server::TestServer::start().await;
 
         // Submit a workorder to have an active progress stream.
         let req = SubmitWorkorderRequest {

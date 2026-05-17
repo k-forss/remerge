@@ -37,6 +37,9 @@ pub struct SubmitWorkorderResponse {
     pub workorder_id: WorkorderId,
     /// WebSocket URL to stream build progress.
     pub progress_ws_url: String,
+    /// Root trace ID attached to this workorder.
+    #[serde(default)]
+    pub trace_id: Option<String>,
 }
 
 // ─── Query workorder ────────────────────────────────────────────────
@@ -47,6 +50,8 @@ pub struct WorkorderStatusResponse {
     pub workorder_id: WorkorderId,
     pub status: WorkorderStatus,
     pub result: Option<WorkorderResult>,
+    #[serde(default)]
+    pub trace_id: Option<String>,
 }
 
 // ─── List workorders ────────────────────────────────────────────────
@@ -127,4 +132,10 @@ pub struct ServerInfoResponse {
     /// Whether the server signs binary packages with GPG.
     #[serde(default)]
     pub binpkg_signing: bool,
+    /// Full fingerprint of the public signing key exposed by the server.
+    #[serde(default)]
+    pub signing_key_fingerprint: Option<String>,
+    /// Public endpoint that serves the ASCII-armored signing key.
+    #[serde(default)]
+    pub signing_key_endpoint: Option<String>,
 }
