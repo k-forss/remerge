@@ -63,6 +63,12 @@ AI tooling continues to be used for development.  All AI-generated code is
 reviewed before merge.  The project's test suite and CI pipeline validate
 correctness independently of the generation method.
 
+Active project state and AI-assisted task planning are tracked in
+[`ROADMAP.md`](ROADMAP.md).  Historical one-off agent prompts are archived under
+[`docs/archive/`](docs/archive/) when they are useful for audit history; they are
+not active task trackers.
+
 ## Model
 
-GitHub Copilot using Anthropic Claude.
+Historical project scaffolding used GitHub Copilot with the model available at
+the time. Current AI-assisted work uses GitHub Copilot.
