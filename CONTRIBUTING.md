@@ -8,7 +8,7 @@ ideas, docs improvements, and code patches.
 - **Open an issue first** for anything beyond a trivial fix. This avoids
   wasted effort and lets us discuss the approach.
 - Check [`ROADMAP.md`](ROADMAP.md) for current priorities, release-readiness
-  gates, and implementation-order dependencies before starting non-trivial work.
+  gates, and implementation-ordered dependencies before starting non-trivial work.
 - Security vulnerabilities should be reported privately — see
   [SECURITY.md](SECURITY.md).
 
