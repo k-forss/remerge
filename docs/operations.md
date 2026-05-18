@@ -42,6 +42,25 @@ Critical paths to plan around:
 - `signing.gpg_home`: signing keyring, if enabled
 - `repos_dir`: local ebuild tree mirror, if configured
 
+Snapshot compression behavior:
+
+- snapshot blob identity is always the raw SHA256 digest of the uncompressed payload
+- the CLI may upload snapshot blobs over the websocket stream using zstd when that reduces transfer size enough to be worthwhile
+- the server keeps the raw blob as the source of truth and may retain zstd sidecars for blobs and tree manifests to reduce later transfer cost
+- HTTP blob downloads may return `Content-Encoding: zstd`; supported clients decode this transparently
+
+Snapshot retention behavior:
+
+- snapshot blob/tree retention is global-only; there are no differentiated retention classes
+- unreferenced snapshot data stays warm-cache reusable for 7 days by default
+- unreferenced snapshot data older than 30 days becomes the oldest eviction tier, but the retained-size floor still prevents deletion below the configured minimum, even for hard-delete-eligible entries
+- age-based cleanup across both grace-eligible and hard-delete-eligible data only runs when cached snapshot data exceeds the global minimum retained-size floor, which defaults to 10 GiB
+- operators can tune these defaults with `snapshot_cache_grace_period_hours`, `snapshot_cache_hard_delete_hours`, and `snapshot_min_retained_bytes` or the matching `REMERGE_*` environment variables
+- when cleanup is needed, the server reclaims the oldest eligible unreferenced entries first until retained snapshot data is back at or below the floor
+- cleanup runs asynchronously after workorder runtime teardown so builds are not blocked on deletions
+- operators can force a one-shot cleanup pass without starting the API server by running `remerge-server --config /path/to/server.toml --cleanup-now`
+- extending retention is purely configuration-driven: raise `snapshot_cache_grace_period_hours`, `snapshot_cache_hard_delete_hours`, or `snapshot_min_retained_bytes` and restart the server
+
 Client identity note:
 
 - The CLI persists `client_id` in `/etc/remerge.conf` on first run when the

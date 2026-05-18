@@ -1,5 +1,7 @@
 //! Docker container management for worker containers.
 
+use std::path::Path;
+
 use anyhow::{Context, Result};
 use bollard::{
     Docker,
@@ -380,7 +382,7 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
         &self,
         container_name: &str,
         image_tag: &str,
-        workorder_json: &str,
+        runtime_dir: &Path,
         traceparent: Option<&str>,
         server_config: &ServerConfig,
     ) -> Result<String> {
@@ -393,6 +395,14 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
         if let Some(ref gpg_home) = self.gpg_home {
             binds.push(format!("{gpg_home}:/var/cache/remerge/gnupg:ro"));
         }
+        binds.push(format!(
+            "{}:/var/cache/remerge/workorder:ro",
+            runtime_dir.display()
+        ));
+        binds.push(format!(
+            "{}:/var/cache/remerge/parity",
+            crate::runtime::parity_runtime_dir(runtime_dir).display()
+        ));
         // Bind-mount the server's portage repos into the container so the
         // worker uses the same ebuild tree without needing to sync.
         if let Some(ref repos_dir) = server_config.repos_dir {
@@ -407,7 +417,10 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
             ..Default::default()
         };
 
-        let mut env = vec![format!("REMERGE_WORKORDER={workorder_json}")];
+        let mut env = vec![
+            "REMERGE_WORKORDER_PATH=/var/cache/remerge/workorder/workorder.json".to_string(),
+            "REMERGE_PARITY_OUTPUT_DIR=/var/cache/remerge/parity".to_string(),
+        ];
         if let Some(traceparent) = traceparent {
             env.push(format!("REMERGE_TRACEPARENT={traceparent}"));
         }

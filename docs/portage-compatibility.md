@@ -391,6 +391,9 @@ remerge evidence:
 - the CLI now consumes `binhost_uri` and sets `PORTAGE_BINHOST` before the
   local `emerge` invocation in
   [crates/cli/src/args.rs](../crates/cli/src/args.rs)
+- the CLI now also syncs built `.gpkg` files into the local `PKGDIR` and can
+  point the follow-up local install at `file://<PKGDIR>` in
+  [crates/cli/src/args.rs](../crates/cli/src/args.rs)
 - the local handoff logic is covered by
   [crates/cli/src/args.rs](../crates/cli/src/args.rs)
 - published binhost result URLs are covered end to end by
@@ -445,6 +448,10 @@ Current documented divergence:
   syncs missing overlays
 - overlays that require authenticated transport are skipped in ephemeral
   workers
+- non-Gentoo local overlay working trees are snapshotted on the client and
+  restored into the worker before build
+- distfiles referenced by snapshotted overlay Manifests are transported from
+  the client and restored into the worker distfiles cache
 
 Compliance note:
 
@@ -472,6 +479,10 @@ Audit finding:
 - empty `package.accept_keywords` entries derive unstable keywords from the
   current global `ACCEPT_KEYWORDS`
 - repo config, profile overlay, patches, and env files are transported
+- non-Gentoo local repo working trees and Manifest-backed distfiles are now
+  transported via the staged worker runtime, which is materialized from a
+  server-side content-addressed blob store and annotated with blob references
+  plus repo tree manifests for future manifest-based transport
 - worker-side binpkg output and signing are explicit
 - worker-side flag filtering is explicit rather than implicit
 - local install now performs explicit runtime binhost handoff via

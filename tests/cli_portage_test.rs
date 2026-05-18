@@ -6,6 +6,11 @@
 mod common;
 
 use remerge::portage;
+use sha2::{Digest, Sha256};
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
 
 // ── split_name_version ──────────────────────────────────────────────
 
@@ -335,6 +340,51 @@ fn fixture_portage_tree_structure() {
             .exists()
     );
     assert!(root.join("var/lib/portage/world").exists());
+}
+
+/// Local overlays and their manifest-backed distfiles are captured into the
+/// portage config snapshot so the worker can build unpublished packages.
+#[test]
+fn read_config_captures_local_overlay_and_distfiles() {
+    let (_tmp, root, overlay_name, distfile_name) =
+        common::fixtures::portage_tree_with_local_overlay();
+    let _env = common::set_root_env(&root);
+    let reader = remerge::portage::PortageReader::new().unwrap();
+
+    let config = reader.read_config().expect("read portage config");
+
+    let overlay = config
+        .repo_snapshots
+        .get(&overlay_name)
+        .expect("local overlay snapshot should be captured");
+    assert!(
+        overlay.contains_key("dev-libs/demo/demo-1.0.ebuild"),
+        "overlay ebuild should be captured"
+    );
+    assert!(
+        overlay.contains_key("dev-libs/demo/Manifest"),
+        "overlay Manifest should be captured"
+    );
+    assert!(
+        !overlay.keys().any(|path| path.starts_with(".git/")),
+        "VCS internals must not be captured"
+    );
+    assert_eq!(
+        config.distfile_snapshots.get(&distfile_name),
+        Some(&b"demo-distfile".to_vec())
+    );
+    assert_eq!(
+        config.repo_snapshot_refs[&overlay_name]["dev-libs/demo/demo-1.0.ebuild"],
+        sha256_hex(b"EAPI=8\nDESCRIPTION=\"demo\"\nSRC_URI=\"https://example.invalid/demo-1.0.tar.xz\"\nSLOT=\"0\"\nKEYWORDS=\"~amd64\"\n")
+    );
+    assert_eq!(
+        config.distfile_snapshot_refs[&distfile_name],
+        sha256_hex(b"demo-distfile")
+    );
+    assert!(
+        !config.repo_snapshot_trees[&overlay_name].is_empty(),
+        "repo tree manifest digest should be populated"
+    );
 }
 
 /// Fixture VDB tree creates package directories.

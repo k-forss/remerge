@@ -14,9 +14,12 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use remerge_types::portage::*;
@@ -47,7 +50,20 @@ impl PortageReader {
         let package_env = self.read_package_env()?;
         let env_files = self.read_env_files()?;
         let repos_conf = self.read_repos_conf()?;
+        let repo_snapshots = self.read_repo_snapshots(&repos_conf)?;
+        let repo_snapshot_refs = Self::compute_repo_snapshot_refs(&repo_snapshots);
+        let repo_snapshot_trees = Self::compute_repo_snapshot_trees(&repo_snapshot_refs)?;
         let patches = self.read_patches()?;
+        let distfile_snapshots = self.read_distfile_snapshots(&repo_snapshots)?;
+        let distfile_snapshot_refs = Self::compute_distfile_snapshot_refs(&distfile_snapshots);
+        let snapshot_manifest = self.build_snapshot_manifest(
+            &repos_conf,
+            &repo_snapshots,
+            &repo_snapshot_refs,
+            &repo_snapshot_trees,
+            &distfile_snapshots,
+            &distfile_snapshot_refs,
+        )?;
         let profile_overlay = self.read_profile_overlay()?;
         let profile = self.read_profile()?;
         let world = self.read_world()?;
@@ -62,7 +78,13 @@ impl PortageReader {
             package_env,
             env_files,
             repos_conf,
+            snapshot_manifest,
+            repo_snapshots,
+            repo_snapshot_refs,
+            repo_snapshot_trees,
             patches,
+            distfile_snapshots,
+            distfile_snapshot_refs,
             profile_overlay,
             profile,
             world,
@@ -76,20 +98,35 @@ impl PortageReader {
     /// preserved in [`MakeConf::original_cflags`].
     fn read_make_conf(&self) -> Result<MakeConf> {
         let vars = self.read_make_conf_vars()?;
-
-        let split_flags = |key: &str| -> Vec<String> {
-            vars.get(key)
-                .map(|v| v.split_whitespace().map(String::from).collect())
-                .unwrap_or_default()
-        };
-
+        let can_query_portageq = self.root == Path::new("/");
         let get = |key: &str| -> String { vars.get(key).cloned().unwrap_or_default() };
+        let get_effective = |key: &str| -> String {
+            if can_query_portageq {
+                match Self::portageq_envvar(key) {
+                    Ok(value) if !value.is_empty() => value,
+                    Ok(_) => get(key),
+                    Err(error) => {
+                        debug!(%error, key, "Failed to resolve make.conf variable via portageq");
+                        get(key)
+                    }
+                }
+            } else {
+                debug!(key, root = %self.root.display(), "Skipping portageq resolution for non-root snapshot tree");
+                get(key)
+            }
+        };
+        let split_flags = |key: &str| -> Vec<String> {
+            get_effective(key)
+                .split_whitespace()
+                .map(String::from)
+                .collect()
+        };
 
         // ── Resolve native flags ─────────────────────────────────────
         let resolved =
             cflags::resolve_native_flags().context("Failed to resolve native compiler flags")?;
 
-        let raw_cflags = get("CFLAGS");
+        let raw_cflags = get_effective("CFLAGS");
         let (cflags, original_cflags) = if let Some(ref march) = resolved.march {
             let (resolved_cflags, was_modified) = cflags::resolve_cflags(&raw_cflags, march);
             if was_modified {
@@ -107,7 +144,7 @@ impl PortageReader {
         };
 
         // Also resolve CXXFLAGS if it doesn't just reference ${CFLAGS}.
-        let raw_cxxflags = get("CXXFLAGS");
+        let raw_cxxflags = get_effective("CXXFLAGS");
         let cxxflags = if raw_cxxflags.contains("-march=native") {
             if let Some(ref march) = resolved.march {
                 let (resolved, _) = cflags::resolve_cflags(&raw_cxxflags, march);
@@ -120,15 +157,22 @@ impl PortageReader {
         };
 
         // CHOST: prefer make.conf, fall back to detected.
-        let chost = vars.get("CHOST").cloned().unwrap_or(resolved.chost);
+        let chost = match get_effective("CHOST") {
+            value if !value.is_empty() => value,
+            _ => resolved.chost,
+        };
 
         // ── Resolve USE flags ────────────────────────────────────────
         // Profile-inherited flags (e.g. `dbus` from the desktop profile)
         // are NOT present in make.conf.  Use `portageq envvar USE` to get
         // the fully merged value (profile defaults + make.conf + profile
         // force/mask).
-        let (use_flags, use_flags_resolved) = match Self::portageq_envvar("USE") {
+        let (use_flags, use_flags_resolved) = match can_query_portageq
+            .then(|| Self::portageq_envvar("USE"))
+            .transpose()
+        {
             Ok(resolved_use) => {
+                let resolved_use = resolved_use.unwrap_or_default();
                 let flags: Vec<String> =
                     resolved_use.split_whitespace().map(String::from).collect();
 
@@ -179,6 +223,9 @@ impl PortageReader {
             let mut any_succeeded = false;
 
             for var in ["USE_EXPAND", "USE_EXPAND_UNPREFIXED", "USE_EXPAND_HIDDEN"] {
+                if !can_query_portageq {
+                    break;
+                }
                 match Self::portageq_envvar(var) {
                     Ok(expand_str) => {
                         let found: Vec<String> =
@@ -227,8 +274,12 @@ impl PortageReader {
                 continue;
             }
             // Try portageq first for fully-resolved values, fall back to make.conf.
-            let vals = match Self::portageq_envvar(key) {
+            let vals = match can_query_portageq
+                .then(|| Self::portageq_envvar(key))
+                .transpose()
+            {
                 Ok(resolved) => {
+                    let resolved = resolved.unwrap_or_default();
                     let v: Vec<String> = resolved.split_whitespace().map(String::from).collect();
                     if !v.is_empty() {
                         debug!(key = %key, ?v, "USE_EXPAND resolved via portageq");
@@ -269,13 +320,13 @@ impl PortageReader {
         Ok(MakeConf {
             cflags,
             cxxflags,
-            ldflags: get("LDFLAGS"),
-            makeopts: get("MAKEOPTS"),
+            ldflags: get_effective("LDFLAGS"),
+            makeopts: get_effective("MAKEOPTS"),
             use_flags,
             features: split_flags("FEATURES"),
-            accept_license: get("ACCEPT_LICENSE"),
-            accept_keywords: get("ACCEPT_KEYWORDS"),
-            emerge_default_opts: get("EMERGE_DEFAULT_OPTS"),
+            accept_license: get_effective("ACCEPT_LICENSE"),
+            accept_keywords: get_effective("ACCEPT_KEYWORDS"),
+            emerge_default_opts: get_effective("EMERGE_DEFAULT_OPTS"),
             chost,
             cpu_flags: resolved.cpu_flags,
             original_cflags,
@@ -488,6 +539,181 @@ impl PortageReader {
         Ok(files)
     }
 
+    fn read_repo_snapshots(
+        &self,
+        repos_conf: &BTreeMap<String, String>,
+    ) -> Result<BTreeMap<String, RepoSnapshot>> {
+        let mut snapshots = BTreeMap::new();
+
+        for content in repos_conf.values() {
+            for (name, location) in Self::parse_repo_sections(content) {
+                if !Self::should_snapshot_repo(&name, &location) {
+                    continue;
+                }
+
+                let location_path = Path::new(&location);
+                if !location_path.is_dir() {
+                    debug!(repo = %name, location = %location, "Repo location missing — skipping snapshot");
+                    continue;
+                }
+
+                let mut files = BTreeMap::new();
+                Self::read_text_tree_recursive(location_path, location_path, &mut files);
+                if !files.is_empty() {
+                    info!(repo = %name, file_count = files.len(), "Captured local repo snapshot");
+                    snapshots.insert(name, files);
+                }
+            }
+        }
+
+        Ok(snapshots)
+    }
+
+    fn read_distfile_snapshots(
+        &self,
+        repo_snapshots: &BTreeMap<String, RepoSnapshot>,
+    ) -> Result<BTreeMap<String, Vec<u8>>> {
+        let distdir = self.detect_distdir();
+        let mut files = BTreeMap::new();
+
+        for snapshot in repo_snapshots.values() {
+            for (path, content) in snapshot {
+                if !path.ends_with("/Manifest") && path != "Manifest" {
+                    continue;
+                }
+
+                for distfile in Self::parse_manifest_distfiles(content) {
+                    if files.contains_key(&distfile) {
+                        continue;
+                    }
+
+                    let source_path = distdir.join(&distfile);
+                    match fs::read(&source_path) {
+                        Ok(data) => {
+                            info!(distfile = %distfile, size = data.len(), "Captured distfile snapshot");
+                            files.insert(distfile, data);
+                        }
+                        Err(error) => {
+                            warn!(%error, path = %source_path.display(), "Manifest distfile missing locally — skipping snapshot");
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(files)
+    }
+
+    fn compute_repo_snapshot_refs(
+        repo_snapshots: &BTreeMap<String, RepoSnapshot>,
+    ) -> BTreeMap<String, SnapshotRefs> {
+        repo_snapshots
+            .iter()
+            .map(|(repo, snapshot)| {
+                let refs = snapshot
+                    .iter()
+                    .map(|(path, content)| (path.clone(), Self::sha256_hex(content.as_bytes())))
+                    .collect();
+                (repo.clone(), refs)
+            })
+            .collect()
+    }
+
+    fn compute_repo_snapshot_trees(
+        repo_snapshot_refs: &BTreeMap<String, SnapshotRefs>,
+    ) -> Result<BTreeMap<String, String>> {
+        repo_snapshot_refs
+            .iter()
+            .map(|(repo, refs)| Ok((repo.clone(), Self::tree_digest(refs)?)))
+            .collect()
+    }
+
+    fn compute_distfile_snapshot_refs(
+        distfile_snapshots: &BTreeMap<String, Vec<u8>>,
+    ) -> BTreeMap<String, String> {
+        distfile_snapshots
+            .iter()
+            .map(|(name, bytes)| (name.clone(), Self::sha256_hex(bytes)))
+            .collect()
+    }
+
+    fn build_snapshot_manifest(
+        &self,
+        repos_conf: &BTreeMap<String, String>,
+        repo_snapshots: &BTreeMap<String, RepoSnapshot>,
+        repo_snapshot_refs: &BTreeMap<String, SnapshotRefs>,
+        repo_snapshot_trees: &BTreeMap<String, String>,
+        distfile_snapshots: &BTreeMap<String, Vec<u8>>,
+        distfile_snapshot_refs: &BTreeMap<String, String>,
+    ) -> Result<SnapshotManifest> {
+        let mut manifest = SnapshotManifest::default();
+        let repo_locations: BTreeMap<String, PathBuf> = repos_conf
+            .values()
+            .flat_map(|content| Self::parse_repo_sections(content).into_iter())
+            .map(|(name, location)| (name, PathBuf::from(location)))
+            .collect();
+
+        for (repo_name, snapshot) in repo_snapshots {
+            let refs = repo_snapshot_refs
+                .get(repo_name)
+                .with_context(|| format!("Missing repo snapshot refs for repo '{repo_name}'"))?;
+            let tree_digest = repo_snapshot_trees.get(repo_name).cloned().unwrap_or_default();
+            let repo_root = repo_locations
+                .get(repo_name)
+                .with_context(|| format!("Missing repo location for repo '{repo_name}'"))?;
+            let mut entries = BTreeMap::new();
+
+            for relative_path in snapshot.keys() {
+                let digest = refs.get(relative_path).with_context(|| {
+                    format!("Missing repo snapshot digest for '{repo_name}:{relative_path}'")
+                })?;
+                let full_path = repo_root.join(relative_path);
+                let metadata = fs::metadata(&full_path)
+                    .with_context(|| format!("Failed to stat {}", full_path.display()))?;
+                entries.insert(
+                    relative_path.clone(),
+                    SnapshotEntry {
+                        digest: digest.clone(),
+                        size: metadata.len(),
+                        mtime_secs: metadata.mtime(),
+                    },
+                );
+            }
+
+            manifest.repo_snapshots.insert(
+                repo_name.clone(),
+                RepoSnapshotManifest { tree_digest, entries },
+            );
+        }
+
+        let distdir = self.detect_distdir();
+        for (filename, bytes) in distfile_snapshots {
+            let digest = distfile_snapshot_refs
+                .get(filename)
+                .with_context(|| format!("Missing distfile snapshot digest for '{filename}'"))?;
+            let full_path = distdir.join(filename);
+            let metadata = fs::metadata(&full_path)
+                .with_context(|| format!("Failed to stat {}", full_path.display()))?;
+            if metadata.len() != bytes.len() as u64 {
+                anyhow::bail!(
+                    "Distfile snapshot size mismatch for '{filename}': captured {} bytes, filesystem reports {}",
+                    bytes.len(),
+                    metadata.len()
+                );
+            }
+            manifest.distfiles.insert(
+                filename.clone(),
+                SnapshotEntry {
+                    digest: digest.clone(),
+                    size: metadata.len(),
+                    mtime_secs: metadata.mtime(),
+                },
+            );
+        }
+
+        Ok(manifest)
+    }
+
     /// Read user patches from `/etc/portage/patches/`.
     ///
     /// Returns a map of relative path → file content.  The directory
@@ -591,6 +817,131 @@ impl PortageReader {
                     out.insert(relative, content);
                 }
             }
+        }
+    }
+
+    fn read_text_tree_recursive(base: &Path, dir: &Path, out: &mut BTreeMap<String, String>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+
+        let mut paths: Vec<_> = entries.flatten().map(|entry| entry.path()).collect();
+        paths.sort();
+
+        for path in paths {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if name.starts_with('.') {
+                continue;
+            }
+
+            if path.is_dir() {
+                Self::read_text_tree_recursive(base, &path, out);
+            } else if path.is_file()
+                && let Ok(content) = fs::read_to_string(&path)
+            {
+                let relative = path
+                    .strip_prefix(base)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.insert(relative, content);
+            }
+        }
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    fn tree_digest(entries: &SnapshotRefs) -> Result<String> {
+        #[derive(Serialize)]
+        struct TreeManifest<'a> {
+            entries: &'a SnapshotRefs,
+        }
+
+        let bytes = serde_json::to_vec(&TreeManifest { entries })?;
+        Ok(Self::sha256_hex(&bytes))
+    }
+
+    fn should_snapshot_repo(name: &str, location: &str) -> bool {
+        if name.eq_ignore_ascii_case("gentoo") {
+            return false;
+        }
+
+        let location = location.trim_end_matches('/');
+        !location.ends_with("/gentoo")
+    }
+
+    fn parse_repo_sections(content: &str) -> Vec<(String, String)> {
+        let mut repos = Vec::new();
+        let mut current_name = String::new();
+        let mut current_location: Option<String> = None;
+
+        let flush = |name: &str, location: Option<String>, out: &mut Vec<(String, String)>| {
+            if !name.is_empty()
+                && !name.eq_ignore_ascii_case("DEFAULT")
+                && let Some(location) = location
+            {
+                out.push((name.to_string(), location));
+            }
+        };
+
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                flush(&current_name, current_location.take(), &mut repos);
+                current_name = trimmed[1..trimmed.len() - 1].trim().to_string();
+                continue;
+            }
+            if let Some((key, value)) = trimmed.split_once('=')
+                && key.trim().eq_ignore_ascii_case("location")
+            {
+                current_location = Some(value.trim().to_string());
+            }
+        }
+
+        flush(&current_name, current_location.take(), &mut repos);
+        repos
+    }
+
+    fn parse_manifest_distfiles(content: &str) -> Vec<String> {
+        content
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split_whitespace();
+                match (parts.next(), parts.next()) {
+                    (Some("DIST"), Some(name)) if !name.contains('/') && !name.contains("..") => {
+                        Some(name.to_string())
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    fn detect_distdir(&self) -> PathBuf {
+        if let Ok(value) = std::env::var("DISTDIR") {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed);
+            }
+        }
+
+        let root_distdir = self.root.join("var/cache/distfiles");
+        if root_distdir.is_dir() {
+            return root_distdir;
+        }
+
+        if self.root != Path::new("/") {
+            return PathBuf::from("/var/cache/distfiles");
+        }
+
+        match Self::portageq_envvar("DISTDIR") {
+            Ok(value) if !value.is_empty() => PathBuf::from(value),
+            _ => PathBuf::from("/var/cache/distfiles"),
         }
     }
 
@@ -1034,41 +1385,126 @@ impl PortageReader {
 
     /// Minimalist shell variable parser for make.conf.
     ///
-    /// Handles `VAR="value"` and `VAR='value'` and `VAR=value` forms.
-    /// Does NOT handle multi-line values, command substitution, etc.
+    /// Handles `VAR="value"`, `VAR='value'`, and `VAR=value` forms,
+    /// including multiline quoted values and multiple assignments on one line.
+    /// Does NOT evaluate command substitution or execute shell code.
     ///
     /// For variables that need full resolution (including `source` directives
     /// and profile inheritance), use [`portageq_envvar`] instead.
     pub fn parse_make_conf_vars(content: &str) -> BTreeMap<String, String> {
+        fn is_var_start(ch: char) -> bool {
+            ch == '_' || ch.is_ascii_alphabetic()
+        }
+
+        fn is_var_char(ch: char) -> bool {
+            ch == '_' || ch.is_ascii_alphanumeric()
+        }
+
         let mut vars = BTreeMap::new();
 
-        // Join continuation lines (backslash-newline).
-        let joined = content.replace("\\\n", " ");
+        let chars: Vec<char> = content.chars().collect();
+        let mut index = 0;
 
-        for line in joined.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
+        while index < chars.len() {
+            while index < chars.len() && chars[index].is_whitespace() {
+                index += 1;
+            }
+            if index >= chars.len() {
+                break;
+            }
+
+            if chars[index] == '#' {
+                while index < chars.len() && chars[index] != '\n' {
+                    index += 1;
+                }
                 continue;
             }
-            // Look for KEY=VALUE.
-            if let Some(eq_pos) = line.find('=') {
-                let key = line[..eq_pos].trim();
-                if key.contains(' ') || key.is_empty() {
-                    continue; // Not a simple assignment.
+
+            if !is_var_start(chars[index]) {
+                while index < chars.len() && chars[index] != '\n' {
+                    index += 1;
                 }
-                let val = line[eq_pos + 1..].trim();
+                continue;
+            }
 
-                // Strip surrounding quotes.
-                let val = if val.len() >= 2
-                    && ((val.starts_with('"') && val.ends_with('"'))
-                        || (val.starts_with('\'') && val.ends_with('\'')))
-                {
-                    &val[1..val.len() - 1]
-                } else {
-                    val
-                };
+            let key_start = index;
+            index += 1;
+            while index < chars.len() && is_var_char(chars[index]) {
+                index += 1;
+            }
+            let key: String = chars[key_start..index].iter().collect();
 
-                vars.insert(key.to_string(), val.to_string());
+            while index < chars.len() && chars[index].is_whitespace() && chars[index] != '\n' {
+                index += 1;
+            }
+            if index >= chars.len() || chars[index] != '=' {
+                while index < chars.len() && chars[index] != '\n' {
+                    index += 1;
+                }
+                continue;
+            }
+            index += 1;
+
+            while index < chars.len() && chars[index].is_whitespace() && chars[index] != '\n' {
+                index += 1;
+            }
+
+            let mut value = String::new();
+            if index < chars.len() && matches!(chars[index], '"' | '\'') {
+                let quote = chars[index];
+                index += 1;
+                let mut terminated = false;
+                while index < chars.len() {
+                    let ch = chars[index];
+                    if ch == quote {
+                        index += 1;
+                        terminated = true;
+                        break;
+                    }
+                    if ch == '\\' {
+                        if index + 1 < chars.len() && chars[index + 1] == '\n' {
+                            index += 2;
+                            continue;
+                        }
+                        if quote == '"' && index + 1 < chars.len() {
+                            let escaped = chars[index + 1];
+                            if matches!(escaped, '\\' | '"' | '$' | '`') {
+                                value.push(escaped);
+                                index += 2;
+                                continue;
+                            }
+                        }
+                    }
+                    value.push(ch);
+                    index += 1;
+                }
+                if !terminated {
+                    value.insert(0, quote);
+                }
+            } else {
+                while index < chars.len() {
+                    let ch = chars[index];
+                    if ch == '\\' && index + 1 < chars.len() && chars[index + 1] == '\n' {
+                        index += 2;
+                        continue;
+                    }
+                    if ch == '\n' || ch.is_whitespace() || ch == '#' {
+                        break;
+                    }
+                    value.push(ch);
+                    index += 1;
+                }
+            }
+
+            vars.insert(key, value);
+
+            while index < chars.len() && chars[index].is_whitespace() && chars[index] != '\n' {
+                index += 1;
+            }
+            if index < chars.len() && chars[index] == '#' {
+                while index < chars.len() && chars[index] != '\n' {
+                    index += 1;
+                }
             }
         }
 
@@ -1440,13 +1876,37 @@ VIDEO_CARDS="amdgpu radeonsi"
     fn parse_continuation_lines() {
         let input = "USE=\"foo \\\nbar \\\nbaz\"";
         let vars = PortageReader::parse_make_conf_vars(input);
-        assert_eq!(vars["USE"], "foo  bar  baz");
+        assert_eq!(vars["USE"], "foo bar baz");
     }
 
     #[test]
     fn parse_make_conf_vars_does_not_panic_on_single_quote_value() {
         let vars = PortageReader::parse_make_conf_vars("BROKEN='");
         assert_eq!(vars["BROKEN"], "'");
+    }
+
+    #[test]
+    fn parse_make_conf_vars_supports_multiline_quoted_values() {
+        let vars = PortageReader::parse_make_conf_vars(
+            "FEATURES=\"\nparallel-fetch\nparallel-install\ncandy\n\"\nUSE=\"\nwayland\nssl\n\"\n",
+        );
+
+        assert_eq!(
+            vars["FEATURES"],
+            "\nparallel-fetch\nparallel-install\ncandy\n"
+        );
+        assert_eq!(vars["USE"], "\nwayland\nssl\n");
+    }
+
+    #[test]
+    fn parse_make_conf_vars_supports_multiple_assignments_on_one_line() {
+        let vars = PortageReader::parse_make_conf_vars(
+            "COMMON_FLAGS=\"-O2 -pipe\" CFLAGS=\"${COMMON_FLAGS}\" MAKEOPTS=\"-j8\"",
+        );
+
+        assert_eq!(vars["COMMON_FLAGS"], "-O2 -pipe");
+        assert_eq!(vars["CFLAGS"], "${COMMON_FLAGS}");
+        assert_eq!(vars["MAKEOPTS"], "-j8");
     }
 
     #[test]

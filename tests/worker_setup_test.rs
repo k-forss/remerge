@@ -247,6 +247,155 @@ async fn write_make_conf_empty_features_defaults() {
     assert!(content.contains("noclean"), "must have noclean default");
 }
 
+/// Repo snapshots and distfile snapshots are restored into the worker runtime
+/// before emerge executes.
+#[tokio::test]
+async fn restore_repo_and_distfile_snapshots() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let repos_base = tmp.path().join("repos");
+    let portage_base = tmp.path().join("etc/portage");
+    let distfiles_base = tmp.path().join("distfiles");
+    tokio::fs::create_dir_all(&repos_base).await.unwrap();
+    tokio::fs::create_dir_all(&portage_base).await.unwrap();
+
+    let mut config = common::fixtures::minimal_portage_config();
+    config.repos_conf.insert(
+        "local-overlay.conf".into(),
+        format!(
+            "[local-overlay]\nlocation = {}\nauto-sync = no\n",
+            repos_base.join("local-overlay").display()
+        ),
+    );
+    config.repo_snapshots.insert(
+        "local-overlay".into(),
+        std::collections::BTreeMap::from([
+            (
+                "dev-libs/demo/demo-1.0.ebuild".into(),
+                "EAPI=8\nDESCRIPTION=\"demo\"\n".into(),
+            ),
+            (
+                "dev-libs/demo/Manifest".into(),
+                "DIST demo-1.0.tar.xz 12 BLAKE2B deadbeef SHA512 cafefood\n".into(),
+            ),
+        ]),
+    );
+    config
+        .distfile_snapshots
+        .insert("demo-1.0.tar.xz".into(), b"demo-distfile".to_vec());
+
+    portage_setup::write_repos_conf_inner(&portage_base, &config)
+        .await
+        .expect("write_repos_conf_inner");
+    portage_setup::ensure_repo_locations_inner(
+        &config,
+        &repos_base,
+        &portage_base.join("repos.conf"),
+        &tmp.path().join("remap"),
+    )
+    .await
+    .expect("ensure_repo_locations_inner");
+    portage_setup::restore_snapshots_inner(
+        &config,
+        &portage_base.join("repos.conf"),
+        &distfiles_base,
+    )
+    .await
+    .expect("restore_snapshots_inner");
+
+    let ebuild = repos_base.join("local-overlay/dev-libs/demo/demo-1.0.ebuild");
+    assert!(ebuild.exists(), "repo snapshot ebuild should be restored");
+    let distfile = distfiles_base.join("demo-1.0.tar.xz");
+    assert!(distfile.exists(), "distfile snapshot should be restored");
+    assert_eq!(std::fs::read(distfile).unwrap(), b"demo-distfile");
+}
+
+/// Staged runtime snapshots are restored from the mounted server runtime even
+/// after the workorder payload has been stripped down to digest refs.
+#[tokio::test]
+async fn restore_staged_runtime_snapshots() {
+    let state_dir = tempfile::TempDir::new().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let repos_base = tmp.path().join("repos");
+    let portage_base = tmp.path().join("etc/portage");
+    let distfiles_base = tmp.path().join("distfiles");
+    tokio::fs::create_dir_all(&repos_base).await.unwrap();
+    tokio::fs::create_dir_all(&portage_base).await.unwrap();
+
+    let mut workorder = remerge_types::workorder::Workorder {
+        id: uuid::Uuid::new_v4(),
+        client_id: uuid::Uuid::new_v4(),
+        role: remerge_types::client::ClientRole::Main,
+        atoms: vec!["dev-libs/demo".into()],
+        emerge_args: vec!["dev-libs/demo".into()],
+        portage_config: common::fixtures::minimal_portage_config(),
+        system_id: common::fixtures::minimal_system_identity(),
+        trace_context: None,
+        status: remerge_types::workorder::WorkorderStatus::Pending,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    workorder.portage_config.repos_conf.insert(
+        "local-overlay.conf".into(),
+        format!(
+            "[local-overlay]\nlocation = {}\nauto-sync = no\n",
+            repos_base.join("local-overlay").display()
+        ),
+    );
+    workorder.portage_config.repo_snapshots.insert(
+        "local-overlay".into(),
+        std::collections::BTreeMap::from([(
+            "dev-libs/demo/demo-1.0.ebuild".into(),
+            "EAPI=8\nDESCRIPTION=\"demo\"\n".into(),
+        )]),
+    );
+    workorder
+        .portage_config
+        .distfile_snapshots
+        .insert("demo-1.0.tar.xz".into(), b"demo-distfile".to_vec());
+
+    let staged = remerge_server::runtime::stage_workorder_runtime(state_dir.path(), &workorder)
+        .await
+        .expect("stage_workorder_runtime");
+    let staged_workorder: remerge_types::workorder::Workorder =
+        serde_json::from_slice(&tokio::fs::read(&staged.workorder_json_path).await.unwrap())
+            .unwrap();
+    assert!(staged_workorder.portage_config.repo_snapshots.is_empty());
+    assert!(
+        staged_workorder
+            .portage_config
+            .distfile_snapshots
+            .is_empty()
+    );
+
+    portage_setup::write_repos_conf_inner(&portage_base, &staged_workorder.portage_config)
+        .await
+        .expect("write_repos_conf_inner");
+    portage_setup::ensure_repo_locations_inner(
+        &staged_workorder.portage_config,
+        &repos_base,
+        &portage_base.join("repos.conf"),
+        &tmp.path().join("remap"),
+    )
+    .await
+    .expect("ensure_repo_locations_inner");
+    portage_setup::restore_staged_snapshots_inner(
+        &portage_base.join("repos.conf"),
+        &distfiles_base,
+        &staged.runtime_dir.join("snapshots"),
+    )
+    .await
+    .expect("restore_staged_snapshots_inner");
+
+    let ebuild = repos_base.join("local-overlay/dev-libs/demo/demo-1.0.ebuild");
+    assert!(
+        ebuild.exists(),
+        "staged repo snapshot ebuild should be restored"
+    );
+    let distfile = distfiles_base.join("demo-1.0.tar.xz");
+    assert!(distfile.exists(), "staged distfile should be restored");
+    assert_eq!(std::fs::read(distfile).unwrap(), b"demo-distfile");
+}
+
 // ── write_package_use ───────────────────────────────────────────────
 
 /// Write package.use entries and verify content.

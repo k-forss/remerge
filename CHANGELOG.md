@@ -124,4 +124,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `remerge_queue_depth` needs a fresh audit before release readiness is claimed.
 - `@system` set expansion does not resolve virtual packages.
 - Production deployment hardening and operator runbooks are tracked in
-  [`ROADMAP.md`](ROADMAP.md).
+  [docs/operations.md](docs/operations.md).

@@ -24,6 +24,10 @@ struct Cli {
     /// Listen address.
     #[arg(long, default_value = "0.0.0.0:7654")]
     listen: String,
+
+    /// Run one snapshot-cache cleanup pass and exit.
+    #[arg(long)]
+    cleanup_now: bool,
 }
 
 #[tokio::main]
@@ -43,6 +47,33 @@ async fn main() -> Result<()> {
     task::spawn_blocking(move || signing::validate_signing_config(&signing_config)).await??;
 
     let state = Arc::new(AppState::new(config).await?);
+
+    if cli.cleanup_now {
+        let active_references: Vec<_> = state
+            .staged_workorder_references
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect();
+        let summary = remerge_server::runtime::cleanup_snapshot_storage(
+            state.config.state_dir.as_path(),
+            &state.config,
+            &active_references,
+        )
+        .await?;
+        state
+            .metrics
+            .record_cleanup_reclaimed_bytes(summary.reclaimed_bytes);
+        info!(
+            deleted_blobs = summary.deleted_blobs,
+            deleted_trees = summary.deleted_trees,
+            reclaimed_bytes = summary.reclaimed_bytes,
+            active_reference_sets = active_references.len(),
+            "Completed manual snapshot-cache cleanup pass"
+        );
+        return Ok(());
+    }
 
     // Ensure binpkg repository directory exists.
     state.binpkg_repo.init().await?;

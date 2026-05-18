@@ -1,15 +1,98 @@
 //! HTTP + WebSocket client for communicating with the remerge server.
 
+use std::path::Path;
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use remerge_types::trace::TRACEPARENT_HEADER;
 use remerge_types::{
-    api::{SubmitWorkorderRequest, SubmitWorkorderResponse},
+    api::{
+        FindMissingBlobsRequest, FindMissingBlobsResponse, SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES,
+        SNAPSHOT_BLOB_ENCODING_ZSTD, SNAPSHOT_BLOB_PROTOCOL_VERSION, SnapshotBlobChunkHeader,
+        SnapshotBlobClientControlMessage, SnapshotBlobEncodingOffer,
+        SnapshotBlobServerControlMessage, SubmitWorkorderRequest, SubmitWorkorderResponse,
+        UploadBlobResponse,
+    },
     client::{ClientId, ClientRole},
+    compression,
     portage::{PortageConfig, SystemIdentity},
     workorder::{BuildEvent, BuildProgress, WorkorderResult},
 };
-use tracing::debug;
+use tracing::{debug, info, warn};
+
+const SNAPSHOT_BLOB_STREAM_MAX_CONNECTION_ATTEMPTS: usize = 4;
+const SNAPSHOT_BLOB_STREAM_RECONNECT_DELAY: Duration = Duration::from_millis(200);
+const SNAPSHOT_BLOB_STREAM_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+const SNAPSHOT_BLOB_STREAM_SLOW_ACK_THRESHOLD: Duration = Duration::from_millis(150);
+const SNAPSHOT_BLOB_STREAM_MIN_CHUNK_SIZE_BYTES: u64 = 256 * 1024;
+const SNAPSHOT_BLOB_STREAM_GROW_AFTER_HEALTHY_ACKS: usize = 2;
+const FILE_DOWNLOAD_STALL_THRESHOLD: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone)]
+struct SnapshotBlobChunkPolicy {
+    current_chunk_size_bytes: u64,
+    max_chunk_size_bytes: u64,
+    min_chunk_size_bytes: u64,
+    healthy_ack_streak: usize,
+}
+
+impl SnapshotBlobChunkPolicy {
+    fn new(max_chunk_size_bytes: u64) -> Self {
+        Self {
+            current_chunk_size_bytes: max_chunk_size_bytes,
+            max_chunk_size_bytes,
+            min_chunk_size_bytes: SNAPSHOT_BLOB_STREAM_MIN_CHUNK_SIZE_BYTES
+                .min(max_chunk_size_bytes.max(1)),
+            healthy_ack_streak: 0,
+        }
+    }
+
+    fn current_chunk_size_bytes(&self) -> u64 {
+        self.current_chunk_size_bytes
+    }
+
+    fn chunk_size_for_remaining(&self, remaining_bytes: u64) -> usize {
+        self.current_chunk_size_bytes.min(remaining_bytes.max(1)) as usize
+    }
+
+    fn on_ack(&mut self, ack_latency: Duration) {
+        if ack_latency >= SNAPSHOT_BLOB_STREAM_SLOW_ACK_THRESHOLD {
+            self.shrink();
+            self.healthy_ack_streak = 0;
+            return;
+        }
+
+        self.healthy_ack_streak += 1;
+        if self.healthy_ack_streak >= SNAPSHOT_BLOB_STREAM_GROW_AFTER_HEALTHY_ACKS {
+            self.grow();
+            self.healthy_ack_streak = 0;
+        }
+    }
+
+    fn on_reconnect(&mut self) {
+        self.shrink();
+        self.healthy_ack_streak = 0;
+    }
+
+    fn shrink(&mut self) {
+        self.current_chunk_size_bytes =
+            (self.current_chunk_size_bytes / 2).max(self.min_chunk_size_bytes);
+    }
+
+    fn grow(&mut self) {
+        self.current_chunk_size_bytes = (self.current_chunk_size_bytes * 2)
+            .min(self.max_chunk_size_bytes)
+            .max(self.min_chunk_size_bytes);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SnapshotBlobUploadPayload {
+    raw_bytes: Vec<u8>,
+    zstd_bytes: Option<Vec<u8>>,
+    offered_encodings: Vec<SnapshotBlobEncodingOffer>,
+}
 
 /// Client for the remerge server.
 pub struct RemergeClient {
@@ -79,6 +162,483 @@ impl RemergeClient {
             .context("Failed to parse workorder response")
     }
 
+    /// Ask the server which blob digests are missing from its shared snapshot store.
+    pub async fn find_missing_blobs(&self, digests: &[String]) -> Result<Vec<String>> {
+        let resp = self
+            .http
+            .post(format!("{}/api/v1/snapshots/missing-blobs", self.base_url))
+            .json(&FindMissingBlobsRequest {
+                digests: digests.to_vec(),
+            })
+            .send()
+            .await
+            .context("Failed to query missing snapshot blobs")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Server returned {status} while querying missing blobs: {body}");
+        }
+
+        let body = resp
+            .json::<FindMissingBlobsResponse>()
+            .await
+            .context("Failed to parse missing-blobs response")?;
+        debug!(
+            requested_digests = digests.len(),
+            missing_digests = body.missing_digests.len(),
+            "Resolved snapshot missing-blob query"
+        );
+        Ok(body.missing_digests)
+    }
+
+    /// Upload a single verified snapshot blob by digest.
+    pub async fn upload_blob(&self, digest: &str, bytes: &[u8]) -> Result<bool> {
+        let resp = self
+            .http
+            .put(format!("{}/api/v1/snapshots/blobs/{digest}", self.base_url))
+            .body(bytes.to_vec())
+            .send()
+            .await
+            .with_context(|| format!("Failed to upload snapshot blob {digest}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Server returned {status} while uploading blob {digest}: {body}");
+        }
+
+        let body = resp
+            .json::<UploadBlobResponse>()
+            .await
+            .context("Failed to parse upload-blob response")?;
+        debug!(
+            digest,
+            raw_size_bytes = bytes.len(),
+            uploaded = body.uploaded,
+            "Completed HTTP snapshot blob upload"
+        );
+        Ok(body.uploaded)
+    }
+
+    /// Download a stored snapshot blob by digest into a local destination.
+    pub async fn download_blob(&self, digest: &str, destination: &Path) -> Result<()> {
+        self.download_file(
+            &format!("{}/api/v1/snapshots/blobs/{digest}", self.base_url),
+            destination,
+        )
+        .await
+    }
+
+    /// Upload a snapshot blob through the hybrid websocket chunk-streaming transport.
+    pub async fn stream_upload_blob(&self, digest: &str, bytes: &[u8]) -> Result<bool> {
+        use tokio_tungstenite::connect_async;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let workorder_id = uuid::Uuid::new_v4();
+        let ws_url = self.snapshot_blob_stream_url();
+        let attempts = SNAPSHOT_BLOB_STREAM_MAX_CONNECTION_ATTEMPTS.max(1);
+        let mut last_error: Option<anyhow::Error> = None;
+        let mut chunk_policy = SnapshotBlobChunkPolicy::new(SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES);
+        let upload_payload = Self::prepare_upload_payload(bytes).await?;
+        debug!(
+            digest,
+            raw_size_bytes = bytes.len(),
+            transport_encoding = if upload_payload.zstd_bytes.is_some() { "zstd_optional" } else { "raw_only" },
+            attempts,
+            "Starting websocket snapshot blob upload"
+        );
+
+        for attempt in 1..=attempts {
+            let upload_result = async {
+                let (mut ws, _) = connect_async(&ws_url)
+                    .await
+                    .with_context(|| format!("Failed to connect to snapshot blob stream {ws_url}"))?;
+
+                let init = SnapshotBlobClientControlMessage::UploadInit {
+                    version: SNAPSHOT_BLOB_PROTOCOL_VERSION,
+                    workorder_id,
+                    digest: digest.to_string(),
+                    total_size_bytes: bytes.len() as u64,
+                    chunk_size_bytes: SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES,
+                    capability_flags: upload_payload
+                        .offered_encodings
+                        .iter()
+                        .map(|offer| offer.encoding.clone())
+                        .collect(),
+                    offered_encodings: upload_payload.offered_encodings.clone(),
+                };
+                ws.send(Message::Text(
+                    serde_json::to_string(&init)
+                        .context("Failed to serialize upload_init")?
+                        .into(),
+                ))
+                .await
+                .with_context(|| format!("Failed to send upload_init for blob {digest}"))?;
+
+                let resume = Self::recv_blob_upload_control_with_timeout(
+                    &mut ws,
+                    digest,
+                    SNAPSHOT_BLOB_STREAM_CONTROL_TIMEOUT,
+                )
+                .await?;
+                let (selected_bytes, mut next_offset, mut next_sequence) = match resume {
+                    SnapshotBlobServerControlMessage::UploadResume {
+                        version,
+                        workorder_id: response_workorder_id,
+                        digest: response_digest,
+                        next_offset_bytes,
+                        next_sequence,
+                        selected_encoding,
+                        expected_size_bytes,
+                    } => {
+                        Self::validate_blob_upload_envelope(
+                            version,
+                            workorder_id,
+                            digest,
+                            &response_digest,
+                            Some(response_workorder_id),
+                        )?;
+                        let selected_bytes =
+                            Self::payload_for_selected_encoding(&upload_payload, selected_encoding.as_deref())?;
+                        if expected_size_bytes != selected_bytes.len() as u64 {
+                            anyhow::bail!(
+                                "Blob stream server selected an unexpected payload length for {digest}: expected {}, got {expected_size_bytes}",
+                                selected_bytes.len()
+                            );
+                        }
+                        debug!(
+                            digest,
+                            attempt,
+                            next_offset_bytes,
+                            next_sequence,
+                            selected_encoding = selected_encoding.as_deref().unwrap_or("raw"),
+                            expected_size_bytes,
+                            "Received snapshot blob upload resume state"
+                        );
+                        (selected_bytes, next_offset_bytes, next_sequence)
+                    }
+                    SnapshotBlobServerControlMessage::UploadError { code, message, .. } => {
+                        anyhow::bail!("Blob stream upload failed during init ({code}): {message}");
+                    }
+                    SnapshotBlobServerControlMessage::UploadComplete {
+                        version,
+                        workorder_id: response_workorder_id,
+                        digest: response_digest,
+                        uploaded,
+                    } => {
+                        Self::validate_blob_upload_envelope(
+                            version,
+                            workorder_id,
+                            digest,
+                            &response_digest,
+                            Some(response_workorder_id),
+                        )?;
+                        debug!(
+                            digest,
+                            attempt,
+                            uploaded,
+                            "Snapshot blob upload short-circuited at init"
+                        );
+                        return Ok(uploaded);
+                    }
+                    other => {
+                        anyhow::bail!(
+                            "Unexpected blob upload control frame before streaming: {other:?}"
+                        );
+                    }
+                };
+
+                while next_offset < selected_bytes.len() as u64 {
+                    let chunk_size_bytes =
+                        chunk_policy.chunk_size_for_remaining(selected_bytes.len() as u64 - next_offset);
+                    let chunk_end = next_offset as usize + chunk_size_bytes;
+                    let chunk = &selected_bytes[next_offset as usize..chunk_end];
+                    let header =
+                        SnapshotBlobChunkHeader::from_payload(next_sequence, next_offset, chunk);
+                    let frame = header
+                        .encode_with_payload(chunk)
+                        .context("Failed to encode snapshot chunk frame")?;
+                    let send_started = std::time::Instant::now();
+                    ws.send(Message::Binary(frame.into())).await.with_context(|| {
+                        format!("Failed to send blob chunk {next_sequence} for {digest}")
+                    })?;
+
+                    let ack = Self::recv_blob_upload_control_with_timeout(
+                        &mut ws,
+                        digest,
+                        SNAPSHOT_BLOB_STREAM_CONTROL_TIMEOUT,
+                    )
+                    .await?;
+                    match ack {
+                        SnapshotBlobServerControlMessage::UploadAck {
+                            version,
+                            workorder_id: response_workorder_id,
+                            digest: response_digest,
+                            sequence,
+                            offset_bytes,
+                            size_bytes,
+                            received_bytes,
+                        } => {
+                            Self::validate_blob_upload_envelope(
+                                version,
+                                workorder_id,
+                                digest,
+                                &response_digest,
+                                Some(response_workorder_id),
+                            )?;
+                            if sequence != next_sequence {
+                                anyhow::bail!(
+                                    "Blob stream ack sequence mismatch for {digest}: expected {next_sequence}, got {sequence}"
+                                );
+                            }
+                            if offset_bytes != next_offset {
+                                anyhow::bail!(
+                                    "Blob stream ack offset mismatch for {digest}: expected {next_offset}, got {offset_bytes}"
+                                );
+                            }
+                            if size_bytes != chunk.len() as u64 {
+                                anyhow::bail!(
+                                    "Blob stream ack size mismatch for {digest}: expected {}, got {size_bytes}",
+                                    chunk.len()
+                                );
+                            }
+                            chunk_policy.on_ack(send_started.elapsed());
+                            next_offset = received_bytes;
+                            next_sequence += 1;
+                        }
+                        SnapshotBlobServerControlMessage::UploadError { code, message, .. } => {
+                            anyhow::bail!(
+                                "Blob stream upload failed while sending {digest} chunk {next_sequence} ({code}): {message}"
+                            );
+                        }
+                        other => {
+                            anyhow::bail!(
+                                "Unexpected blob upload control frame after chunk {next_sequence} for {digest}: {other:?}"
+                            );
+                        }
+                    }
+                }
+
+                let complete = Self::recv_blob_upload_control_with_timeout(
+                    &mut ws,
+                    digest,
+                    SNAPSHOT_BLOB_STREAM_CONTROL_TIMEOUT,
+                )
+                .await?;
+                match complete {
+                    SnapshotBlobServerControlMessage::UploadComplete {
+                        version,
+                        workorder_id: response_workorder_id,
+                        digest: response_digest,
+                        uploaded,
+                    } => {
+                        Self::validate_blob_upload_envelope(
+                            version,
+                            workorder_id,
+                            digest,
+                            &response_digest,
+                            Some(response_workorder_id),
+                        )?;
+                        debug!(
+                            digest,
+                            attempt,
+                            uploaded,
+                            final_chunk_size_bytes = chunk_policy.current_chunk_size_bytes(),
+                            "Completed websocket snapshot blob upload"
+                        );
+                        Ok(uploaded)
+                    }
+                    SnapshotBlobServerControlMessage::UploadError { code, message, .. } => {
+                        anyhow::bail!(
+                            "Blob stream upload failed while completing {digest} ({code}): {message}"
+                        );
+                    }
+                    other => anyhow::bail!(
+                        "Unexpected blob upload completion frame for {digest}: {other:?}"
+                    ),
+                }
+            }
+            .await;
+
+            match upload_result {
+                Ok(uploaded) => return Ok(uploaded),
+                Err(error)
+                    if attempt < attempts && Self::is_retryable_blob_stream_error(&error) =>
+                {
+                    chunk_policy.on_reconnect();
+                    debug!(
+                        %error,
+                        digest,
+                        attempt,
+                        attempts,
+                        chunk_size_bytes = chunk_policy.current_chunk_size_bytes(),
+                        "Blob stream connection failed; reconnecting from upload_resume"
+                    );
+                    last_error = Some(error);
+                    tokio::time::sleep(
+                        SNAPSHOT_BLOB_STREAM_RECONNECT_DELAY.mul_f32(attempt as f32),
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "Failed to stream snapshot blob {digest} after {attempts} connection attempt(s)"
+                        )
+                    });
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            anyhow::anyhow!("snapshot blob stream loop ended unexpectedly for {digest}")
+        }))
+    }
+
+    async fn prepare_upload_payload(bytes: &[u8]) -> Result<SnapshotBlobUploadPayload> {
+        let raw_bytes = bytes.to_vec();
+        let mut zstd_bytes = None;
+        let mut offered_encodings = Vec::new();
+
+        let input = raw_bytes.clone();
+        if let Some(compressed) =
+            tokio::task::spawn_blocking(move || compression::encode_zstd_if_worthwhile(&input))
+                .await
+                .context("zstd compression task failed to join")??
+        {
+            offered_encodings.push(SnapshotBlobEncodingOffer {
+                encoding: SNAPSHOT_BLOB_ENCODING_ZSTD.to_string(),
+                size_bytes: compressed.len() as u64,
+            });
+            zstd_bytes = Some(compressed);
+        }
+
+        Ok(SnapshotBlobUploadPayload {
+            raw_bytes,
+            zstd_bytes,
+            offered_encodings,
+        })
+    }
+
+    fn payload_for_selected_encoding<'a>(
+        payload: &'a SnapshotBlobUploadPayload,
+        selected_encoding: Option<&str>,
+    ) -> Result<&'a [u8]> {
+        match selected_encoding {
+            None => Ok(&payload.raw_bytes),
+            Some(SNAPSHOT_BLOB_ENCODING_ZSTD) => payload
+                .zstd_bytes
+                .as_deref()
+                .context("server selected zstd upload without a prepared zstd payload"),
+            Some(other) => {
+                anyhow::bail!("Blob stream server selected unsupported upload encoding '{other}'")
+            }
+        }
+    }
+
+    /// Download a file from the binhost or API to a local destination.
+    pub async fn download_file(&self, url: &str, destination: &Path) -> Result<()> {
+        self.download_file_with_progress(url, destination, |_received, _total, _stalled| {})
+            .await
+    }
+
+    /// Download a file from the binhost or API to a local destination while reporting progress.
+    pub async fn download_file_with_progress<F>(
+        &self,
+        url: &str,
+        destination: &Path,
+        mut on_progress: F,
+    ) -> Result<()>
+    where
+        F: FnMut(u64, Option<u64>, bool),
+    {
+        use tokio::io::AsyncWriteExt;
+
+        let resp = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("Failed to download {url}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Server returned {status} for {url}: {body}");
+        }
+
+        let total_bytes = resp.content_length();
+        debug!(
+            url,
+            destination = %destination.display(),
+            total_bytes,
+            "Starting file download"
+        );
+
+        let mut file = tokio::fs::File::create(destination)
+            .await
+            .with_context(|| format!("Failed to create {}", destination.display()))?;
+        let mut stream = resp.bytes_stream();
+        let mut received_bytes = 0u64;
+        let mut stalled = false;
+        loop {
+            let next_chunk = stream.next();
+            tokio::pin!(next_chunk);
+
+            let chunk = loop {
+                match tokio::time::timeout(FILE_DOWNLOAD_STALL_THRESHOLD, &mut next_chunk).await {
+                    Ok(chunk) => break chunk,
+                    Err(_) => {
+                        if !stalled {
+                            warn!(
+                                url,
+                                destination = %destination.display(),
+                                received_bytes,
+                                total_bytes,
+                                "File download stalled waiting for the next chunk"
+                            );
+                            stalled = true;
+                        }
+                        on_progress(received_bytes, total_bytes, true)
+                    }
+                }
+            };
+
+            let Some(chunk) = chunk else {
+                break;
+            };
+
+            let chunk = chunk.with_context(|| format!("Failed while reading {url}"))?;
+            if stalled {
+                debug!(
+                    url,
+                    destination = %destination.display(),
+                    received_bytes,
+                    total_bytes,
+                    "File download resumed after a stall"
+                );
+                stalled = false;
+            }
+            file.write_all(&chunk)
+                .await
+                .with_context(|| format!("Failed to write {}", destination.display()))?;
+            received_bytes += chunk.len() as u64;
+            on_progress(received_bytes, total_bytes, false);
+        }
+        file.flush()
+            .await
+            .with_context(|| format!("Failed to flush {}", destination.display()))?;
+        info!(
+            url,
+            destination = %destination.display(),
+            received_bytes,
+            total_bytes,
+            "Completed file download"
+        );
+        Ok(())
+    }
+
     /// Connect to the progress WebSocket and stream events to stdout.
     ///
     /// The connection is bidirectional:
@@ -100,6 +660,10 @@ impl RemergeClient {
         let (mut ws_write, mut ws_read) = ws.split();
 
         let mut final_result: Option<WorkorderResult> = None;
+        let workorder_id = Self::workorder_id_from_progress_url(ws_url);
+        let mut result_poll = tokio::time::interval(std::time::Duration::from_secs(1));
+        result_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        result_poll.tick().await;
 
         // Disable local terminal echo so we don't double-echo input.
         // The container's PTY already echoes back everything we send.
@@ -140,33 +704,48 @@ impl RemergeClient {
         });
 
         // Read build output from the WebSocket.
-        while let Some(msg) = ws_read.next().await {
-            let msg = msg.context("WebSocket error")?;
-            match msg {
-                // Binary frames carry raw PTY bytes — write directly to stdout.
-                tokio_tungstenite::tungstenite::Message::Binary(data) => {
-                    use std::io::Write;
-                    let stdout = std::io::stdout();
-                    let mut out = stdout.lock();
-                    let _ = out.write_all(&data);
-                    let _ = out.flush();
-                }
-                // Text frames carry structured JSON events.
-                tokio_tungstenite::tungstenite::Message::Text(text) => {
-                    if let Ok(progress) = serde_json::from_str::<BuildProgress>(&text) {
-                        Self::print_event(&progress.event);
-
-                        // If we get a Finished event, fetch the result and exit.
-                        if matches!(progress.event, BuildEvent::Finished { .. }) {
-                            final_result = self.fetch_result(progress.workorder_id).await.ok();
-                            break;
-                        }
-                    } else {
-                        debug!("Unrecognised WS message: {text}");
+        loop {
+            tokio::select! {
+                _ = result_poll.tick(), if workorder_id.is_some() => {
+                    if let Some(id) = workorder_id
+                        && let Ok(result) = self.fetch_result(id).await
+                    {
+                        final_result = Some(result);
+                        break;
                     }
                 }
-                tokio_tungstenite::tungstenite::Message::Close(_) => break,
-                _ => {}
+                maybe_msg = ws_read.next() => {
+                    let Some(msg) = maybe_msg else {
+                        break;
+                    };
+                    let msg = msg.context("WebSocket error")?;
+                    match msg {
+                        // Binary frames carry raw PTY bytes — write directly to stdout.
+                        tokio_tungstenite::tungstenite::Message::Binary(data) => {
+                            use std::io::Write;
+                            let stdout = std::io::stdout();
+                            let mut out = stdout.lock();
+                            let _ = out.write_all(&data);
+                            let _ = out.flush();
+                        }
+                        // Text frames carry structured JSON events.
+                        tokio_tungstenite::tungstenite::Message::Text(text) => {
+                            if let Ok(progress) = serde_json::from_str::<BuildProgress>(&text) {
+                                Self::print_event(&progress.event);
+
+                                // If we get a Finished event, fetch the result and exit.
+                                if matches!(progress.event, BuildEvent::Finished { .. }) {
+                                    final_result = self.fetch_result(progress.workorder_id).await.ok();
+                                    break;
+                                }
+                            } else {
+                                debug!("Unrecognised WS message: {text}");
+                            }
+                        }
+                        tokio_tungstenite::tungstenite::Message::Close(_) => break,
+                        _ => {}
+                    }
+                }
             }
         }
 
@@ -186,15 +765,19 @@ impl RemergeClient {
             // Extract workorder ID from the WS URL.
             // URL format: ws://host/api/v1/workorders/{id}/progress
             // The UUID is the second-to-last path segment.
-            let segments: Vec<&str> = ws_url.split('/').collect();
-            if let Some(id_str) = segments.iter().rev().nth(1)
-                && let Ok(id) = id_str.parse::<uuid::Uuid>()
-            {
+            if let Some(id) = workorder_id {
                 final_result = self.fetch_result(id).await.ok();
             }
         }
 
         final_result.context("Build finished but no result was received")
+    }
+
+    fn workorder_id_from_progress_url(
+        ws_url: &str,
+    ) -> Option<remerge_types::workorder::WorkorderId> {
+        let segments: Vec<&str> = ws_url.split('/').collect();
+        segments.iter().rev().nth(1)?.parse::<uuid::Uuid>().ok()
     }
 
     /// Print a build event to the terminal.
@@ -229,6 +812,105 @@ impl RemergeClient {
                 );
             }
         }
+    }
+
+    fn snapshot_blob_stream_url(&self) -> String {
+        if let Some(rest) = self.base_url.strip_prefix("https://") {
+            format!("wss://{rest}/api/v1/snapshots/blobs/stream")
+        } else if let Some(rest) = self.base_url.strip_prefix("http://") {
+            format!("ws://{rest}/api/v1/snapshots/blobs/stream")
+        } else {
+            format!("{}/api/v1/snapshots/blobs/stream", self.base_url)
+        }
+    }
+
+    async fn recv_blob_upload_control(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        digest: &str,
+    ) -> Result<SnapshotBlobServerControlMessage> {
+        use tokio_tungstenite::tungstenite::Message;
+
+        loop {
+            let message = ws
+                .next()
+                .await
+                .with_context(|| {
+                    format!("Blob stream closed unexpectedly while uploading {digest}")
+                })?
+                .with_context(|| format!("Blob stream read failed while uploading {digest}"))?;
+
+            match message {
+                Message::Text(text) => {
+                    return serde_json::from_str::<SnapshotBlobServerControlMessage>(&text)
+                        .with_context(|| {
+                            format!("Failed to parse blob upload control frame for {digest}")
+                        });
+                }
+                Message::Ping(_) | Message::Pong(_) => continue,
+                Message::Close(_) => {
+                    anyhow::bail!("Blob stream closed before completing upload for {digest}");
+                }
+                Message::Binary(_) => {
+                    anyhow::bail!(
+                        "Blob stream server sent an unexpected binary frame while uploading {digest}"
+                    );
+                }
+                Message::Frame(_) => continue,
+            }
+        }
+    }
+
+    async fn recv_blob_upload_control_with_timeout(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        digest: &str,
+        timeout: Duration,
+    ) -> Result<SnapshotBlobServerControlMessage> {
+        match tokio::time::timeout(timeout, Self::recv_blob_upload_control(ws, digest)).await {
+            Ok(result) => result,
+            Err(_) => anyhow::bail!(
+                "Timed out waiting for blob upload control frame for {digest} after {:?}",
+                timeout
+            ),
+        }
+    }
+
+    fn validate_blob_upload_envelope(
+        version: u8,
+        workorder_id: uuid::Uuid,
+        digest: &str,
+        response_digest: &str,
+        response_workorder_id: Option<uuid::Uuid>,
+    ) -> Result<()> {
+        if version != SNAPSHOT_BLOB_PROTOCOL_VERSION {
+            anyhow::bail!(
+                "Blob stream protocol version mismatch for {digest}: expected {}, got {version}",
+                SNAPSHOT_BLOB_PROTOCOL_VERSION
+            );
+        }
+        if response_digest != digest {
+            anyhow::bail!("Blob stream digest mismatch: expected {digest}, got {response_digest}");
+        }
+        if response_workorder_id != Some(workorder_id) {
+            anyhow::bail!(
+                "Blob stream workorder ID mismatch: expected {workorder_id}, got {:?}",
+                response_workorder_id
+            );
+        }
+        Ok(())
+    }
+
+    fn is_retryable_blob_stream_error(error: &anyhow::Error) -> bool {
+        let message = format!("{error:#}").to_ascii_lowercase();
+        message.contains("failed to connect to snapshot blob stream")
+            || message.contains("failed to send blob chunk")
+            || message.contains("blob stream read failed")
+            || message.contains("blob stream closed unexpectedly")
+            || message.contains("blob stream closed before completing upload")
+            || message.contains("timed out waiting for blob upload control frame")
     }
 
     /// Fetch the workorder result from the REST API.
@@ -299,5 +981,105 @@ impl Drop for EchoGuard {
                 libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, original);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RemergeClient, SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES, SnapshotBlobChunkPolicy};
+    use std::time::Duration;
+
+    #[test]
+    fn parses_workorder_id_from_progress_url() {
+        let id = uuid::Uuid::parse_str("23137eac-2455-45cf-a09f-cbdbd3a01fcc").unwrap();
+
+        assert_eq!(
+            RemergeClient::workorder_id_from_progress_url(
+                "ws://localhost/api/v1/workorders/23137eac-2455-45cf-a09f-cbdbd3a01fcc/progress"
+            ),
+            Some(id)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_progress_url_workorder_id() {
+        assert_eq!(
+            RemergeClient::workorder_id_from_progress_url(
+                "ws://localhost/api/v1/workorders/not-a-uuid/progress"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn snapshot_blob_chunk_policy_starts_at_default_chunk_size() {
+        let policy = SnapshotBlobChunkPolicy::new(SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES);
+        assert_eq!(
+            policy.current_chunk_size_bytes(),
+            SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES
+        );
+    }
+
+    #[test]
+    fn snapshot_blob_chunk_policy_shrinks_on_slow_ack_and_reconnect() {
+        let mut policy = SnapshotBlobChunkPolicy::new(SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES);
+
+        policy.on_ack(Duration::from_millis(250));
+        assert_eq!(
+            policy.current_chunk_size_bytes(),
+            SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES / 2
+        );
+
+        policy.on_reconnect();
+        assert_eq!(
+            policy.current_chunk_size_bytes(),
+            SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES / 4
+        );
+    }
+
+    #[test]
+    fn snapshot_blob_chunk_policy_grows_only_after_healthy_ack_streak() {
+        let mut policy = SnapshotBlobChunkPolicy::new(SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES);
+        policy.on_ack(Duration::from_millis(250));
+        assert_eq!(
+            policy.current_chunk_size_bytes(),
+            SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES / 2
+        );
+
+        policy.on_ack(Duration::from_millis(10));
+        assert_eq!(
+            policy.current_chunk_size_bytes(),
+            SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES / 2
+        );
+
+        policy.on_ack(Duration::from_millis(10));
+        assert_eq!(
+            policy.current_chunk_size_bytes(),
+            SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_upload_payload_offers_zstd_when_worthwhile() {
+        let payload = vec![b'a'; 256 * 1024];
+
+        let prepared = RemergeClient::prepare_upload_payload(&payload)
+            .await
+            .expect("prepare upload payload");
+
+        assert_eq!(prepared.offered_encodings.len(), 1);
+        assert_eq!(prepared.offered_encodings[0].encoding, "zstd");
+        assert!(prepared.zstd_bytes.is_some());
+    }
+
+    #[tokio::test]
+    async fn prepare_upload_payload_keeps_small_payloads_raw() {
+        let prepared = RemergeClient::prepare_upload_payload(b"small-payload")
+            .await
+            .expect("prepare upload payload");
+
+        assert!(prepared.offered_encodings.is_empty());
+        assert!(prepared.zstd_bytes.is_none());
+        assert_eq!(prepared.raw_bytes, b"small-payload");
     }
 }

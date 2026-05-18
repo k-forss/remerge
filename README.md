@@ -12,9 +12,9 @@ binary packages locally via portage's native binhost support.
 
 ## Project status and roadmap
 
-Current project status, release-readiness gates, and implementation-ordered
-future work are tracked in [`ROADMAP.md`](ROADMAP.md).  Historical integration
-test planning has been archived under [`docs/archive/`](docs/archive/).
+Current project status and active planning are tracked in the project
+roadmap in [`ROADMAP.md`](ROADMAP.md). Historical integration test planning has
+been archived under [`docs/archive/`](docs/archive/).
 Portage compatibility requirements and current compliance gaps are tracked in
 [`docs/portage-compatibility.md`](docs/portage-compatibility.md).
 Production deployment, backup, rollback, and monitoring procedures live in
@@ -33,6 +33,8 @@ Production deployment, backup, rollback, and monitoring procedures live in
 │  - make.conf     │                           │  │ spins up workers │ │
 │  - package.use   │                           │  └────────┬────────┘ │
 │  - profile       │                           │           │          │
+│  - local repos   │                           │  ┌────────▼────────┐ │
+│  - distfiles     │                           │  │ staged runtime  │ │
 │  - gcc version   │                           │  ┌────────▼────────┐ │
 │  - ...           │                           │  │ remerge-worker  │ │
 │                  │                           │  │ (Docker ctnr)   │ │
@@ -51,18 +53,32 @@ Production deployment, backup, rollback, and monitoring procedures live in
 
 1. **User runs `remerge <emerge-args>`** on their Gentoo machine.
 2. The CLI reads `/etc/portage/make.conf`, `package.use`, `package.accept_keywords`,
-   active profile, GCC version, glibc version, etc.
+   active profile, GCC version, glibc version, and snapshots non-Gentoo local
+   repo working trees plus Manifest-backed distfiles.
 3. A **workorder** is assembled and sent to the remerge server via HTTP.
-4. The server **provisions a worker container** matching the requester's toolchain
-   (arch, profile, GCC version). Images are built on-demand and cached.
-5. Inside the worker, the requester's portage config is applied and
-   `emerge --buildpkg` builds the requested packages.
+4. The server stages the workorder into a per-build runtime directory under
+   its state directory, stores snapshot file payloads in a shared
+   content-addressed blob store, and records blob references plus repo tree
+   manifests in the staged workorder metadata, then **provisions a worker
+   container** matching the requester's toolchain (arch, profile, GCC
+   version). Images are built on-demand and cached.
+5. Inside the worker, the staged repo snapshots and distfiles are restored,
+   then the requester's portage config is applied and `emerge --buildpkg`
+   builds the requested packages.
 6. **Build progress** is streamed back to the CLI over WebSocket in real-time.
 7. Once complete, the binary packages are available in the server's HTTP-served
    binpkg repository.
-8. The CLI runs `emerge --getbinpkg --usepkg <original-args>` locally, which
-   fetches the pre-built packages from the server and installs them — only
-   building from source for packages that couldn't be pre-built.
+8. The CLI syncs the built binpkgs into the local `PKGDIR`, then runs
+   `emerge --getbinpkg --usepkg <original-args>` locally against that cache.
+   This lets later plain local `emerge --usepkg` runs reuse work already done
+   by remerge, while still falling back to the server binhost if needed.
+
+Snapshot transport compression:
+
+- canonical blob identity always remains the raw SHA256 digest of the uncompressed bytes
+- the blob upload stream negotiates optional zstd transport when the client can prove a worthwhile encoded size up front
+- the server may store zstd sidecars for blobs and tree manifests when compression is worthwhile
+- blob downloads use standard HTTP `Content-Encoding: zstd` when a stored variant exists and the client requests it
 
 ## Installation
 
@@ -119,10 +135,15 @@ alternative installation methods, and signature verification details.
 ### Build from source
 
 ```bash
-cargo build --release
+cargo build --release -p remerge
+cargo build --release -p remerge-server
+cargo build --release -p remerge-worker
 ```
 
-This produces three binaries in `target/release/`:
+The repository root is a workspace whose top-level package is the integration
+test harness, so the build needs explicit `-p` package selection.
+
+These commands produce three binaries in `target/release/`:
 - `remerge` — install on Gentoo hosts
 - `remerge-server` — run on your build server
 - `remerge-worker` — bundled into Docker images automatically
@@ -289,8 +310,9 @@ Package policy notes:
    Set `OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` to
    export traces to an OTLP collector.
 - `/metrics` now exposes worker image build duration, worker container startup
-   latency, cleanup success/failure counters, and best-effort per-package build
-   timing aggregates.
+   latency, cleanup success/failure plus reclaimed-byte counters, snapshot
+   missing-blob/upload/download/staging counters, and best-effort per-package
+   build timing aggregates.
 
 ## Authentication
 

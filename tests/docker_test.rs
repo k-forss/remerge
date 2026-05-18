@@ -365,12 +365,28 @@ mod docker_tests {
             .expect("build image for start_worker test");
 
         // Start a worker container.
-        let workorder_json =
-            serde_json::to_string(&common::fixtures::minimal_portage_config()).expect("serialize");
+        let runtime_dir = tempfile::TempDir::new().expect("temp runtime dir");
+        let workorder = remerge_types::workorder::Workorder {
+            id: uuid::Uuid::new_v4(),
+            client_id: uuid::Uuid::new_v4(),
+            role: remerge_types::client::ClientRole::Main,
+            atoms: vec!["app-misc/hello".into()],
+            emerge_args: vec!["app-misc/hello".into()],
+            portage_config: common::fixtures::minimal_portage_config(),
+            system_id: common::fixtures::minimal_system_identity(),
+            trace_context: None,
+            status: remerge_types::workorder::WorkorderStatus::Pending,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let staged =
+            remerge_server::runtime::stage_workorder_runtime(runtime_dir.path(), &workorder)
+                .await
+                .expect("stage workorder runtime");
         let container_name = format!("remerge-test-{}", uuid::Uuid::new_v4());
 
         let container_id = manager
-            .start_worker(&container_name, &tag, &workorder_json, None, &config)
+            .start_worker(&container_name, &tag, &staged.runtime_dir, None, &config)
             .await
             .expect("start_worker should succeed with built image");
 
@@ -382,16 +398,18 @@ mod docker_tests {
             .await
             .expect("inspect container");
 
-        // Verify REMERGE_WORKORDER env var is set.
+        // Verify REMERGE_WORKORDER_PATH env var is set.
         let env_vars = inspect
             .config
             .as_ref()
             .and_then(|c| c.env.as_ref())
             .expect("container should have env vars");
-        let has_workorder_env = env_vars.iter().any(|e| e.starts_with("REMERGE_WORKORDER="));
+        let has_workorder_env = env_vars
+            .iter()
+            .any(|e| e.starts_with("REMERGE_WORKORDER_PATH="));
         assert!(
             has_workorder_env,
-            "container should have REMERGE_WORKORDER env var, got: {env_vars:?}"
+            "container should have REMERGE_WORKORDER_PATH env var, got: {env_vars:?}"
         );
 
         // Verify binpkg mount exists.

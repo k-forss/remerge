@@ -56,6 +56,28 @@ pub struct Metrics {
     pub cleanup_success_total: AtomicU64,
     /// Failed runtime cleanup operations.
     pub cleanup_failure_total: AtomicU64,
+    /// Cumulative bytes reclaimed by snapshot cleanup.
+    pub cleanup_reclaimed_bytes_total: AtomicU64,
+    /// Total snapshot missing-blob discovery requests.
+    pub snapshot_missing_blob_queries_total: AtomicU64,
+    /// Total digests examined by snapshot missing-blob discovery.
+    pub snapshot_missing_blob_digests_total: AtomicU64,
+    /// Total digests reported missing by snapshot missing-blob discovery.
+    pub snapshot_missing_blob_digests_missing_total: AtomicU64,
+    /// Total snapshot blob upload requests accepted by the server.
+    pub snapshot_blob_uploads_total: AtomicU64,
+    /// Upload requests that reused an already stored canonical blob.
+    pub snapshot_blob_upload_dedup_hits_total: AtomicU64,
+    /// Cumulative raw snapshot blob bytes accepted by the server.
+    pub snapshot_blob_upload_bytes_total: AtomicU64,
+    /// Total snapshot blob download responses served.
+    pub snapshot_blob_downloads_total: AtomicU64,
+    /// Cumulative snapshot blob bytes served to clients.
+    pub snapshot_blob_download_bytes_total: AtomicU64,
+    /// Snapshot runtime staging passes completed successfully.
+    pub snapshot_runtime_stages_total: AtomicU64,
+    /// Cumulative bytes materialized while staging snapshot runtimes.
+    pub snapshot_runtime_stage_bytes_total: AtomicU64,
     /// Best-effort package build completions detected from emerge output.
     pub package_builds_total: AtomicU64,
     /// Cumulative best-effort package build duration in seconds.
@@ -87,6 +109,17 @@ impl Metrics {
             worker_container_startup_duration_secs_total: AtomicU64::new(0),
             cleanup_success_total: AtomicU64::new(0),
             cleanup_failure_total: AtomicU64::new(0),
+            cleanup_reclaimed_bytes_total: AtomicU64::new(0),
+            snapshot_missing_blob_queries_total: AtomicU64::new(0),
+            snapshot_missing_blob_digests_total: AtomicU64::new(0),
+            snapshot_missing_blob_digests_missing_total: AtomicU64::new(0),
+            snapshot_blob_uploads_total: AtomicU64::new(0),
+            snapshot_blob_upload_dedup_hits_total: AtomicU64::new(0),
+            snapshot_blob_upload_bytes_total: AtomicU64::new(0),
+            snapshot_blob_downloads_total: AtomicU64::new(0),
+            snapshot_blob_download_bytes_total: AtomicU64::new(0),
+            snapshot_runtime_stages_total: AtomicU64::new(0),
+            snapshot_runtime_stage_bytes_total: AtomicU64::new(0),
             package_builds_total: AtomicU64::new(0),
             package_build_duration_secs_total: AtomicU64::new(0),
             package_builds_by_atom: Mutex::new(BTreeMap::new()),
@@ -114,6 +147,45 @@ impl Metrics {
             &self.cleanup_failure_total
         };
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_cleanup_reclaimed_bytes(&self, reclaimed_bytes: u64) {
+        self.cleanup_reclaimed_bytes_total
+            .fetch_add(reclaimed_bytes, Ordering::Relaxed);
+    }
+
+    pub fn record_snapshot_missing_blob_query(&self, digest_count: usize, missing_count: usize) {
+        self.snapshot_missing_blob_queries_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.snapshot_missing_blob_digests_total
+            .fetch_add(digest_count as u64, Ordering::Relaxed);
+        self.snapshot_missing_blob_digests_missing_total
+            .fetch_add(missing_count as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_snapshot_blob_upload(&self, raw_size_bytes: u64, uploaded: bool) {
+        self.snapshot_blob_uploads_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.snapshot_blob_upload_bytes_total
+            .fetch_add(raw_size_bytes, Ordering::Relaxed);
+        if !uploaded {
+            self.snapshot_blob_upload_dedup_hits_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_snapshot_blob_download(&self, served_bytes: u64) {
+        self.snapshot_blob_downloads_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.snapshot_blob_download_bytes_total
+            .fetch_add(served_bytes, Ordering::Relaxed);
+    }
+
+    pub fn record_snapshot_runtime_stage(&self, materialized_bytes: u64) {
+        self.snapshot_runtime_stages_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.snapshot_runtime_stage_bytes_total
+            .fetch_add(materialized_bytes, Ordering::Relaxed);
     }
 
     pub fn record_package_build(&self, atom: &str, duration_secs: u64) {
@@ -222,6 +294,78 @@ impl Metrics {
         );
         write_counter(
             &mut out,
+            "remerge_cleanup_reclaimed_bytes_total",
+            "Total snapshot cache bytes reclaimed by cleanup.",
+            self.cleanup_reclaimed_bytes_total.load(Ordering::Relaxed),
+        );
+        write_counter(
+            &mut out,
+            "remerge_snapshot_missing_blob_queries_total",
+            "Total snapshot missing-blob discovery requests.",
+            self.snapshot_missing_blob_queries_total
+                .load(Ordering::Relaxed),
+        );
+        write_counter(
+            &mut out,
+            "remerge_snapshot_missing_blob_digests_total",
+            "Total digests examined by snapshot missing-blob discovery.",
+            self.snapshot_missing_blob_digests_total
+                .load(Ordering::Relaxed),
+        );
+        write_counter(
+            &mut out,
+            "remerge_snapshot_missing_blob_digests_missing_total",
+            "Total digests reported missing by snapshot missing-blob discovery.",
+            self.snapshot_missing_blob_digests_missing_total
+                .load(Ordering::Relaxed),
+        );
+        write_counter(
+            &mut out,
+            "remerge_snapshot_blob_uploads_total",
+            "Total snapshot blob upload requests accepted by the server.",
+            self.snapshot_blob_uploads_total.load(Ordering::Relaxed),
+        );
+        write_counter(
+            &mut out,
+            "remerge_snapshot_blob_upload_dedup_hits_total",
+            "Snapshot blob upload requests that reused an already stored canonical blob.",
+            self.snapshot_blob_upload_dedup_hits_total
+                .load(Ordering::Relaxed),
+        );
+        write_counter(
+            &mut out,
+            "remerge_snapshot_blob_upload_bytes_total",
+            "Total raw snapshot blob bytes accepted by the server.",
+            self.snapshot_blob_upload_bytes_total.load(Ordering::Relaxed),
+        );
+        write_counter(
+            &mut out,
+            "remerge_snapshot_blob_downloads_total",
+            "Total snapshot blob download responses served.",
+            self.snapshot_blob_downloads_total.load(Ordering::Relaxed),
+        );
+        write_counter(
+            &mut out,
+            "remerge_snapshot_blob_download_bytes_total",
+            "Total snapshot blob bytes served to clients.",
+            self.snapshot_blob_download_bytes_total
+                .load(Ordering::Relaxed),
+        );
+        write_counter(
+            &mut out,
+            "remerge_snapshot_runtime_stages_total",
+            "Total snapshot runtime staging passes completed successfully.",
+            self.snapshot_runtime_stages_total.load(Ordering::Relaxed),
+        );
+        write_counter(
+            &mut out,
+            "remerge_snapshot_runtime_stage_bytes_total",
+            "Total bytes materialized while staging snapshot runtimes.",
+            self.snapshot_runtime_stage_bytes_total
+                .load(Ordering::Relaxed),
+        );
+        write_counter(
+            &mut out,
             "remerge_package_builds_total",
             "Total best-effort package build completions detected from emerge output.",
             self.package_builds_total.load(Ordering::Relaxed),
@@ -289,9 +433,11 @@ mod tests {
         let metrics = Metrics::new();
         metrics.record_package_build("dev-libs/openssl", 12);
         metrics.record_cleanup(true);
+        metrics.record_snapshot_blob_upload(42, false);
 
         let body = metrics.to_prometheus();
         assert!(body.contains("remerge_package_builds_by_atom_total{atom=\"dev-libs/openssl\"} 1"));
         assert!(body.contains("remerge_cleanup_success_total 1"));
+        assert!(body.contains("remerge_snapshot_blob_upload_dedup_hits_total 1"));
     }
 }

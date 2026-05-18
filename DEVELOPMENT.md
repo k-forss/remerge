@@ -5,8 +5,8 @@ installation and usage instructions, see [README.md](README.md).
 For operator deployment, backup, rollback, and monitoring guidance, see
 [docs/operations.md](docs/operations.md).
 For contribution guidelines, see [CONTRIBUTING.md](CONTRIBUTING.md).
-For current project status, release-readiness gates, and implementation-ordered
-future work, see [ROADMAP.md](ROADMAP.md).
+For current project status, release-readiness context, and active planning,
+see [README.md](README.md) plus the referenced project documentation.
 
 ## Table of contents
 

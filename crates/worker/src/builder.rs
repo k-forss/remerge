@@ -29,6 +29,7 @@ fn build_emerge_args(workorder: &Workorder) -> Vec<String> {
         "--buildpkg".to_string(),
         "--usepkg".to_string(),
         "--verbose".to_string(),
+        "--ask=n".to_string(),
         "--color=y".to_string(),
         "--keep-going".to_string(),
         "--newuse".to_string(),
@@ -131,7 +132,7 @@ async fn sync_portage() -> Result<()> {
     info!("Syncing all configured repos");
 
     let status = Command::new("emerge")
-        .args(["--sync", "--quiet"])
+        .args(["--sync", "--quiet", "--ask=n"])
         .status()
         .await
         .context("Failed to sync portage")?;
@@ -257,6 +258,9 @@ fn is_repo_populated(location: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    static REMERGE_SKIP_SYNC_ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
     use remerge_types::client::ClientRole;
     use remerge_types::workorder::Workorder;
     use serde_json::json;
@@ -349,6 +353,7 @@ mod tests {
             "--usepkg".to_string(),
             "--verbose".to_string(),
         ]));
+        assert!(args.contains(&"--ask=n".to_string()));
         assert!(args.contains(&"--emptytree".to_string()));
         assert!(args.contains(&"--jobs=4".to_string()));
         assert!(!args.contains(&"--pretend".to_string()));
@@ -356,7 +361,34 @@ mod tests {
     }
 
     #[test]
+    fn worker_explicit_ask_overrides_default_noninteractive_mode() {
+        let workorder = minimal_workorder(
+            vec!["--ask".into(), "app-misc/hello".into()],
+            vec!["app-misc/hello".into()],
+        );
+        let (_program, args) = build_emerge_invocation(&workorder, "emerge");
+
+        let default_ask = args
+            .iter()
+            .position(|arg| arg == "--ask=n")
+            .expect("default noninteractive arg should be present");
+        let explicit_ask = args
+            .iter()
+            .position(|arg| arg == "--ask")
+            .expect("explicit user --ask should be preserved");
+
+        assert!(
+            default_ask < explicit_ask,
+            "explicit user --ask should remain later in argv so it can override the default"
+        );
+    }
+
+    #[test]
     fn pc_012_sync_policy_contract() {
+        let _lock = REMERGE_SKIP_SYNC_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         unsafe { std::env::remove_var("REMERGE_SKIP_SYNC") };
         assert!(
             !should_skip_main_sync(),

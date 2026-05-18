@@ -53,6 +53,11 @@ worker_network_mode = "bridge"
 # This is bind-mounted from the host's binpkg_dir.
 worker_binpkg_mount = "/var/cache/binpkgs"
 
+# Path to the host's repo tree mirror.
+# When set, this directory is bind-mounted read-only into workers and the
+# per-build sync step is skipped.
+# repos_dir = "/var/db/repos"
+
 # ── Build tuning ─────────────────────────────────────────────────
 # Number of parallel emerge jobs (-j flag).
 # Omit or set to 0 to auto-detect from CPU count.
@@ -77,15 +82,31 @@ retention_hours = 24
 # Set to 0 to disable (rely only on retention_hours).
 max_retained_workorders = 1000
 
+# Snapshot retention grace window in hours.
+# Unreferenced snapshot data older than this becomes eligible for floor-aware
+# cleanup.
+snapshot_cache_grace_period_hours = 168
+
+# Snapshot hard-delete eligibility in hours.
+# Data older than this is reclaimed first when cleanup is needed, but cleanup
+# still stops once retained snapshot data is at or below the retained-size
+# floor.
+snapshot_cache_hard_delete_hours = 720
+
+# Minimum retained snapshot bytes.
+# Cleanup of unreferenced snapshot blobs/trees stops once retained snapshot
+# data is back at or below this floor.
+snapshot_min_retained_bytes = 10737418240
+
 # ── Observability ────────────────────────────────────────────────
 # Enable JSON-formatted structured log output.
 # Useful for log aggregation pipelines (ELK, Loki, etc.).
-# log_json = false
+log_json = false
 
 # Disk usage warning threshold for the binpkg directory, in bytes.
 # A warning log + metric is emitted when exceeded.  Set to 0 to disable.
 # Default: 10 GiB (10737418240).
-# binpkg_disk_warn_bytes = 10737418240
+binpkg_disk_warn_bytes = 10737418240
 
 # ── Worker binary ───────────────────────────────────────────────
 # Path to the remerge-worker binary on the host.
@@ -106,7 +127,7 @@ max_retained_workorders = 1000
 # Force cached worker base layers to skip the initial sync step.
 # Safe only when worker_base_image or the chosen base already has a usable
 # Portage tree.
-# skip_worker_sync = false
+skip_worker_sync = false
 
 # ── Native TLS (optional) ───────────────────────────────────────
 # For direct HTTPS without a reverse proxy.

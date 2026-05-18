@@ -1,5 +1,6 @@
 pub mod api;
 pub mod auth;
+pub mod blob_store;
 pub mod config;
 pub mod docker;
 pub mod metrics;
@@ -7,5 +8,7 @@ pub mod persistence;
 pub mod queue;
 pub mod registry;
 pub mod repo;
+pub mod runtime;
 pub mod signing;
 pub mod state;
+pub mod tree_store;
