@@ -354,7 +354,7 @@ async fn persist_blob_metadata(
         .await
         .with_context(|| format!("Failed to create {}", parent.display()))?;
     let bytes = serde_json::to_vec(metadata)?;
-    write_bytes_atomically(
+    write_bytes_with_atomic_replace(
         parent,
         &target,
         &format!("{}.meta.json", file_name(digest)?),
@@ -364,7 +364,7 @@ async fn persist_blob_metadata(
     .map(|_| ())
 }
 
-async fn write_bytes_atomically(
+pub(crate) async fn write_bytes_atomically(
     parent: &Path,
     target: &Path,
     stem: &str,
@@ -375,22 +375,106 @@ async fn write_bytes_atomically(
         .await
         .with_context(|| format!("Failed to write {}", temp.display()))?;
 
+    let temp_cleanup = CleanupTempFile::new(temp.clone());
+    let uploaded = link_or_copy_into_place(&temp, target).await?;
+    temp_cleanup.disarm().await;
+    Ok(uploaded)
+}
+
+pub(crate) async fn write_bytes_with_atomic_replace(
+    parent: &Path,
+    target: &Path,
+    stem: &str,
+    bytes: &[u8],
+) -> Result<()> {
+    let temp = parent.join(format!("{stem}.tmp-{}", uuid::Uuid::new_v4()));
+    tokio::fs::write(&temp, bytes)
+        .await
+        .with_context(|| format!("Failed to write {}", temp.display()))?;
+
     match tokio::fs::rename(&temp, target).await {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let _ = tokio::fs::remove_file(&temp).await;
-            Ok(false)
-        }
+        Ok(()) => Ok(()),
         Err(error) => {
             let _ = tokio::fs::remove_file(&temp).await;
             Err(error).with_context(|| {
-                format!(
-                    "Failed to move {} into {}",
-                    temp.display(),
-                    target.display()
-                )
+                format!("Failed to move {} into {}", temp.display(), target.display())
             })
         }
+    }
+}
+
+async fn link_or_copy_into_place(source: &Path, target: &Path) -> Result<bool> {
+    match tokio::fs::hard_link(source, target).await {
+        Ok(()) => return Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EXDEV | libc::EMLINK | libc::EPERM | libc::EOPNOTSUPP)
+            ) => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to link {} into {}",
+                    source.display(),
+                    target.display()
+                )
+            });
+        }
+    }
+
+    let mut file = match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)
+        .await
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to create {}", target.display()));
+        }
+    };
+
+    let bytes = tokio::fs::read(source)
+        .await
+        .with_context(|| format!("Failed to read {}", source.display()))?;
+    use tokio::io::AsyncWriteExt;
+    file.write_all(&bytes)
+        .await
+        .with_context(|| format!("Failed to write {}", target.display()))?;
+    file.flush()
+        .await
+        .with_context(|| format!("Failed to flush {}", target.display()))?;
+    Ok(true)
+}
+
+struct CleanupTempFile {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl CleanupTempFile {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    async fn disarm(mut self) {
+        if self.armed {
+            let _ = tokio::fs::remove_file(&self.path).await;
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for CleanupTempFile {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        let path = self.path.clone();
+        let _ = std::fs::remove_file(path);
     }
 }
 

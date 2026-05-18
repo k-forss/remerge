@@ -7,6 +7,8 @@ use remerge_types::compression;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::blob_store::{write_bytes_atomically, write_bytes_with_atomic_replace};
+
 pub const TREES_SUBDIR: &str = "trees";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,14 +63,10 @@ pub async fn store_tree(
     tokio::fs::create_dir_all(parent)
         .await
         .with_context(|| format!("Failed to create {}", parent.display()))?;
-    tokio::fs::write(&path, bytes)
-        .await
-        .with_context(|| format!("Failed to write {}", path.display()))?;
+    let file_name = format!("{digest}.json");
+    write_bytes_atomically(parent, &path, &file_name, &bytes).await?;
     ensure_tree_metadata(state_dir, &digest, raw_size_bytes).await?;
-    let manifest_bytes = tokio::fs::read(&path)
-        .await
-        .with_context(|| format!("Failed to read {}", path.display()))?;
-    maybe_store_zstd_variant(state_dir, &digest, &manifest_bytes).await?;
+    maybe_store_zstd_variant(state_dir, &digest, &bytes).await?;
     touch_tree(state_dir, &digest, Utc::now()).await?;
 
     Ok(StoredTree { digest, path })
@@ -205,9 +203,10 @@ async fn persist_tree_metadata(
     tokio::fs::create_dir_all(parent)
         .await
         .with_context(|| format!("Failed to create {}", parent.display()))?;
-    tokio::fs::write(&path, serde_json::to_vec(metadata)?)
+    let bytes = serde_json::to_vec(metadata)?;
+    write_bytes_with_atomic_replace(parent, &path, &format!("{digest}.meta.json"), &bytes)
         .await
-        .with_context(|| format!("Failed to write {}", path.display()))
+        .map(|_| ())
 }
 
 async fn maybe_store_zstd_variant(state_dir: &Path, digest: &str, bytes: &[u8]) -> Result<()> {
