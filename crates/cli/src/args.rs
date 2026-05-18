@@ -120,7 +120,7 @@ impl Cli {
         let raw_atoms = self.extract_atoms();
         if raw_atoms.is_empty() {
             info!("No package atoms detected — falling through to plain emerge");
-            return self.run_emerge_locally(&self.emerge_args).await;
+            return self.run_emerge_locally(&self.emerge_args, None).await;
         }
 
         // 1a. Expand set references (@world, @system) into individual atoms.
@@ -271,24 +271,42 @@ impl Cli {
 
         // 6. Run emerge locally with --getbinpkg.
         println!("\nRunning emerge locally with binary packages…\n");
-        let mut local_args = vec!["--getbinpkg".to_string(), "--usepkg".to_string()];
-        local_args.extend(self.emerge_args.clone());
-        self.run_emerge_locally(&local_args).await
+        let local_args = Self::build_local_emerge_args(&self.emerge_args);
+        self.run_emerge_locally(&local_args, Some(&result.binhost_uri))
+            .await
     }
 
     fn extract_atoms(&self) -> Vec<String> {
         extract_package_atoms(&self.emerge_args)
     }
 
+    fn build_local_emerge_args(emerge_args: &[String]) -> Vec<String> {
+        let mut local_args = vec!["--getbinpkg".to_string(), "--usepkg".to_string()];
+        local_args.extend(emerge_args.iter().cloned());
+        local_args
+    }
+
+    fn portage_binhost_env(binhost_uri: Option<&str>) -> Option<String> {
+        let uri = binhost_uri?.trim();
+        if uri.is_empty() {
+            None
+        } else {
+            Some(uri.to_string())
+        }
+    }
+
     /// Run emerge as a child process with the given arguments.
-    async fn run_emerge_locally(&self, args: &[String]) -> Result<()> {
+    async fn run_emerge_locally(&self, args: &[String], binhost_uri: Option<&str>) -> Result<()> {
         use tokio::process::Command;
 
-        let status = Command::new("emerge")
-            .args(args)
-            .status()
-            .await
-            .context("Failed to execute emerge")?;
+        let mut command = Command::new("emerge");
+        command.args(args);
+
+        if let Some(portage_binhost) = Self::portage_binhost_env(binhost_uri) {
+            command.env("PORTAGE_BINHOST", portage_binhost);
+        }
+
+        let status = command.status().await.context("Failed to execute emerge")?;
 
         if !status.success() {
             anyhow::bail!("emerge exited with status {}", status);
@@ -299,7 +317,7 @@ impl Cli {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_package_atoms;
+    use super::{Cli, extract_package_atoms};
 
     #[test]
     fn extract_package_atoms_preserves_sets_and_versioned_atoms() {
@@ -330,5 +348,26 @@ mod tests {
         ];
 
         assert!(extract_package_atoms(&args).is_empty());
+    }
+
+    #[test]
+    fn pc_010_local_install_binhost_handoff_contract() {
+        let args = vec!["dev-libs/openssl".to_string(), "--ask".to_string()];
+        let local_args = Cli::build_local_emerge_args(&args);
+
+        assert_eq!(
+            local_args,
+            vec![
+                "--getbinpkg".to_string(),
+                "--usepkg".to_string(),
+                "dev-libs/openssl".to_string(),
+                "--ask".to_string(),
+            ]
+        );
+        assert_eq!(
+            Cli::portage_binhost_env(Some("https://binhost.example.invalid/binpkgs")),
+            Some("https://binhost.example.invalid/binpkgs".to_string())
+        );
+        assert_eq!(Cli::portage_binhost_env(Some("   ")), None);
     }
 }

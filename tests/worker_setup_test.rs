@@ -1125,3 +1125,136 @@ async fn apply_config_orchestration() {
         "patches directory structure should exist"
     );
 }
+
+/// PC-004: resolved USE and USE_EXPAND are serialized without duplication.
+#[tokio::test]
+async fn pc_004_use_and_use_expand_contract() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    let mut config = common::fixtures::minimal_portage_config();
+    config.make_conf.use_flags = vec!["wayland".into(), "dbus".into()];
+    config.make_conf.use_flags_resolved = true;
+    config
+        .make_conf
+        .use_expand
+        .insert("VIDEO_CARDS".into(), vec!["intel".into()]);
+    config
+        .make_conf
+        .use_expand
+        .insert("INPUT_DEVICES".into(), vec!["libinput".into()]);
+
+    portage_setup::write_make_conf_inner(&base, &config, "x86_64-pc-linux-gnu", None, None)
+        .await
+        .expect("write_make_conf_inner");
+
+    let content = std::fs::read_to_string(base.join("make.conf")).unwrap();
+    let use_line = content
+        .lines()
+        .find(|line| line.starts_with("USE="))
+        .expect("USE line");
+
+    assert!(use_line.contains("USE=\"-* wayland dbus\""));
+    assert!(!use_line.contains("video_cards_intel"));
+    assert!(!use_line.contains("input_devices_libinput"));
+    assert!(content.contains("VIDEO_CARDS=\"intel\""));
+    assert!(content.contains("INPUT_DEVICES=\"libinput\""));
+}
+
+/// PC-007: repos.conf, active profile, and profile overlay survive worker replay.
+#[tokio::test]
+async fn pc_007_repo_and_profile_fidelity_contract() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().join("etc/portage");
+    std::fs::create_dir_all(&base).unwrap();
+
+    let repo_dir = tmp.path().join("repo");
+    let profile_dir = repo_dir.join("profiles/default/linux/amd64/23.0");
+    std::fs::create_dir_all(&profile_dir).unwrap();
+
+    let mut config = common::fixtures::minimal_portage_config();
+    config.profile = "default/linux/amd64/23.0".into();
+    config.repos_conf.insert(
+        "gentoo.conf".into(),
+        format!(
+            "[gentoo]\nlocation = {}\nsync-type = rsync\n",
+            repo_dir.display()
+        ),
+    );
+    config
+        .profile_overlay
+        .insert("use.mask".into(), "custom-flag\n".into());
+
+    portage_setup::apply_config_inner(&base, &config, "x86_64-pc-linux-gnu", None, None)
+        .await
+        .expect("apply_config_inner");
+
+    assert!(base.join("repos.conf/gentoo.conf").exists());
+    assert_eq!(
+        std::fs::read_to_string(base.join("profile/use.mask")).unwrap(),
+        "custom-flag\n"
+    );
+    assert!(base.join("make.profile").is_symlink());
+}
+
+/// PC-008: package.env, env files, and patches survive worker replay together.
+#[tokio::test]
+async fn pc_008_patch_and_env_fidelity_contract() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().join("etc/portage");
+    std::fs::create_dir_all(&base).unwrap();
+
+    let mut config = common::fixtures::minimal_portage_config();
+    config.package_env = vec![PackageEnvEntry {
+        atom: "dev-qt/qtwebengine".into(),
+        env_file: "no-lto.conf".into(),
+    }];
+    config
+        .env_files
+        .insert("no-lto.conf".into(), "CFLAGS=\"-fno-lto\"\n".into());
+    config.patches.insert(
+        "dev-libs/openssl/fix.patch".into(),
+        "--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n".into(),
+    );
+
+    portage_setup::apply_config_inner(&base, &config, "x86_64-pc-linux-gnu", None, None)
+        .await
+        .expect("apply_config_inner");
+
+    assert!(
+        std::fs::read_to_string(base.join("package.env/remerge"))
+            .unwrap()
+            .contains("dev-qt/qtwebengine no-lto.conf")
+    );
+    assert!(
+        std::fs::read_to_string(base.join("env/no-lto.conf"))
+            .unwrap()
+            .contains("-fno-lto")
+    );
+    assert!(base.join("patches/dev-libs/openssl/fix.patch").exists());
+}
+
+/// PC-011: worker binpkg output and signing defaults are explicit and present together.
+#[tokio::test]
+async fn pc_011_binpkg_and_signing_contract() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    let config = common::fixtures::minimal_portage_config();
+    portage_setup::write_make_conf_inner(
+        &base,
+        &config,
+        "x86_64-pc-linux-gnu",
+        Some("0xABCD1234"),
+        Some("/var/cache/remerge/gnupg"),
+    )
+    .await
+    .expect("write_make_conf_inner");
+
+    let content = std::fs::read_to_string(base.join("make.conf")).unwrap();
+    assert!(content.contains("PKGDIR=\"/var/cache/binpkgs\""));
+    assert!(content.contains("BINPKG_FORMAT=\"gpkg\""));
+    assert!(content.contains("BINPKG_GPG_SIGNING_KEY=\"0xABCD1234\""));
+    assert!(content.contains("BINPKG_GPG_SIGNING_GPG_HOME=\"/var/cache/remerge/gnupg\""));
+    assert!(content.contains("binpkg-signing"));
+}

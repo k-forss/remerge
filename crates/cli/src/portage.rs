@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use tracing::{debug, info, warn};
 
 use remerge_types::portage::*;
@@ -39,7 +39,8 @@ impl PortageReader {
     pub fn read_config(&self) -> Result<PortageConfig> {
         let make_conf = self.read_make_conf()?;
         let package_use = self.read_package_use()?;
-        let package_accept_keywords = self.read_package_accept_keywords()?;
+        let package_accept_keywords =
+            self.read_package_accept_keywords(&make_conf.accept_keywords)?;
         let package_license = self.read_package_license()?;
         let package_mask = self.read_package_mask()?;
         let package_unmask = self.read_package_unmask()?;
@@ -74,11 +75,7 @@ impl PortageReader {
     /// micro-architecture flag for the current CPU.  The original value is
     /// preserved in [`MakeConf::original_cflags`].
     fn read_make_conf(&self) -> Result<MakeConf> {
-        let path = self.root.join("etc/portage/make.conf");
-        let content = fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
-
-        let vars = Self::parse_make_conf_vars(&content);
+        let vars = self.read_make_conf_vars()?;
 
         let split_flags = |key: &str| -> Vec<String> {
             vars.get(key)
@@ -288,6 +285,32 @@ impl PortageReader {
         })
     }
 
+    fn read_make_conf_vars(&self) -> Result<BTreeMap<String, String>> {
+        let preferred = self.root.join("etc/portage/make.conf");
+        let legacy = self.root.join("etc/make.conf");
+        let mut vars = BTreeMap::new();
+        let mut loaded_any = false;
+
+        for path in [&preferred, &legacy] {
+            if path.is_file() {
+                let content = fs::read_to_string(path)
+                    .with_context(|| format!("Failed to read {}", path.display()))?;
+                vars.extend(Self::parse_make_conf_vars(&content));
+                loaded_any = true;
+            }
+        }
+
+        if !loaded_any {
+            return Err(anyhow!(
+                "Failed to read {} or {}",
+                preferred.display(),
+                legacy.display()
+            ));
+        }
+
+        Ok(vars)
+    }
+
     /// Read per-package USE flags from `/etc/portage/package.use`.
     fn read_package_use(&self) -> Result<Vec<PackageUseEntry>> {
         self.read_package_entries("package.use", |line| {
@@ -303,7 +326,11 @@ impl PortageReader {
     }
 
     /// Read package keywords from `/etc/portage/package.accept_keywords`.
-    fn read_package_accept_keywords(&self) -> Result<Vec<PackageKeywordEntry>> {
+    fn read_package_accept_keywords(
+        &self,
+        global_accept_keywords: &str,
+    ) -> Result<Vec<PackageKeywordEntry>> {
+        let default_keywords = Self::empty_accept_keywords_defaults(global_accept_keywords);
         self.read_package_entries("package.accept_keywords", |line| {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.is_empty() {
@@ -314,11 +341,19 @@ impl PortageReader {
                 keywords: if parts.len() > 1 {
                     parts[1..].iter().map(|s| s.to_string()).collect()
                 } else {
-                    // No explicit keyword = ~ARCH
-                    vec!["~*".to_string()]
+                    default_keywords.clone()
                 },
             })
         })
+    }
+
+    fn empty_accept_keywords_defaults(global_accept_keywords: &str) -> Vec<String> {
+        global_accept_keywords
+            .split_whitespace()
+            .filter(|keyword| !keyword.is_empty())
+            .filter(|keyword| !keyword.starts_with('~') && !keyword.starts_with('-'))
+            .map(|keyword| format!("~{keyword}"))
+            .collect()
     }
 
     /// Read package licenses from `/etc/portage/package.license`.
@@ -569,19 +604,7 @@ impl PortageReader {
         let mut entries = Vec::new();
 
         if path.is_dir() {
-            // Read all files in the directory (non-recursive, skip hidden).
-            if let Ok(dir) = fs::read_dir(&path) {
-                for entry in dir.flatten() {
-                    if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                        let fname = entry.file_name();
-                        if !fname.to_string_lossy().starts_with('.')
-                            && let Ok(content) = fs::read_to_string(entry.path())
-                        {
-                            Self::parse_lines(&content, &parser, &mut entries);
-                        }
-                    }
-                }
-            }
+            Self::read_package_entries_recursive(&path, &parser, &mut entries);
         } else if path.is_file() {
             let content = fs::read_to_string(&path).unwrap_or_default();
             Self::parse_lines(&content, &parser, &mut entries);
@@ -590,6 +613,37 @@ impl PortageReader {
         }
 
         Ok(entries)
+    }
+
+    fn read_package_entries_recursive<T>(
+        dir: &std::path::Path,
+        parser: &impl Fn(&str) -> Option<T>,
+        out: &mut Vec<T>,
+    ) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+
+        let mut paths: Vec<_> = entries.flatten().map(|entry| entry.path()).collect();
+        paths.sort();
+
+        for path in paths {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if name.starts_with('.') {
+                continue;
+            }
+
+            if path.is_dir() {
+                Self::read_package_entries_recursive(&path, parser, out);
+            } else if path.is_file()
+                && let Ok(content) = fs::read_to_string(&path)
+            {
+                Self::parse_lines(&content, parser, out);
+            }
+        }
     }
 
     /// Parse non-comment, non-empty lines.

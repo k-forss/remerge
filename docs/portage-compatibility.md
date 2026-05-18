@@ -12,7 +12,8 @@ Validated against:
   <https://dev.gentoo.org/~zmedico/portage/doc/> on 2026-05-18
 - `gentoo/portage` `master` as retrieved from
   <https://github.com/gentoo/portage/tree/master/lib/portage> on 2026-05-18
-- current remerge implementation in this repository on 2026-05-18
+- current remerge implementation and compatibility tests in this repository on
+  2026-05-18
 
 ## Purpose
 
@@ -112,6 +113,10 @@ remerge evidence:
 
 Status: aligned
 
+Audit finding:
+
+- verified in current code and contract coverage
+
 ### PC-002 Client configuration snapshot coverage
 
 remerge MUST capture and replay the Portage inputs that materially affect
@@ -146,7 +151,14 @@ remerge evidence:
 - worker-side replay is implemented in
   [crates/worker/src/portage_setup.rs](../crates/worker/src/portage_setup.rs)
 
-Status: aligned in scope, with specific gaps called out below
+Status: aligned in scope
+
+Audit finding:
+
+- verified by the snapshot contract in
+  [tests/cli_portage_test.rs](../tests/cli_portage_test.rs)
+- worker replay remains verified by
+  [tests/worker_setup_test.rs](../tests/worker_setup_test.rs)
 
 ### PC-003 `make.conf` path compatibility
 
@@ -160,15 +172,17 @@ Upstream basis:
 
 remerge evidence:
 
-- the current CLI reads only `/etc/portage/make.conf` in
+- the CLI now reads both `/etc/portage/make.conf` and `/etc/make.conf` via
+  `read_make_conf_vars()` in
   [crates/cli/src/portage.rs](../crates/cli/src/portage.rs)
+- dual-path behavior is covered by
+  [tests/cli_portage_test.rs](../tests/cli_portage_test.rs)
 
-Current implementation status: known gap
+Status: aligned
 
-Implication for future tests:
+Audit finding:
 
-- compatibility coverage should include systems that use `/etc/make.conf`,
-  `/etc/portage/make.conf`, and both simultaneously
+- previously documented as a gap; now implemented and contract-tested
 
 ### PC-004 Effective USE and USE_EXPAND semantics
 
@@ -196,6 +210,11 @@ remerge evidence:
 
 Status: aligned
 
+Audit finding:
+
+- verified by the worker-side contract in
+  [tests/worker_setup_test.rs](../tests/worker_setup_test.rs)
+
 ### PC-005 Recursive directory semantics for user package config
 
 Where remerge claims to capture Portage user package configuration directories,
@@ -211,20 +230,21 @@ Upstream basis:
 
 remerge evidence:
 
-- remerge currently reads directory entries non-recursively in
+- remerge now traverses package configuration directories recursively through
+  `read_package_entries_recursive()` in
   [crates/cli/src/portage.rs](../crates/cli/src/portage.rs)
+- the shared package-entry reader is used for `package.use`,
+  `package.accept_keywords`, `package.license`, `package.mask`,
+  `package.unmask`, and `package.env`
+- nested directory behavior is covered by
+  [tests/cli_portage_test.rs](../tests/cli_portage_test.rs)
 
-Current implementation status:
+Status: aligned
 
-- known gap for `package.use`
-- known gap for `package.accept_keywords`
-- unspecified for the remaining `package.*` directories until verified against
-  upstream code
+Audit finding:
 
-Implication for future tests:
-
-- include nested directory layouts under `package.use/` and
-  `package.accept_keywords/`
+- previously documented as a gap; now implemented for all current
+  `package.*` readers that share the recursive loader
 
 ### PC-006 Empty `package.accept_keywords` entry semantics
 
@@ -238,15 +258,17 @@ Upstream basis:
 
 remerge evidence:
 
-- the current CLI normalizes an empty entry to `~*` in
+- the CLI derives empty-entry defaults from the current global
+  `ACCEPT_KEYWORDS` via `empty_accept_keywords_defaults()` in
   [crates/cli/src/portage.rs](../crates/cli/src/portage.rs)
+- the behavior is covered by
+  [tests/cli_portage_test.rs](../tests/cli_portage_test.rs)
 
-Current implementation status: known gap
+Status: aligned
 
-Implication for future tests:
+Audit finding:
 
-- compare empty-entry behavior under different `ACCEPT_KEYWORDS` values,
-  especially architecture-specific ones
+- previously documented as a gap; now implemented and contract-tested
 
 ### PC-007 Repository and profile fidelity
 
@@ -270,6 +292,11 @@ remerge evidence:
 
 Status: aligned
 
+Audit finding:
+
+- verified by the replay contract in
+  [tests/worker_setup_test.rs](../tests/worker_setup_test.rs)
+
 ### PC-008 Patch and per-package environment fidelity
 
 remerge MUST preserve Portage behaviors that affect build outputs through local
@@ -289,6 +316,11 @@ remerge evidence:
   [crates/worker/src/portage_setup.rs](../crates/worker/src/portage_setup.rs)
 
 Status: aligned
+
+Audit finding:
+
+- verified by the replay contract in
+  [tests/worker_setup_test.rs](../tests/worker_setup_test.rs)
 
 ### PC-009 Worker-side `emerge` invocation policy
 
@@ -320,6 +352,14 @@ Compliance note:
 - this divergence is allowed because it is explicit, worker-scoped, and does
   not claim to be raw `emerge` passthrough behavior
 
+Status: aligned with documented divergence
+
+Audit finding:
+
+- the injected and filtered flag policy is now covered by
+  [crates/worker/src/builder.rs](../crates/worker/src/builder.rs) unit
+  contracts
+
 ### PC-010 Local install invocation and binhost handoff
 
 remerge MUST make the post-build local install path transparent and compatible
@@ -348,15 +388,20 @@ remerge evidence:
   [crates/cli/src/args.rs](../crates/cli/src/args.rs)
 - the server returns `binhost_uri` in workorder results from
   [crates/server/src/queue.rs](../crates/server/src/queue.rs)
-- the CLI currently does not consume `binhost_uri` and does not set
-  `PORTAGE_BINHOST`
+- the CLI now consumes `binhost_uri` and sets `PORTAGE_BINHOST` before the
+  local `emerge` invocation in
+  [crates/cli/src/args.rs](../crates/cli/src/args.rs)
+- the local handoff logic is covered by
+  [crates/cli/src/args.rs](../crates/cli/src/args.rs)
+- published binhost result URLs are covered end to end by
+  [tests/e2e_test.rs](../tests/e2e_test.rs)
 
-Current implementation status: transparency gap
+Status: aligned
 
-Implication for future tests:
+Audit finding:
 
-- distinguish between environments where Portage binhost config is already
-  present and environments where remerge is expected to supply it
+- previously documented as a transparency gap; now implemented with explicit
+  runtime handoff and e2e verification of published binhost result URLs
 
 ### PC-011 Binpkg output and signing
 
@@ -377,6 +422,12 @@ remerge evidence:
   [README.md](../README.md) and [docs/operations.md](operations.md)
 
 Status: aligned
+
+Audit finding:
+
+- verified by both worker-side make.conf contracts in
+  [tests/worker_setup_test.rs](../tests/worker_setup_test.rs) and queue/result
+  publication coverage in [tests/e2e_test.rs](../tests/e2e_test.rs)
 
 ### PC-012 Sync and overlay behavior
 
@@ -400,30 +451,43 @@ Compliance note:
 - this divergence is allowed only because it is explicit and operationally
   documented
 
+Status: aligned with documented divergence
+
+Audit finding:
+
+- skip-sync behavior is covered by the worker-side contract in
+  [crates/worker/src/builder.rs](../crates/worker/src/builder.rs)
+
 ## Current compliance summary
 
 ### Aligned or intentionally aligned
 
 - Portage remains the dependency resolver and task scheduler
+- client configuration snapshot coverage matches the current supported scope
+- `make.conf` path compatibility now covers both `/etc/make.conf` and
+  `/etc/portage/make.conf`
 - effective USE and USE_EXPAND handling is intentionally normalized
+- recursive package directory traversal is implemented for the current
+  `package.*` readers
+- empty `package.accept_keywords` entries derive unstable keywords from the
+  current global `ACCEPT_KEYWORDS`
 - repo config, profile overlay, patches, and env files are transported
 - worker-side binpkg output and signing are explicit
 - worker-side flag filtering is explicit rather than implicit
+- local install now performs explicit runtime binhost handoff via
+  `PORTAGE_BINHOST`
 
-### Known gaps
+### Known gaps in audited scope
 
-- `make.conf` path compatibility does not yet match Portage
-- recursive directory semantics are not preserved for at least
-  `package.use` and `package.accept_keywords`
-- empty `package.accept_keywords` entries are normalized to `~*` rather than
-  to unstable variants of the current global `ACCEPT_KEYWORDS`
-- local install behavior is not fully transparent because `binhost_uri` is
-  returned but not consumed by the CLI
+- no known implementation gaps remain in the audited PC-001 through PC-012
+  scope as of 2026-05-18
 
 ### Open questions for later verification
 
-- whether additional user config directories beyond `package.use` and
-  `package.accept_keywords` require recursive handling for full Portage parity
+- whether any additional Portage-managed directories outside the current
+  snapshot scope should be added for future supported workflows
+- whether all remaining `package.*` directories not currently materialized by
+  remerge need explicit upstream parity review beyond the current shared loader
 - whether any additional Portage config paths beyond the current snapshot scope
   are necessary for supported remerge workflows
 

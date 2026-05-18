@@ -116,6 +116,88 @@ INPUT_DEVICES="libinput"
     (tmp, root)
 }
 
+/// Create a temp directory with both `/etc/portage/make.conf` and
+/// `/etc/make.conf` populated so tests can verify merged path behavior.
+pub fn portage_tree_with_dual_make_conf() -> (TempDir, PathBuf) {
+    let (tmp, root) = portage_tree();
+
+    std::fs::create_dir_all(root.join("etc")).unwrap();
+    std::fs::write(
+        root.join("etc/make.conf"),
+        r#"CFLAGS="-O3 -pipe"
+ACCEPT_KEYWORDS="~amd64"
+FEATURES="buildpkg test"
+CUSTOM_LEGACY="yes"
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("etc/portage/make.conf"),
+        r#"CFLAGS="-O2 -pipe"
+CXXFLAGS="${CFLAGS}"
+LDFLAGS="-Wl,-O1 -Wl,--as-needed"
+MAKEOPTS="-j4"
+USE="X wayland -systemd"
+FEATURES="buildpkg noclean"
+ACCEPT_LICENSE="-* @FREE"
+ACCEPT_KEYWORDS="amd64"
+EMERGE_DEFAULT_OPTS="--quiet"
+CHOST="x86_64-pc-linux-gnu"
+VIDEO_CARDS="amdgpu"
+INPUT_DEVICES="libinput"
+CUSTOM_PORTAGE="yes"
+"#,
+    )
+    .unwrap();
+
+    (tmp, root)
+}
+
+/// Add nested directory entries under package.use and package.accept_keywords.
+pub fn portage_tree_with_nested_package_dirs() -> (TempDir, PathBuf) {
+    let (tmp, root) = portage_tree();
+    let portage = root.join("etc/portage");
+
+    let nested_use_dir = portage.join("package.use/nested/deeper");
+    std::fs::create_dir_all(&nested_use_dir).unwrap();
+    std::fs::write(
+        nested_use_dir.join("extra"),
+        "media-libs/mesa llvm\nsys-libs/zlib minizip\n",
+    )
+    .unwrap();
+
+    let nested_keywords_dir = portage.join("package.accept_keywords/nested/deeper");
+    std::fs::create_dir_all(&nested_keywords_dir).unwrap();
+    std::fs::write(nested_keywords_dir.join("extra"), "dev-util/re2c ~amd64\n").unwrap();
+
+    (tmp, root)
+}
+
+/// Overwrite the fixture's global ACCEPT_KEYWORDS and package.accept_keywords
+/// content for empty-entry semantics tests.
+pub fn portage_tree_with_empty_accept_keywords(global_accept_keywords: &str) -> (TempDir, PathBuf) {
+    let (tmp, root) = portage_tree();
+    let portage = root.join("etc/portage");
+
+    std::fs::write(
+        portage.join("make.conf"),
+        format!(
+            "CFLAGS=\"-O2 -pipe\"\nCXXFLAGS=\"${{CFLAGS}}\"\nLDFLAGS=\"-Wl,-O1 -Wl,--as-needed\"\nMAKEOPTS=\"-j4\"\nUSE=\"X wayland -systemd\"\nFEATURES=\"buildpkg noclean\"\nACCEPT_LICENSE=\"-* @FREE\"\nACCEPT_KEYWORDS=\"{}\"\nEMERGE_DEFAULT_OPTS=\"\"\nCHOST=\"x86_64-pc-linux-gnu\"\nVIDEO_CARDS=\"amdgpu\"\nINPUT_DEVICES=\"libinput\"\n",
+            global_accept_keywords
+        ),
+    )
+    .unwrap();
+
+    std::fs::write(
+        portage.join("package.accept_keywords/custom"),
+        "sys-kernel/gentoo-sources\n",
+    )
+    .unwrap();
+
+    (tmp, root)
+}
+
 /// Create a temp directory with a populated `/var/db/pkg/` VDB.
 pub fn vdb_tree(packages: &[(&str, &str)]) -> (TempDir, PathBuf) {
     let tmp = TempDir::new().expect("failed to create temp dir");

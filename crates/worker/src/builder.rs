@@ -15,51 +15,70 @@ use remerge_types::workorder::Workorder;
 
 use crate::portage_setup::{self, RepoSection};
 
-/// Build all packages in the workorder using emerge.
-///
-/// `emerge_cmd` is either `"emerge"` (native) or `"emerge-<CHOST>"` (cross).
-pub async fn build_packages(workorder: &Workorder, emerge_cmd: &str) -> Result<()> {
-    // Sync the portage tree first.
-    sync_portage().await?;
+fn build_emerge_invocation<'a>(
+    workorder: &Workorder,
+    emerge_cmd: &'a str,
+) -> (&'a str, Vec<String>) {
+    let mut args = build_emerge_args(workorder);
+    args.extend(workorder.atoms.iter().cloned());
+    (emerge_cmd, args)
+}
 
-    // Build each atom with --buildpkg so binary packages are created.
+fn build_emerge_args(workorder: &Workorder) -> Vec<String> {
     let mut args = vec![
         "--buildpkg".to_string(),
         "--usepkg".to_string(),
         "--verbose".to_string(),
         "--color=y".to_string(),
         "--keep-going".to_string(),
-        // --newuse and --update are essential: the container may have
-        // pre-installed packages built with different USE/PYTHON_TARGETS
-        // than the client's config.  Without these, emerge would report
-        // slot conflicts instead of rebuilding the mismatched packages.
         "--newuse".to_string(),
         "--update".to_string(),
-        // Auto-apply USE / keyword changes that emerge suggests (e.g.
-        // REQUIRED_USE constraints like `wayland? ( gles2 )`, missing
-        // keywords, etc.) and continue the build without prompting.
         "--autounmask-write".to_string(),
         "--autounmask-continue".to_string(),
     ];
 
-    // Forward any additional emerge arguments from the workorder,
-    // but filter out arguments that conflict with our flags.
     for arg in &workorder.emerge_args {
         match arg.as_str() {
-            // Skip arguments we already set or that don't make sense in the worker.
-            "--pretend" | "-p" | "--getbinpkg" | "-g" |
-            "--newuse" | "-N" | "--update" | "-u" |
-            "--autounmask-write" | "--autounmask-continue" |
-            // Dangerous flags that must never run in the worker.
-            "--depclean" | "--unmerge" | "-C" | "--deselect" |
-            "--sync" | "--info" | "--search" | "-s" | "--searchdesc" | "-S" |
-            "--config" | "--rage-clean" => continue,
+            "--pretend"
+            | "-p"
+            | "--getbinpkg"
+            | "-g"
+            | "--newuse"
+            | "-N"
+            | "--update"
+            | "-u"
+            | "--autounmask-write"
+            | "--autounmask-continue"
+            | "--depclean"
+            | "--unmerge"
+            | "-C"
+            | "--deselect"
+            | "--sync"
+            | "--info"
+            | "--search"
+            | "-s"
+            | "--searchdesc"
+            | "-S"
+            | "--config"
+            | "--rage-clean" => continue,
             _ => args.push(arg.clone()),
         }
     }
 
-    // Add the package atoms.
-    args.extend(workorder.atoms.iter().cloned());
+    args
+}
+
+fn should_skip_main_sync() -> bool {
+    std::env::var("REMERGE_SKIP_SYNC").is_ok()
+}
+
+/// Build all packages in the workorder using emerge.
+///
+/// `emerge_cmd` is either `"emerge"` (native) or `"emerge-<CHOST>"` (cross).
+pub async fn build_packages(workorder: &Workorder, emerge_cmd: &str) -> Result<()> {
+    // Sync the portage tree first.
+    sync_portage().await?;
+    let (program, args) = build_emerge_invocation(workorder, emerge_cmd);
 
     // Warn about expensive operations that are technically valid but risky.
     if args.iter().any(|a| a == "--emptytree" || a == "-e") {
@@ -69,25 +88,25 @@ pub async fn build_packages(workorder: &Workorder, emerge_cmd: &str) -> Result<(
         );
     }
 
-    info!(cmd = %emerge_cmd, ?args, "Running emerge");
+    info!(cmd = %program, ?args, "Running emerge");
 
     // Inherit the container PTY for all stdio — emerge output goes directly
     // through the Docker attach stream to the server.  The server handles
     // parsing for structured events; we just need the exit code.
-    let status = Command::new(emerge_cmd)
+    let status = Command::new(program)
         .args(&args)
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
         .status()
         .await
-        .with_context(|| format!("Failed to spawn {emerge_cmd}"))?;
+        .with_context(|| format!("Failed to spawn {program}"))?;
 
     if !status.success() {
-        anyhow::bail!("{emerge_cmd} exited with status {status}");
+        anyhow::bail!("{program} exited with status {status}");
     }
 
-    info!("{emerge_cmd} completed successfully");
+    info!("{program} completed successfully");
     Ok(())
 }
 
@@ -102,7 +121,7 @@ pub async fn build_packages(workorder: &Workorder, emerge_cmd: &str) -> Result<(
 /// When `REMERGE_SKIP_SYNC` is not set, `emerge --sync` syncs ALL
 /// configured repositories (gentoo + overlays) in one go.
 async fn sync_portage() -> Result<()> {
-    if std::env::var("REMERGE_SKIP_SYNC").is_ok() {
+    if should_skip_main_sync() {
         info!("Main repo sync skipped (repos are bind-mounted from the server)");
         // Overlays not present on the server still need to be synced.
         sync_missing_repos().await?;
@@ -234,4 +253,122 @@ async fn discover_configured_repos() -> Vec<RepoSection> {
 /// check because the symlink target is a fully populated repo tree.
 fn is_repo_populated(location: &str) -> bool {
     std::path::Path::new(location).join("profiles").exists()
+}
+
+#[cfg(test)]
+mod tests {
+    use remerge_types::client::ClientRole;
+    use remerge_types::workorder::Workorder;
+    use serde_json::json;
+
+    use super::{build_emerge_invocation, should_skip_main_sync};
+
+    fn minimal_workorder(emerge_args: Vec<String>, atoms: Vec<String>) -> Workorder {
+        serde_json::from_value(json!({
+            "id": "00000000-0000-0000-0000-000000000001",
+            "client_id": "00000000-0000-0000-0000-000000000002",
+            "role": match ClientRole::Main {
+                ClientRole::Main => "main",
+                ClientRole::Follower => "follower",
+            },
+            "atoms": atoms,
+            "emerge_args": emerge_args,
+            "portage_config": {
+                "make_conf": {
+                    "cflags": "-O2 -pipe",
+                    "original_cflags": null,
+                    "cxxflags": "${CFLAGS}",
+                    "ldflags": "-Wl,-O1 -Wl,--as-needed",
+                    "makeopts": "-j4",
+                    "use_flags": [],
+                    "use_flags_resolved": false,
+                    "features": ["buildpkg"],
+                    "accept_license": "-* @FREE",
+                    "accept_keywords": "amd64",
+                    "emerge_default_opts": "",
+                    "chost": "x86_64-pc-linux-gnu",
+                    "use_expand": {},
+                    "extra": {}
+                },
+                "package_use": [],
+                "package_accept_keywords": [],
+                "package_license": [],
+                "package_mask": [],
+                "package_unmask": [],
+                "package_env": [],
+                "env_files": {},
+                "repos_conf": {},
+                "patches": {},
+                "profile_overlay": {},
+                "profile": "default/linux/amd64/23.0",
+                "world": []
+            },
+            "system_id": {
+                "arch": "amd64",
+                "chost": "x86_64-pc-linux-gnu",
+                "gcc_version": "13.2.0",
+                "libc_version": "2.38",
+                "kernel_version": "6.6.0",
+                "python_targets": ["python3_12"],
+                "profile": "default/linux/amd64/23.0"
+            },
+            "trace_context": null,
+            "status": "pending",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }))
+        .expect("deserialize workorder fixture")
+    }
+
+    #[test]
+    fn pc_001_worker_delegates_to_supplied_emerge_contract() {
+        let workorder =
+            minimal_workorder(vec!["--emptytree".into()], vec!["app-misc/hello".into()]);
+        let (program, args) = build_emerge_invocation(&workorder, "/custom/bin/emerge");
+
+        assert_eq!(program, "/custom/bin/emerge");
+        assert!(args.contains(&"app-misc/hello".to_string()));
+        assert!(args.contains(&"--emptytree".to_string()));
+    }
+
+    #[test]
+    fn pc_009_worker_invocation_policy_contract() {
+        let workorder = minimal_workorder(
+            vec![
+                "--pretend".into(),
+                "--search".into(),
+                "--emptytree".into(),
+                "--jobs=4".into(),
+            ],
+            vec!["app-misc/hello".into()],
+        );
+        let (_program, args) = build_emerge_invocation(&workorder, "emerge");
+
+        assert!(args.starts_with(&[
+            "--buildpkg".to_string(),
+            "--usepkg".to_string(),
+            "--verbose".to_string(),
+        ]));
+        assert!(args.contains(&"--emptytree".to_string()));
+        assert!(args.contains(&"--jobs=4".to_string()));
+        assert!(!args.contains(&"--pretend".to_string()));
+        assert!(!args.contains(&"--search".to_string()));
+    }
+
+    #[test]
+    fn pc_012_sync_policy_contract() {
+        unsafe { std::env::remove_var("REMERGE_SKIP_SYNC") };
+        assert!(
+            !should_skip_main_sync(),
+            "skip-sync should default to disabled"
+        );
+
+        unsafe { std::env::set_var("REMERGE_SKIP_SYNC", "1") };
+        assert!(
+            should_skip_main_sync(),
+            "skip-sync should activate when env is set"
+        );
+
+        unsafe { std::env::remove_var("REMERGE_SKIP_SYNC") };
+    }
 }

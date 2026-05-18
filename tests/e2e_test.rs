@@ -362,6 +362,79 @@ mod e2e_tests {
         );
     }
 
+    /// PC-011 E2E: completed queue results always publish the same binhost URL
+    /// the server advertises to clients, regardless of build outcome.
+    #[tokio::test]
+    async fn pc_011_e2e_published_binhost_result_contract() {
+        require_docker();
+
+        let server = common::server::TestServer::start_with_queue().await;
+        let req = SubmitWorkorderRequest {
+            client_id: uuid::Uuid::new_v4(),
+            role: remerge_types::client::ClientRole::Main,
+            atoms: vec!["app-misc/hello".into()],
+            emerge_args: vec![],
+            portage_config: common::fixtures::minimal_portage_config(),
+            system_id: common::fixtures::minimal_system_identity(),
+        };
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{}/api/v1/workorders", server.base_url))
+            .json(&req)
+            .send()
+            .await
+            .expect("submit request");
+        assert_eq!(resp.status(), 200, "workorder submission should succeed");
+
+        let submit_resp: SubmitWorkorderResponse = resp.json().await.expect("parse response");
+        let expected_binhost_url = format!("{}/binpkgs", server.base_url);
+
+        let info_resp = reqwest::get(format!("{}/api/v1/info", server.base_url))
+            .await
+            .expect("fetch server info");
+        assert_eq!(info_resp.status(), 200, "server info should be reachable");
+        let info: ServerInfoResponse = info_resp.json().await.expect("parse server info");
+        assert_eq!(info.binhost_base_url, expected_binhost_url);
+
+        let result = common::with_timeout(std::time::Duration::from_secs(300), async {
+            loop {
+                if let Some(result) = server
+                    .state
+                    .results
+                    .read()
+                    .await
+                    .get(&submit_resp.workorder_id)
+                    .cloned()
+                {
+                    return result;
+                }
+
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        })
+        .await;
+
+        assert_eq!(result.binhost_uri, expected_binhost_url);
+        assert_eq!(result.binhost_uri, info.binhost_base_url);
+
+        let workorder = server.state.workorders.read().await;
+        let final_status = &workorder
+            .get(&submit_resp.workorder_id)
+            .expect("workorder should exist in state")
+            .status;
+        assert!(
+            matches!(
+                final_status,
+                remerge_types::workorder::WorkorderStatus::Completed
+                    | remerge_types::workorder::WorkorderStatus::Failed { .. }
+                    | remerge_types::workorder::WorkorderStatus::Cancelled
+            ),
+            "workorder should reach a terminal state, got {:?}",
+            final_status
+        );
+    }
+
     /// 6.7: Concurrent workorder rejection — submit while another is active.
     #[tokio::test]
     async fn concurrent_workorder_rejection() {
