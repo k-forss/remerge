@@ -40,7 +40,9 @@ fn build_emerge_args(workorder: &Workorder) -> Vec<String> {
 
     for arg in &workorder.emerge_args {
         match arg.as_str() {
-            "--getbinpkg"
+            "--pretend"
+            | "-p"
+            | "--getbinpkg"
             | "-g"
             | "--newuse"
             | "-N"
@@ -354,7 +356,7 @@ mod tests {
         assert!(args.contains(&"--ask=n".to_string()));
         assert!(args.contains(&"--emptytree".to_string()));
         assert!(args.contains(&"--jobs=4".to_string()));
-        assert!(args.contains(&"--pretend".to_string()));
+        assert!(!args.contains(&"--pretend".to_string()));
         assert!(!args.contains(&"--search".to_string()));
     }
 

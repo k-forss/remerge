@@ -919,13 +919,24 @@ impl PortageReader {
             .filter_map(|line| {
                 let mut parts = line.split_whitespace();
                 match (parts.next(), parts.next()) {
-                    (Some("DIST"), Some(name)) if !name.contains('/') && !name.contains("..") => {
+                    (Some("DIST"), Some(name)) if Self::is_valid_distfile_basename(name) => {
                         Some(name.to_string())
                     }
                     _ => None,
                 }
             })
             .collect()
+    }
+
+    fn is_valid_distfile_basename(name: &str) -> bool {
+        use std::path::Component;
+
+        if name.trim().is_empty() {
+            return false;
+        }
+
+        let mut components = Path::new(name).components();
+        matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
     }
 
     fn detect_distdir(&self) -> PathBuf {
@@ -2062,6 +2073,21 @@ VIDEO_CARDS="amdgpu radeonsi"
         assert_eq!(
             parse_atom_operator("=dev-libs/foo-1.0*"),
             (AtomOp::EqGlob, "dev-libs/foo-1.0*")
+        );
+    }
+
+    #[test]
+    fn parse_manifest_distfiles_allows_literal_double_dot_basenames() {
+        let distfiles = PortageReader::parse_manifest_distfiles(
+            "DIST foo..bar.tar.xz 123 BLAKE2B deadbeef SHA512 cafe\nDIST ../escape.tar.xz 1 BLAKE2B dead SHA512 beef\nDIST nested/file.tar.xz 1 BLAKE2B dead SHA512 beef\nDIST hello-1.0.tar.xz 123 BLAKE2B deadbeef SHA512 cafe\n",
+        );
+
+        assert_eq!(
+            distfiles,
+            vec![
+                "foo..bar.tar.xz".to_string(),
+                "hello-1.0.tar.xz".to_string()
+            ]
         );
     }
 }

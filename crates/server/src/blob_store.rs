@@ -397,7 +397,11 @@ pub(crate) async fn write_bytes_with_atomic_replace(
         Err(error) => {
             let _ = tokio::fs::remove_file(&temp).await;
             Err(error).with_context(|| {
-                format!("Failed to move {} into {}", temp.display(), target.display())
+                format!(
+                    "Failed to move {} into {}",
+                    temp.display(),
+                    target.display()
+                )
             })
         }
     }

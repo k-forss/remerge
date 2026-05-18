@@ -764,7 +764,7 @@ pub async fn restore_snapshots_inner(
         })?;
     }
     for (filename, bytes) in &config.distfile_snapshots {
-        if filename.trim().is_empty() || filename.contains('/') || filename.contains("..") {
+        if !is_valid_distfile_basename(filename) {
             tracing::warn!(filename, "Skipping distfile snapshot with invalid filename");
             continue;
         }
@@ -821,7 +821,7 @@ pub async fn restore_staged_snapshots_inner(
             let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
-            if filename.trim().is_empty() || filename.contains('/') || filename.contains("..") {
+            if !is_valid_distfile_basename(filename) {
                 tracing::warn!(filename, "Skipping staged distfile with invalid filename");
                 continue;
             }
@@ -838,6 +838,17 @@ pub async fn restore_staged_snapshots_inner(
     }
 
     Ok(())
+}
+
+fn is_valid_distfile_basename(filename: &str) -> bool {
+    use std::path::Component;
+
+    if filename.trim().is_empty() {
+        return false;
+    }
+
+    let mut components = Path::new(filename).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
 }
 
 async fn read_repo_locations(repos_conf_base: &Path) -> std::collections::BTreeMap<String, String> {
@@ -1407,6 +1418,15 @@ sync-type = git
             repos[0],
             ("myrepo".to_string(), "/var/db/repos/myrepo".to_string())
         );
+    }
+
+    #[test]
+    fn distfile_basename_validation_allows_literal_double_dot_but_rejects_paths() {
+        assert!(is_valid_distfile_basename("foo..bar.tar.xz"));
+        assert!(is_valid_distfile_basename("hello-1.0.tar.xz"));
+        assert!(!is_valid_distfile_basename("../escape.tar.xz"));
+        assert!(!is_valid_distfile_basename("nested/file.tar.xz"));
+        assert!(!is_valid_distfile_basename(""));
     }
 
     // ── write_profile_overlay_inner ──────────────────────────────────────────

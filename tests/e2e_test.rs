@@ -146,13 +146,14 @@ mod e2e_tests {
         }
     }
 
-    /// 6.2: Build with --pretend flag — verify the flag is passed through.
-    /// --ask should be filtered/rejected (single expected outcome).
+    /// 6.2: Build with --pretend flag — verify the worker filters the
+    /// non-build flag and still drives the workorder to a terminal state.
     #[tokio::test]
     async fn build_with_pretend_flag() {
         let server = common::server::TestServer::start_with_queue().await;
 
-        // Submit with --pretend (should be accepted and passed through).
+        // Submit with --pretend. The API accepts it, but the worker should
+        // strip the flag and run a normal build attempt.
         let req = SubmitWorkorderRequest {
             client_id: uuid::Uuid::new_v4(),
             role: remerge_types::client::ClientRole::Main,
@@ -186,21 +187,25 @@ mod e2e_tests {
         .expect("get");
         assert_eq!(resp.status(), 200, "should retrieve pretend workorder");
 
-        // Connect to WebSocket — if pretend mode works, we should see
-        // output without actual compilation (pretend output is fast).
+        // Connect to WebSocket and wait for a normal build attempt.
         let ws_url = format!(
             "ws://127.0.0.1:{}/api/v1/workorders/{}/progress",
             server.port, submit_resp.workorder_id
         );
         if let Ok((mut stream, _)) = tokio_tungstenite::connect_async(&ws_url).await {
             use futures_util::StreamExt;
-            let timeout = tokio::time::Duration::from_secs(120);
+            let timeout = tokio::time::Duration::from_secs(300);
             let result = tokio::time::timeout(timeout, async {
                 let mut saw_output = false;
                 while let Some(msg) = stream.next().await {
                     match msg {
-                        Ok(tokio_tungstenite::tungstenite::Message::Text(_))
-                        | Ok(tokio_tungstenite::tungstenite::Message::Binary(_)) => {
+                        Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
+                            saw_output = true;
+                            if text.contains("Finished") || text.contains("finished") {
+                                return true;
+                            }
+                        }
+                        Ok(tokio_tungstenite::tungstenite::Message::Binary(_)) => {
                             saw_output = true;
                         }
                         _ => {}
@@ -210,17 +215,39 @@ mod e2e_tests {
             })
             .await;
 
-            // The WebSocket connection and streaming must work. If it timed
-            // out, the pretend build is hanging; if it errored, the stream
-            // is broken. Either way it's a real failure.
             match result {
-                Ok(saw_output) => {
-                    // Pretend mode should produce output quickly — at minimum
-                    // the stream should have opened successfully.
-                    assert!(saw_output, "pretend build should produce WebSocket output");
+                Ok(true) => {
+                    let binpkg_entries: Vec<_> =
+                        std::fs::read_dir(server.state.config.binpkg_dir.clone())
+                            .map(|rd| rd.filter_map(|e| e.ok()).collect())
+                            .unwrap_or_default();
+                    assert!(
+                        !binpkg_entries.is_empty(),
+                        "binpkg directory should contain output when pretend is filtered"
+                    );
+                }
+                Ok(false) => {
+                    let resp = reqwest::get(format!(
+                        "{}/api/v1/workorders/{}",
+                        server.base_url, submit_resp.workorder_id
+                    ))
+                    .await
+                    .expect("get final status");
+                    let status: WorkorderStatusResponse =
+                        resp.json().await.expect("parse final status");
+                    assert!(
+                        matches!(
+                            status.status,
+                            remerge_types::workorder::WorkorderStatus::Failed { .. }
+                                | remerge_types::workorder::WorkorderStatus::Completed
+                                | remerge_types::workorder::WorkorderStatus::Cancelled
+                        ),
+                        "workorder should reach a terminal state, got {:?}",
+                        status.status
+                    );
                 }
                 Err(_) => {
-                    panic!("pretend build did not complete within 120s — timed out");
+                    panic!("build with pretend flag did not complete within 5 minutes — timed out");
                 }
             }
         } else {
