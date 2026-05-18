@@ -9,7 +9,9 @@ use bytes::Bytes;
 use tokio::sync::{Mutex, RwLock, Semaphore, broadcast, mpsc};
 use tokio::task;
 
-use remerge_types::workorder::{BuildProgress, Workorder, WorkorderId, WorkorderResult};
+use remerge_types::workorder::{
+    BuildProgress, Workorder, WorkorderId, WorkorderResult, WorkorderStatus,
+};
 
 use crate::auth::CertRegistry;
 use crate::config::ServerConfig;
@@ -17,6 +19,7 @@ use crate::docker::DockerManager;
 use crate::metrics::Metrics;
 use crate::registry::ClientRegistry;
 use crate::repo::BinpkgRepo;
+use crate::runtime::SnapshotReferenceSet;
 use crate::signing::ExportedSigningKey;
 
 /// Central application state shared across handlers and the queue processor.
@@ -60,6 +63,9 @@ pub struct AppState {
     /// Tracks last-used time of worker images (for idle timeout reaping).
     pub image_last_used: RwLock<HashMap<String, Instant>>,
 
+    /// Tracks which staged workorders currently reference which snapshot blobs and trees.
+    pub staged_workorder_references: RwLock<HashMap<WorkorderId, SnapshotReferenceSet>>,
+
     /// Server start time (for uptime reporting).
     pub started_at: Instant,
 
@@ -90,12 +96,33 @@ impl AppState {
         tokio::fs::create_dir_all(&config.state_dir).await?;
 
         // Load persisted state.
+        let persisted_workorders = crate::persistence::load_workorders(&config.state_dir)
+            .await
+            .unwrap_or_default();
         let persisted_results = crate::persistence::load_results(&config.state_dir)
             .await
             .unwrap_or_default();
         let persisted_clients = crate::persistence::load_clients(&config.state_dir)
             .await
             .unwrap_or_default();
+
+        let mut progress_txs = HashMap::new();
+        let mut raw_output_txs = HashMap::new();
+        for id in persisted_workorders.keys().copied().filter(|id| {
+            persisted_workorders.get(id).is_some_and(|workorder| {
+                matches!(
+                    workorder.status,
+                    WorkorderStatus::Pending
+                        | WorkorderStatus::Provisioning
+                        | WorkorderStatus::Building
+                )
+            })
+        }) {
+            let (raw_tx, _) = broadcast::channel(512);
+            raw_output_txs.insert(id, raw_tx);
+            let (tx, _) = broadcast::channel(256);
+            progress_txs.insert(id, tx);
+        }
 
         let max_workers = config.max_workers;
         let binpkg_repo = BinpkgRepo::new(config.binpkg_dir.clone());
@@ -105,15 +132,16 @@ impl AppState {
             docker,
             auth,
             clients: ClientRegistry::from_persisted(persisted_clients),
-            workorders: RwLock::new(HashMap::new()),
+            workorders: RwLock::new(persisted_workorders),
             submission_lock: Mutex::new(()),
             results: RwLock::new(persisted_results),
-            progress_txs: RwLock::new(HashMap::new()),
-            raw_output_txs: RwLock::new(HashMap::new()),
+            progress_txs: RwLock::new(progress_txs),
+            raw_output_txs: RwLock::new(raw_output_txs),
             stdin_txs: RwLock::new(HashMap::new()),
             worker_semaphore: Arc::new(Semaphore::new(max_workers)),
             container_ids: RwLock::new(HashMap::new()),
             image_last_used: RwLock::new(HashMap::new()),
+            staged_workorder_references: RwLock::new(HashMap::new()),
             started_at: Instant::now(),
             metrics: Metrics::new(),
             binpkg_repo,
@@ -186,6 +214,20 @@ impl AppState {
         self.progress_txs.write().await.remove(id);
         self.raw_output_txs.write().await.remove(id);
         self.stdin_txs.write().await.remove(id);
+    }
+
+    pub async fn track_staged_workorder_references(
+        &self,
+        id: WorkorderId,
+        references: SnapshotReferenceSet,
+    ) {
+        let mut tracked = self.staged_workorder_references.write().await;
+        track_staged_workorder_references(&mut tracked, id, references);
+    }
+
+    pub async fn clear_staged_workorder_references(&self, id: &WorkorderId) {
+        let mut tracked = self.staged_workorder_references.write().await;
+        clear_staged_workorder_references(&mut tracked, id);
     }
 
     /// Run a single eviction pass — remove stale terminal workorders and
@@ -266,5 +308,85 @@ impl AppState {
         }
 
         evicted
+    }
+}
+
+pub fn track_staged_workorder_references(
+    tracked: &mut HashMap<WorkorderId, SnapshotReferenceSet>,
+    id: WorkorderId,
+    references: SnapshotReferenceSet,
+) {
+    tracked.insert(id, references);
+}
+
+pub fn clear_staged_workorder_references(
+    tracked: &mut HashMap<WorkorderId, SnapshotReferenceSet>,
+    id: &WorkorderId,
+) {
+    tracked.remove(id);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeSet, HashMap};
+
+    use chrono::{Duration, Utc};
+    use remerge_types::workorder::WorkorderId;
+
+    use super::{
+        SnapshotReferenceSet, clear_staged_workorder_references, track_staged_workorder_references,
+    };
+
+    #[test]
+    fn staged_workorder_reference_tracking_replaces_and_clears_entries() {
+        let id = WorkorderId::new_v4();
+        let mut tracked = HashMap::new();
+        let first_seen = Utc::now() - Duration::minutes(5);
+        let refreshed_at = first_seen + Duration::minutes(3);
+
+        track_staged_workorder_references(
+            &mut tracked,
+            id,
+            SnapshotReferenceSet {
+                blob_digests: BTreeSet::from(["blob-a".to_string()]),
+                tree_digests: BTreeSet::from(["tree-a".to_string()]),
+                total_blob_bytes: 11,
+                total_tree_bytes: 22,
+                last_referenced_at: first_seen,
+            },
+        );
+        assert_eq!(
+            tracked[&id].blob_digests,
+            BTreeSet::from(["blob-a".to_string()])
+        );
+        assert_eq!(tracked[&id].total_blob_bytes, 11);
+        assert_eq!(tracked[&id].total_tree_bytes, 22);
+        assert_eq!(tracked[&id].last_referenced_at, first_seen);
+
+        track_staged_workorder_references(
+            &mut tracked,
+            id,
+            SnapshotReferenceSet {
+                blob_digests: BTreeSet::from(["blob-b".to_string()]),
+                tree_digests: BTreeSet::from(["tree-b".to_string()]),
+                total_blob_bytes: 33,
+                total_tree_bytes: 44,
+                last_referenced_at: refreshed_at,
+            },
+        );
+        assert_eq!(
+            tracked[&id].blob_digests,
+            BTreeSet::from(["blob-b".to_string()])
+        );
+        assert_eq!(
+            tracked[&id].tree_digests,
+            BTreeSet::from(["tree-b".to_string()])
+        );
+        assert_eq!(tracked[&id].total_blob_bytes, 33);
+        assert_eq!(tracked[&id].total_tree_bytes, 44);
+        assert_eq!(tracked[&id].last_referenced_at, refreshed_at);
+
+        clear_staged_workorder_references(&mut tracked, &id);
+        assert!(!tracked.contains_key(&id));
     }
 }

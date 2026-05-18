@@ -1,4 +1,4 @@
-use remerge_worker::{builder, crossdev, portage_setup};
+use remerge_worker::{builder, crossdev, parity, portage_setup};
 
 use anyhow::{Context, Result};
 use tracing::{Instrument, info};
@@ -11,9 +11,12 @@ async fn main() -> Result<()> {
 
     info!("remerge-worker starting");
 
-    // Read the workorder from the REMERGE_WORKORDER environment variable.
-    let workorder_json = std::env::var("REMERGE_WORKORDER")
-        .context("REMERGE_WORKORDER environment variable not set")?;
+    // Read the staged workorder JSON path from the environment.
+    let workorder_path = std::env::var("REMERGE_WORKORDER_PATH")
+        .context("REMERGE_WORKORDER_PATH environment variable not set")?;
+    let workorder_json = tokio::fs::read_to_string(&workorder_path)
+        .await
+        .with_context(|| format!("Failed to read staged workorder JSON from {workorder_path}"))?;
 
     let workorder: Workorder =
         serde_json::from_str(&workorder_json).context("Failed to parse workorder JSON")?;
@@ -79,6 +82,25 @@ async fn main() -> Result<()> {
         // 2. Build the packages.
         match builder::build_packages(&workorder, &emerge_cmd).await {
             Ok(()) => {
+                if let Ok(parity_output_dir) = std::env::var("REMERGE_PARITY_OUTPUT_DIR") {
+                    let parity_output_dir = std::path::Path::new(&parity_output_dir);
+                    parity::capture_final_state_parity(parity_output_dir)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to capture final-state parity into {}",
+                                parity_output_dir.display()
+                            )
+                        })?;
+                    parity::capture_fetched_distfiles(parity_output_dir)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to capture fetched distfiles into {}",
+                                parity_output_dir.display()
+                            )
+                        })?;
+                }
                 info!("Build completed successfully");
                 Ok(())
             }

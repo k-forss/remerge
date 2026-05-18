@@ -2,7 +2,8 @@
 
 This archive summarizes the completed integration-test milestone that used to
 be tracked in `TASKS.md`. It is no longer the active project tracker; use
-`ROADMAP.md` for current project state and future work.
+[README.md](../../README.md) and the linked project documentation for current project
+state and future work.
 
 ## Completion status
 

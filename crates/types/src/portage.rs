@@ -7,6 +7,53 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Relative file tree captured from a local repo working tree.
+pub type RepoSnapshot = BTreeMap<String, String>;
+
+/// Content-addressed blob references for a captured file tree.
+pub type SnapshotRefs = BTreeMap<String, String>;
+
+pub const SNAPSHOT_MANIFEST_VERSION_V1: u8 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotEntry {
+    pub digest: String,
+    pub size: u64,
+    pub mtime_secs: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RepoSnapshotManifest {
+    #[serde(default)]
+    pub tree_digest: String,
+    #[serde(default)]
+    pub entries: BTreeMap<String, SnapshotEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotManifest {
+    #[serde(default = "default_snapshot_manifest_version")]
+    pub version: u8,
+    #[serde(default)]
+    pub repo_snapshots: BTreeMap<String, RepoSnapshotManifest>,
+    #[serde(default)]
+    pub distfiles: BTreeMap<String, SnapshotEntry>,
+}
+
+impl Default for SnapshotManifest {
+    fn default() -> Self {
+        Self {
+            version: default_snapshot_manifest_version(),
+            repo_snapshots: BTreeMap::new(),
+            distfiles: BTreeMap::new(),
+        }
+    }
+}
+
+fn default_snapshot_manifest_version() -> u8 {
+    SNAPSHOT_MANIFEST_VERSION_V1
+}
+
 /// A complete snapshot of the portage configuration relevant for binary builds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortageConfig {
@@ -54,6 +101,31 @@ pub struct PortageConfig {
     #[serde(default)]
     pub repos_conf: BTreeMap<String, String>,
 
+    /// Versioned embedded snapshot manifest for persisted repo and distfile refs.
+    ///
+    /// This is the canonical refs-only contract used for persisted workorders.
+    #[serde(default)]
+    pub snapshot_manifest: SnapshotManifest,
+
+    /// Local overlay working trees captured from the client.
+    ///
+    /// Maps repo name (e.g. `local-overlay`) to a relative file tree rooted at
+    /// the repository location. Hidden/VCS files are omitted.
+    #[serde(default)]
+    pub repo_snapshots: BTreeMap<String, RepoSnapshot>,
+
+    /// Content-addressed blob references for local overlay working trees.
+    ///
+    /// Maps repo name to relative path -> SHA256 digest.
+    #[serde(default)]
+    pub repo_snapshot_refs: BTreeMap<String, SnapshotRefs>,
+
+    /// Content-addressed tree manifests for local overlay working trees.
+    ///
+    /// Maps repo name to a tree manifest digest.
+    #[serde(default)]
+    pub repo_snapshot_trees: BTreeMap<String, String>,
+
     /// User patches from `/etc/portage/patches/`.
     ///
     /// Maps relative path (e.g. `dev-libs/openssl/fix.patch`) to file
@@ -77,6 +149,19 @@ pub struct PortageConfig {
     /// - `make.defaults` — set variable defaults at profile level
     #[serde(default)]
     pub profile_overlay: BTreeMap<String, String>,
+
+    /// Distfiles captured from the client for local or dropped upstream
+    /// package versions.
+    ///
+    /// Keys are basenames (e.g. `demo-1.0.tar.xz`), values are raw bytes.
+    #[serde(default)]
+    pub distfile_snapshots: BTreeMap<String, Vec<u8>>,
+
+    /// Content-addressed blob references for captured distfiles.
+    ///
+    /// Maps distfile basename to SHA256 digest.
+    #[serde(default)]
+    pub distfile_snapshot_refs: BTreeMap<String, String>,
 
     /// The active portage profile path (e.g. `default/linux/amd64/23.0`).
     pub profile: String,

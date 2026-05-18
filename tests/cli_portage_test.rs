@@ -6,6 +6,11 @@
 mod common;
 
 use remerge::portage;
+use sha2::{Digest, Sha256};
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
 
 // ── split_name_version ──────────────────────────────────────────────
 
@@ -337,6 +342,51 @@ fn fixture_portage_tree_structure() {
     assert!(root.join("var/lib/portage/world").exists());
 }
 
+/// Local overlays and their manifest-backed distfiles are captured into the
+/// portage config snapshot so the worker can build unpublished packages.
+#[test]
+fn read_config_captures_local_overlay_and_distfiles() {
+    let (_tmp, root, overlay_name, distfile_name) =
+        common::fixtures::portage_tree_with_local_overlay();
+    let _env = common::set_root_env(&root);
+    let reader = remerge::portage::PortageReader::new().unwrap();
+
+    let config = reader.read_config().expect("read portage config");
+
+    let overlay = config
+        .repo_snapshots
+        .get(&overlay_name)
+        .expect("local overlay snapshot should be captured");
+    assert!(
+        overlay.contains_key("dev-libs/demo/demo-1.0.ebuild"),
+        "overlay ebuild should be captured"
+    );
+    assert!(
+        overlay.contains_key("dev-libs/demo/Manifest"),
+        "overlay Manifest should be captured"
+    );
+    assert!(
+        !overlay.keys().any(|path| path.starts_with(".git/")),
+        "VCS internals must not be captured"
+    );
+    assert_eq!(
+        config.distfile_snapshots.get(&distfile_name),
+        Some(&b"demo-distfile".to_vec())
+    );
+    assert_eq!(
+        config.repo_snapshot_refs[&overlay_name]["dev-libs/demo/demo-1.0.ebuild"],
+        sha256_hex(b"EAPI=8\nDESCRIPTION=\"demo\"\nSRC_URI=\"https://example.invalid/demo-1.0.tar.xz\"\nSLOT=\"0\"\nKEYWORDS=\"~amd64\"\n")
+    );
+    assert_eq!(
+        config.distfile_snapshot_refs[&distfile_name],
+        sha256_hex(b"demo-distfile")
+    );
+    assert!(
+        !config.repo_snapshot_trees[&overlay_name].is_empty(),
+        "repo tree manifest digest should be populated"
+    );
+}
+
 /// Fixture VDB tree creates package directories.
 #[test]
 fn fixture_vdb_tree() {
@@ -636,4 +686,116 @@ fn read_repos_conf_multiple_sections() {
         all_content.contains("[guru]"),
         "should contain guru section"
     );
+}
+
+/// PC-002: full snapshot coverage contract.
+#[test]
+fn pc_002_portage_snapshot_coverage_contract() {
+    let (_tmp, root) = common::fixtures::portage_tree();
+    let _env = common::set_root_env(&root);
+    let reader = portage::PortageReader::new().unwrap();
+    let config = reader.read_config().expect("read config");
+
+    assert_eq!(
+        config.package_use.len(),
+        2,
+        "expected 2 package.use entries"
+    );
+    assert_eq!(config.package_accept_keywords.len(), 1);
+    assert_eq!(config.package_license.len(), 1);
+    assert_eq!(config.package_mask, vec![">=dev-libs/foo-2.0".to_string()]);
+    assert_eq!(config.package_unmask, vec!["=dev-libs/bar-1.5".to_string()]);
+    assert_eq!(config.package_env.len(), 1);
+    assert!(config.env_files.contains_key("no-lto.conf"));
+    assert!(config.repos_conf.contains_key("gentoo.conf"));
+    assert!(
+        config.patches.contains_key("dev-libs/openssl/fix.patch"),
+        "expected openssl patch in snapshot"
+    );
+    assert_eq!(
+        config.profile_overlay.get("use.mask").map(String::as_str),
+        Some("custom-flag\n")
+    );
+    assert_eq!(
+        config.world,
+        vec![
+            "dev-libs/openssl".to_string(),
+            "sys-apps/systemd".to_string(),
+            "app-misc/screen".to_string(),
+        ]
+    );
+}
+
+/// PC-003: both make.conf paths are consumed when distinct, with legacy values
+/// overlaying earlier ones.
+#[test]
+fn pc_003_make_conf_search_path_contract() {
+    let (_tmp, root) = common::fixtures::portage_tree_with_dual_make_conf();
+    let _env = common::set_root_env(&root);
+    let reader = portage::PortageReader::new().unwrap();
+    let config = reader.read_config().expect("read config");
+
+    assert_eq!(config.make_conf.cflags, "-O3 -pipe");
+    assert_eq!(config.make_conf.accept_keywords, "~amd64");
+    assert!(config.make_conf.features.iter().any(|f| f == "test"));
+    assert_eq!(
+        config
+            .make_conf
+            .extra
+            .get("CUSTOM_PORTAGE")
+            .map(String::as_str),
+        Some("yes")
+    );
+    assert_eq!(
+        config
+            .make_conf
+            .extra
+            .get("CUSTOM_LEGACY")
+            .map(String::as_str),
+        Some("yes")
+    );
+}
+
+/// PC-005: package.use and package.accept_keywords directory traversal is recursive.
+#[test]
+fn pc_005_recursive_package_config_contract() {
+    let (_tmp, root) = common::fixtures::portage_tree_with_nested_package_dirs();
+    let _env = common::set_root_env(&root);
+    let reader = portage::PortageReader::new().unwrap();
+    let config = reader.read_config().expect("read config");
+
+    assert!(
+        config
+            .package_use
+            .iter()
+            .any(|entry| entry.atom == "media-libs/mesa" && entry.flags == vec!["llvm".to_string()]),
+        "nested package.use entry should be present"
+    );
+    assert!(
+        config
+            .package_accept_keywords
+            .iter()
+            .any(|entry| entry.atom == "dev-util/re2c"
+                && entry.keywords == vec!["~amd64".to_string()]),
+        "nested package.accept_keywords entry should be present"
+    );
+}
+
+/// PC-006: empty package.accept_keywords entries derive unstable variants from
+/// global ACCEPT_KEYWORDS rather than falling back to a universal literal.
+#[test]
+fn pc_006_empty_accept_keywords_contract() {
+    let (_tmp, root) =
+        common::fixtures::portage_tree_with_empty_accept_keywords("amd64 ~arm64 -x86");
+    let _env = common::set_root_env(&root);
+    let reader = portage::PortageReader::new().unwrap();
+    let config = reader.read_config().expect("read config");
+
+    let entry = config
+        .package_accept_keywords
+        .iter()
+        .find(|entry| entry.atom == "sys-kernel/gentoo-sources")
+        .expect("expected empty-entry package.accept_keywords atom");
+
+    assert_eq!(entry.keywords, vec!["~amd64".to_string()]);
 }

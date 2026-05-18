@@ -5,6 +5,12 @@
 
 mod common;
 
+use remerge_types::api::{
+    SNAPSHOT_BLOB_CHUNK_HEADER_LEN, SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES,
+    SNAPSHOT_BLOB_ENCODING_ZSTD, SNAPSHOT_BLOB_PROTOCOL_VERSION, SnapshotBlobChunkFrameError,
+    SnapshotBlobChunkHeader, SnapshotBlobClientControlMessage, SnapshotBlobEncodingOffer,
+    SnapshotBlobServerControlMessage,
+};
 use remerge_types::auth::AuthMode;
 use remerge_types::client::ClientRole;
 use remerge_types::portage::*;
@@ -75,6 +81,42 @@ fn portage_config_minimal_defaults() {
     assert!(
         config.repos_conf.is_empty(),
         "repos_conf should default to empty"
+    );
+    assert!(
+        config.repo_snapshots.is_empty(),
+        "repo_snapshots should default to empty"
+    );
+    assert!(
+        config.repo_snapshot_refs.is_empty(),
+        "repo_snapshot_refs should default to empty"
+    );
+    assert!(
+        config.repo_snapshot_trees.is_empty(),
+        "repo_snapshot_trees should default to empty"
+    );
+    assert!(
+        config.distfile_snapshots.is_empty(),
+        "distfile_snapshots should default to empty"
+    );
+    assert!(
+        config.distfile_snapshot_refs.is_empty(),
+        "distfile_snapshot_refs should default to empty"
+    );
+}
+
+#[test]
+fn portage_config_snapshot_payload_roundtrip() {
+    let config = common::fixtures::full_portage_config();
+    let json = serde_json::to_string(&config).expect("serialize");
+    let deserialized: PortageConfig = serde_json::from_str(&json).expect("deserialize");
+
+    assert_eq!(config.repo_snapshots, deserialized.repo_snapshots);
+    assert_eq!(config.repo_snapshot_refs, deserialized.repo_snapshot_refs);
+    assert_eq!(config.repo_snapshot_trees, deserialized.repo_snapshot_trees);
+    assert_eq!(config.distfile_snapshots, deserialized.distfile_snapshots);
+    assert_eq!(
+        config.distfile_snapshot_refs,
+        deserialized.distfile_snapshot_refs
     );
 }
 
@@ -157,6 +199,31 @@ fn workorder_result_roundtrip() {
             build_log: Some("error log here".into()),
         }],
         binhost_uri: "http://localhost:7654/binpkgs".into(),
+        fetched_distfiles: std::collections::BTreeMap::new(),
+        parity_manifest: ParityManifest {
+            files: std::collections::BTreeMap::from([(
+                "var/db/repos/gentoo/metadata/timestamp.chk".into(),
+                ParityFileEntry {
+                    digest: "ab".repeat(32),
+                    size: 42,
+                    mtime_secs: 1_700_000_000,
+                },
+            )]),
+            directories: std::collections::BTreeMap::from([(
+                "var/lib/portage".into(),
+                ParityDirectoryEntry {
+                    mtime_secs: 1_700_000_001,
+                },
+            )]),
+            symlinks: std::collections::BTreeMap::from([(
+                "var/lib/portage/make.profile".into(),
+                ParitySymlinkEntry {
+                    digest: "cd".repeat(32),
+                    size: 14,
+                    mtime_secs: 1_700_000_002,
+                },
+            )]),
+        },
     };
     let json = serde_json::to_string(&result).expect("serialize");
     let deserialized: WorkorderResult = serde_json::from_str(&json).expect("deserialize");
@@ -169,6 +236,7 @@ fn workorder_result_roundtrip() {
         deserialized.failed_packages.len()
     );
     assert_eq!(result.binhost_uri, deserialized.binhost_uri);
+    assert_eq!(result.parity_manifest, deserialized.parity_manifest);
 }
 
 /// BuildEvent tagged enum serialization.
@@ -201,6 +269,69 @@ fn build_event_serde() {
         // Just verify it doesn't panic — BuildEvent doesn't impl PartialEq.
         let _ = format!("{:?}", deserialized);
     }
+}
+
+#[test]
+fn snapshot_blob_control_messages_serialize_with_type_and_version() {
+    let workorder_id = uuid::Uuid::new_v4();
+    let client_message = SnapshotBlobClientControlMessage::UploadInit {
+        version: SNAPSHOT_BLOB_PROTOCOL_VERSION,
+        workorder_id,
+        digest: "ab".repeat(32),
+        total_size_bytes: 123,
+        chunk_size_bytes: SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES,
+        capability_flags: Vec::new(),
+        offered_encodings: vec![SnapshotBlobEncodingOffer {
+            encoding: SNAPSHOT_BLOB_ENCODING_ZSTD.to_string(),
+            size_bytes: 77,
+        }],
+    };
+    let client_json = serde_json::to_value(&client_message).expect("serialize client control");
+    assert_eq!(client_json["type"], "upload_init");
+    assert_eq!(client_json["version"], SNAPSHOT_BLOB_PROTOCOL_VERSION);
+    assert_eq!(client_json["offered_encodings"][0]["encoding"], "zstd");
+
+    let server_message = SnapshotBlobServerControlMessage::UploadResume {
+        version: SNAPSHOT_BLOB_PROTOCOL_VERSION,
+        workorder_id,
+        digest: "cd".repeat(32),
+        next_offset_bytes: 10,
+        next_sequence: 1,
+        selected_encoding: Some(SNAPSHOT_BLOB_ENCODING_ZSTD.to_string()),
+        expected_size_bytes: 20,
+    };
+    let server_json = serde_json::to_value(&server_message).expect("serialize server control");
+    assert_eq!(server_json["type"], "upload_resume");
+    assert_eq!(server_json["version"], SNAPSHOT_BLOB_PROTOCOL_VERSION);
+    assert_eq!(server_json["selected_encoding"], "zstd");
+
+    let roundtrip: SnapshotBlobServerControlMessage =
+        serde_json::from_value(server_json).expect("deserialize server control");
+    assert_eq!(roundtrip, server_message);
+}
+
+#[test]
+fn snapshot_blob_chunk_header_roundtrip_and_checksum_validation() {
+    let payload = b"chunk-payload";
+    let header = SnapshotBlobChunkHeader::from_payload(7, 42, payload);
+    let frame = header
+        .encode_with_payload(payload)
+        .expect("encode chunk frame");
+    assert_eq!(frame.len(), SNAPSHOT_BLOB_CHUNK_HEADER_LEN + payload.len());
+
+    let (decoded, decoded_payload) = SnapshotBlobChunkHeader::decode(&frame).expect("decode frame");
+    assert_eq!(decoded, header);
+    assert_eq!(decoded_payload, payload);
+
+    let mut corrupted = frame.clone();
+    let last = corrupted.len() - 1;
+    corrupted[last] ^= 0x01;
+    let error =
+        SnapshotBlobChunkHeader::decode(&corrupted).expect_err("corrupted frame should fail");
+    assert!(matches!(
+        error,
+        SnapshotBlobChunkFrameError::ChecksumMismatch { .. }
+    ));
 }
 
 // ── validate_atom exhaustive ────────────────────────────────────────

@@ -163,6 +163,29 @@ pub struct ServerConfig {
     /// integration tests where the base image already has a synced tree.
     #[serde(default)]
     pub skip_worker_sync: bool,
+
+    /// Warm-cache grace window for unreferenced snapshot blobs and trees.
+    ///
+    /// Eligible unreferenced data older than this window may be evicted only
+    /// when retained snapshot data exceeds `snapshot_min_retained_bytes`.
+    #[serde(default = "default_snapshot_cache_grace_period_hours")]
+    pub snapshot_cache_grace_period_hours: u64,
+
+    /// Hard-delete retention for unreferenced snapshot blobs and trees.
+    ///
+    /// Unreferenced data older than this bound becomes the first eviction tier
+    /// when cleanup is needed, but the retained-size floor still prevents any
+    /// deletion once retained snapshot data is at or below
+    /// `snapshot_min_retained_bytes`.
+    #[serde(default = "default_snapshot_cache_hard_delete_hours")]
+    pub snapshot_cache_hard_delete_hours: u64,
+
+    /// Minimum retained size floor for cached snapshot blobs and trees.
+    ///
+    /// Unreferenced snapshot eviction does not delete below this floor,
+    /// including data past `snapshot_cache_hard_delete_hours`.
+    #[serde(default = "default_snapshot_min_retained_bytes")]
+    pub snapshot_min_retained_bytes: u64,
 }
 
 fn default_binpkg_dir() -> PathBuf {
@@ -214,6 +237,15 @@ fn default_max_retained_workorders() -> usize {
     1000
 }
 fn default_binpkg_disk_warn_bytes() -> u64 {
+    10 * 1024 * 1024 * 1024 // 10 GiB
+}
+fn default_snapshot_cache_grace_period_hours() -> u64 {
+    7 * 24
+}
+fn default_snapshot_cache_hard_delete_hours() -> u64 {
+    30 * 24
+}
+fn default_snapshot_min_retained_bytes() -> u64 {
     10 * 1024 * 1024 * 1024 // 10 GiB
 }
 
@@ -326,6 +358,9 @@ impl Default for ServerConfig {
             binpkg_disk_warn_bytes: default_binpkg_disk_warn_bytes(),
             worker_base_image: None,
             skip_worker_sync: false,
+            snapshot_cache_grace_period_hours: default_snapshot_cache_grace_period_hours(),
+            snapshot_cache_hard_delete_hours: default_snapshot_cache_hard_delete_hours(),
+            snapshot_min_retained_bytes: default_snapshot_min_retained_bytes(),
         }
     }
 }
@@ -348,6 +383,20 @@ impl ServerConfig {
         if self.worker_network_mode.trim().is_empty() {
             tracing::warn!("worker_network_mode must not be empty — resetting to default");
             self.worker_network_mode = default_worker_network_mode();
+        }
+        if self.snapshot_cache_grace_period_hours == 0 {
+            tracing::warn!("snapshot_cache_grace_period_hours must be > 0 — resetting to default");
+            self.snapshot_cache_grace_period_hours = default_snapshot_cache_grace_period_hours();
+        }
+        if self.snapshot_cache_hard_delete_hours == 0 {
+            tracing::warn!("snapshot_cache_hard_delete_hours must be > 0 — resetting to default");
+            self.snapshot_cache_hard_delete_hours = default_snapshot_cache_hard_delete_hours();
+        }
+        if self.snapshot_cache_hard_delete_hours < self.snapshot_cache_grace_period_hours {
+            tracing::warn!(
+                "snapshot_cache_hard_delete_hours must be >= snapshot_cache_grace_period_hours — resetting hard-delete window to default"
+            );
+            self.snapshot_cache_hard_delete_hours = default_snapshot_cache_hard_delete_hours();
         }
         if let Some(ref path) = self.repos_dir {
             if !path.exists() {
@@ -494,6 +543,21 @@ impl ServerConfig {
         }
         if let Ok(v) = std::env::var("REMERGE_SKIP_WORKER_SYNC") {
             config.skip_worker_sync = v == "1" || v.eq_ignore_ascii_case("true");
+        }
+        if let Ok(v) = std::env::var("REMERGE_SNAPSHOT_CACHE_GRACE_PERIOD_HOURS")
+            && let Ok(n) = v.parse()
+        {
+            config.snapshot_cache_grace_period_hours = n;
+        }
+        if let Ok(v) = std::env::var("REMERGE_SNAPSHOT_CACHE_HARD_DELETE_HOURS")
+            && let Ok(n) = v.parse()
+        {
+            config.snapshot_cache_hard_delete_hours = n;
+        }
+        if let Ok(v) = std::env::var("REMERGE_SNAPSHOT_MIN_RETAINED_BYTES")
+            && let Ok(n) = v.parse()
+        {
+            config.snapshot_min_retained_bytes = n;
         }
 
         config.validate();

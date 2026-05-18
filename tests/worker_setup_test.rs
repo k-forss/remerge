@@ -247,6 +247,155 @@ async fn write_make_conf_empty_features_defaults() {
     assert!(content.contains("noclean"), "must have noclean default");
 }
 
+/// Repo snapshots and distfile snapshots are restored into the worker runtime
+/// before emerge executes.
+#[tokio::test]
+async fn restore_repo_and_distfile_snapshots() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let repos_base = tmp.path().join("repos");
+    let portage_base = tmp.path().join("etc/portage");
+    let distfiles_base = tmp.path().join("distfiles");
+    tokio::fs::create_dir_all(&repos_base).await.unwrap();
+    tokio::fs::create_dir_all(&portage_base).await.unwrap();
+
+    let mut config = common::fixtures::minimal_portage_config();
+    config.repos_conf.insert(
+        "local-overlay.conf".into(),
+        format!(
+            "[local-overlay]\nlocation = {}\nauto-sync = no\n",
+            repos_base.join("local-overlay").display()
+        ),
+    );
+    config.repo_snapshots.insert(
+        "local-overlay".into(),
+        std::collections::BTreeMap::from([
+            (
+                "dev-libs/demo/demo-1.0.ebuild".into(),
+                "EAPI=8\nDESCRIPTION=\"demo\"\n".into(),
+            ),
+            (
+                "dev-libs/demo/Manifest".into(),
+                "DIST demo-1.0.tar.xz 12 BLAKE2B deadbeef SHA512 cafefood\n".into(),
+            ),
+        ]),
+    );
+    config
+        .distfile_snapshots
+        .insert("demo-1.0.tar.xz".into(), b"demo-distfile".to_vec());
+
+    portage_setup::write_repos_conf_inner(&portage_base, &config)
+        .await
+        .expect("write_repos_conf_inner");
+    portage_setup::ensure_repo_locations_inner(
+        &config,
+        &repos_base,
+        &portage_base.join("repos.conf"),
+        &tmp.path().join("remap"),
+    )
+    .await
+    .expect("ensure_repo_locations_inner");
+    portage_setup::restore_snapshots_inner(
+        &config,
+        &portage_base.join("repos.conf"),
+        &distfiles_base,
+    )
+    .await
+    .expect("restore_snapshots_inner");
+
+    let ebuild = repos_base.join("local-overlay/dev-libs/demo/demo-1.0.ebuild");
+    assert!(ebuild.exists(), "repo snapshot ebuild should be restored");
+    let distfile = distfiles_base.join("demo-1.0.tar.xz");
+    assert!(distfile.exists(), "distfile snapshot should be restored");
+    assert_eq!(std::fs::read(distfile).unwrap(), b"demo-distfile");
+}
+
+/// Staged runtime snapshots are restored from the mounted server runtime even
+/// after the workorder payload has been stripped down to digest refs.
+#[tokio::test]
+async fn restore_staged_runtime_snapshots() {
+    let state_dir = tempfile::TempDir::new().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let repos_base = tmp.path().join("repos");
+    let portage_base = tmp.path().join("etc/portage");
+    let distfiles_base = tmp.path().join("distfiles");
+    tokio::fs::create_dir_all(&repos_base).await.unwrap();
+    tokio::fs::create_dir_all(&portage_base).await.unwrap();
+
+    let mut workorder = remerge_types::workorder::Workorder {
+        id: uuid::Uuid::new_v4(),
+        client_id: uuid::Uuid::new_v4(),
+        role: remerge_types::client::ClientRole::Main,
+        atoms: vec!["dev-libs/demo".into()],
+        emerge_args: vec!["dev-libs/demo".into()],
+        portage_config: common::fixtures::minimal_portage_config(),
+        system_id: common::fixtures::minimal_system_identity(),
+        trace_context: None,
+        status: remerge_types::workorder::WorkorderStatus::Pending,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    workorder.portage_config.repos_conf.insert(
+        "local-overlay.conf".into(),
+        format!(
+            "[local-overlay]\nlocation = {}\nauto-sync = no\n",
+            repos_base.join("local-overlay").display()
+        ),
+    );
+    workorder.portage_config.repo_snapshots.insert(
+        "local-overlay".into(),
+        std::collections::BTreeMap::from([(
+            "dev-libs/demo/demo-1.0.ebuild".into(),
+            "EAPI=8\nDESCRIPTION=\"demo\"\n".into(),
+        )]),
+    );
+    workorder
+        .portage_config
+        .distfile_snapshots
+        .insert("demo-1.0.tar.xz".into(), b"demo-distfile".to_vec());
+
+    let staged = remerge_server::runtime::stage_workorder_runtime(state_dir.path(), &workorder)
+        .await
+        .expect("stage_workorder_runtime");
+    let staged_workorder: remerge_types::workorder::Workorder =
+        serde_json::from_slice(&tokio::fs::read(&staged.workorder_json_path).await.unwrap())
+            .unwrap();
+    assert!(staged_workorder.portage_config.repo_snapshots.is_empty());
+    assert!(
+        staged_workorder
+            .portage_config
+            .distfile_snapshots
+            .is_empty()
+    );
+
+    portage_setup::write_repos_conf_inner(&portage_base, &staged_workorder.portage_config)
+        .await
+        .expect("write_repos_conf_inner");
+    portage_setup::ensure_repo_locations_inner(
+        &staged_workorder.portage_config,
+        &repos_base,
+        &portage_base.join("repos.conf"),
+        &tmp.path().join("remap"),
+    )
+    .await
+    .expect("ensure_repo_locations_inner");
+    portage_setup::restore_staged_snapshots_inner(
+        &portage_base.join("repos.conf"),
+        &distfiles_base,
+        &staged.runtime_dir.join("snapshots"),
+    )
+    .await
+    .expect("restore_staged_snapshots_inner");
+
+    let ebuild = repos_base.join("local-overlay/dev-libs/demo/demo-1.0.ebuild");
+    assert!(
+        ebuild.exists(),
+        "staged repo snapshot ebuild should be restored"
+    );
+    let distfile = distfiles_base.join("demo-1.0.tar.xz");
+    assert!(distfile.exists(), "staged distfile should be restored");
+    assert_eq!(std::fs::read(distfile).unwrap(), b"demo-distfile");
+}
+
 // ── write_package_use ───────────────────────────────────────────────
 
 /// Write package.use entries and verify content.
@@ -1124,4 +1273,137 @@ async fn apply_config_orchestration() {
         base.join("patches/dev-libs/openssl").is_dir(),
         "patches directory structure should exist"
     );
+}
+
+/// PC-004: resolved USE and USE_EXPAND are serialized without duplication.
+#[tokio::test]
+async fn pc_004_use_and_use_expand_contract() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    let mut config = common::fixtures::minimal_portage_config();
+    config.make_conf.use_flags = vec!["wayland".into(), "dbus".into()];
+    config.make_conf.use_flags_resolved = true;
+    config
+        .make_conf
+        .use_expand
+        .insert("VIDEO_CARDS".into(), vec!["intel".into()]);
+    config
+        .make_conf
+        .use_expand
+        .insert("INPUT_DEVICES".into(), vec!["libinput".into()]);
+
+    portage_setup::write_make_conf_inner(&base, &config, "x86_64-pc-linux-gnu", None, None)
+        .await
+        .expect("write_make_conf_inner");
+
+    let content = std::fs::read_to_string(base.join("make.conf")).unwrap();
+    let use_line = content
+        .lines()
+        .find(|line| line.starts_with("USE="))
+        .expect("USE line");
+
+    assert!(use_line.contains("USE=\"-* wayland dbus\""));
+    assert!(!use_line.contains("video_cards_intel"));
+    assert!(!use_line.contains("input_devices_libinput"));
+    assert!(content.contains("VIDEO_CARDS=\"intel\""));
+    assert!(content.contains("INPUT_DEVICES=\"libinput\""));
+}
+
+/// PC-007: repos.conf, active profile, and profile overlay survive worker replay.
+#[tokio::test]
+async fn pc_007_repo_and_profile_fidelity_contract() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().join("etc/portage");
+    std::fs::create_dir_all(&base).unwrap();
+
+    let repo_dir = tmp.path().join("repo");
+    let profile_dir = repo_dir.join("profiles/default/linux/amd64/23.0");
+    std::fs::create_dir_all(&profile_dir).unwrap();
+
+    let mut config = common::fixtures::minimal_portage_config();
+    config.profile = "default/linux/amd64/23.0".into();
+    config.repos_conf.insert(
+        "gentoo.conf".into(),
+        format!(
+            "[gentoo]\nlocation = {}\nsync-type = rsync\n",
+            repo_dir.display()
+        ),
+    );
+    config
+        .profile_overlay
+        .insert("use.mask".into(), "custom-flag\n".into());
+
+    portage_setup::apply_config_inner(&base, &config, "x86_64-pc-linux-gnu", None, None)
+        .await
+        .expect("apply_config_inner");
+
+    assert!(base.join("repos.conf/gentoo.conf").exists());
+    assert_eq!(
+        std::fs::read_to_string(base.join("profile/use.mask")).unwrap(),
+        "custom-flag\n"
+    );
+    assert!(base.join("make.profile").is_symlink());
+}
+
+/// PC-008: package.env, env files, and patches survive worker replay together.
+#[tokio::test]
+async fn pc_008_patch_and_env_fidelity_contract() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().join("etc/portage");
+    std::fs::create_dir_all(&base).unwrap();
+
+    let mut config = common::fixtures::minimal_portage_config();
+    config.package_env = vec![PackageEnvEntry {
+        atom: "dev-qt/qtwebengine".into(),
+        env_file: "no-lto.conf".into(),
+    }];
+    config
+        .env_files
+        .insert("no-lto.conf".into(), "CFLAGS=\"-fno-lto\"\n".into());
+    config.patches.insert(
+        "dev-libs/openssl/fix.patch".into(),
+        "--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n".into(),
+    );
+
+    portage_setup::apply_config_inner(&base, &config, "x86_64-pc-linux-gnu", None, None)
+        .await
+        .expect("apply_config_inner");
+
+    assert!(
+        std::fs::read_to_string(base.join("package.env/remerge"))
+            .unwrap()
+            .contains("dev-qt/qtwebengine no-lto.conf")
+    );
+    assert!(
+        std::fs::read_to_string(base.join("env/no-lto.conf"))
+            .unwrap()
+            .contains("-fno-lto")
+    );
+    assert!(base.join("patches/dev-libs/openssl/fix.patch").exists());
+}
+
+/// PC-011: worker binpkg output and signing defaults are explicit and present together.
+#[tokio::test]
+async fn pc_011_binpkg_and_signing_contract() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    let config = common::fixtures::minimal_portage_config();
+    portage_setup::write_make_conf_inner(
+        &base,
+        &config,
+        "x86_64-pc-linux-gnu",
+        Some("0xABCD1234"),
+        Some("/var/cache/remerge/gnupg"),
+    )
+    .await
+    .expect("write_make_conf_inner");
+
+    let content = std::fs::read_to_string(base.join("make.conf")).unwrap();
+    assert!(content.contains("PKGDIR=\"/var/cache/binpkgs\""));
+    assert!(content.contains("BINPKG_FORMAT=\"gpkg\""));
+    assert!(content.contains("BINPKG_GPG_SIGNING_KEY=\"0xABCD1234\""));
+    assert!(content.contains("BINPKG_GPG_SIGNING_GPG_HOME=\"/var/cache/remerge/gnupg\""));
+    assert!(content.contains("binpkg-signing"));
 }

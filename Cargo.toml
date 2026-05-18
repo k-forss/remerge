@@ -28,6 +28,10 @@ tokio-tungstenite = { workspace = true }
 futures-util = "0.3"
 bollard = { workspace = true }
 chrono = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+filetime = { workspace = true }
+zstd = { workspace = true }
 
 [workspace]
 resolver = "2"
@@ -60,7 +64,7 @@ toml = "1.1"
 
 # HTTP
 axum = { version = "0.8", features = ["ws"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "zstd"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
 
@@ -91,8 +95,11 @@ sha2 = "0.11"
 hex = "0.4"
 regex = "1"
 bytes = "1"
+adler2 = "2"
 tempfile = "3"
 tokio-tungstenite = "0.29"
+filetime = "0.2"
+zstd = "0.13"
 
 [profile.release]
 lto = true

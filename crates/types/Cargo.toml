@@ -12,3 +12,5 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
+adler2 = { workspace = true }
+zstd = { workspace = true }

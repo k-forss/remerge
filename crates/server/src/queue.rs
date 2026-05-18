@@ -16,7 +16,9 @@ use tracing::{Instrument, error, info, warn};
 
 use remerge_types::workorder::*;
 
+use crate::persistence;
 use crate::repo::BinpkgRepo;
+use crate::runtime;
 use crate::state::AppState;
 
 fn failed_packages_for_atoms(atoms: &[String], reason: &str) -> Vec<FailedPackage> {
@@ -77,6 +79,19 @@ async fn set_workorder_status(
             to: new_status,
         },
     ));
+
+    let workorders = {
+        let workorders = state.workorders.read().await;
+        workorders.clone()
+    };
+    if let Err(error) =
+        persistence::save_workorders(state.config.state_dir.as_path(), &workorders).await
+    {
+        warn!(
+            ?workorder_id,
+            "Failed to persist workorder state change: {error:#}"
+        );
+    }
 }
 
 async fn cleanup_workorder_runtime(
@@ -86,6 +101,7 @@ async fn cleanup_workorder_runtime(
     container_id: Option<&str>,
 ) {
     state.container_ids.write().await.remove(&id);
+    state.clear_staged_workorder_references(&id).await;
     state.remove_workorder_channels(&id).await;
     state
         .clients
@@ -111,6 +127,42 @@ async fn cleanup_workorder_runtime(
     } else {
         true
     };
+
+    if let Err(e) = runtime::cleanup_workorder_runtime(&state.config.state_dir, id).await {
+        warn!(?id, "Failed to clean up staged runtime dir: {e:#}");
+    }
+
+    let cleanup_state = Arc::clone(state);
+    tokio::spawn(async move {
+        let active_references: Vec<_> = cleanup_state
+            .staged_workorder_references
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect();
+        match runtime::cleanup_snapshot_storage(
+            &cleanup_state.config.state_dir,
+            &cleanup_state.config,
+            &active_references,
+        )
+        .await
+        {
+            Ok(summary) if summary.deleted_blobs != 0 || summary.deleted_trees != 0 => {
+                cleanup_state
+                    .metrics
+                    .record_cleanup_reclaimed_bytes(summary.reclaimed_bytes);
+                info!(
+                    deleted_blobs = summary.deleted_blobs,
+                    deleted_trees = summary.deleted_trees,
+                    reclaimed_bytes = summary.reclaimed_bytes,
+                    "Cleaned unreferenced snapshot cache entries"
+                )
+            }
+            Ok(_) => {}
+            Err(error) => warn!(?id, "Failed snapshot cache cleanup pass: {error:#}"),
+        }
+    });
 
     state.metrics.record_cleanup(cleanup_success);
     if cleanup_success {
@@ -279,6 +331,8 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
                     built_packages: Vec::new(),
                     failed_packages: failed_packages_for_atoms(&workorder.atoms, &reason),
                     binhost_uri: state.config.binhost_url.clone(),
+                    fetched_distfiles: Default::default(),
+                    parity_manifest: ParityManifest::default(),
                 },
             );
 
@@ -307,7 +361,70 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
     set_workorder_status(state, &tx, id, &trace_id, WorkorderStatus::Building).await;
 
     let container_name = format!("remerge-worker-{}", id.as_simple());
-    let workorder_json = serde_json::to_string(&workorder)?;
+    let staged_runtime =
+        match runtime::stage_workorder_runtime(&state.config.state_dir, &workorder).await {
+            Ok(runtime) => runtime,
+            Err(e) => {
+                let reason = format!("Failed to stage worker runtime: {e:#}");
+                set_workorder_status(
+                    state,
+                    &tx,
+                    id,
+                    &trace_id,
+                    WorkorderStatus::Failed {
+                        reason: reason.clone(),
+                    },
+                )
+                .await;
+                let _ = tx.send(build_progress(
+                    id,
+                    &trace_id,
+                    BuildEvent::Finished {
+                        built: Vec::new(),
+                        failed: workorder.atoms.clone(),
+                    },
+                ));
+                state.results.write().await.insert(
+                    id,
+                    WorkorderResult {
+                        workorder_id: id,
+                        built_packages: Vec::new(),
+                        failed_packages: failed_packages_for_atoms(&workorder.atoms, &reason),
+                        binhost_uri: state.config.binhost_url.clone(),
+                        fetched_distfiles: Default::default(),
+                        parity_manifest: ParityManifest::default(),
+                    },
+                );
+                state
+                    .metrics
+                    .builds_total_duration_secs
+                    .fetch_add(build_start.elapsed().as_secs(), Ordering::Relaxed);
+                state.metrics.builds_active.fetch_sub(1, Ordering::Relaxed);
+                state
+                    .metrics
+                    .workorders_failed
+                    .fetch_add(1, Ordering::Relaxed);
+                cleanup_workorder_runtime(state, &workorder, id, None).await;
+                return Ok(());
+            }
+        };
+    state.metrics.record_snapshot_runtime_stage(
+        staged_runtime.snapshot_references.total_blob_bytes
+            + staged_runtime.snapshot_references.total_tree_bytes,
+    );
+    state
+        .track_staged_workorder_references(id, staged_runtime.snapshot_references.clone())
+        .await;
+    info!(
+        ?id,
+        trace_id,
+        runtime_dir = %staged_runtime.runtime_dir.display(),
+        blob_count = staged_runtime.snapshot_references.blob_digests.len(),
+        tree_count = staged_runtime.snapshot_references.tree_digests.len(),
+        total_blob_bytes = staged_runtime.snapshot_references.total_blob_bytes,
+        total_tree_bytes = staged_runtime.snapshot_references.total_tree_bytes,
+        "Prepared staged runtime for worker startup"
+    );
 
     let container_start = Instant::now();
     let container_result = state
@@ -315,7 +432,7 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
         .start_worker(
             &container_name,
             &image_tag,
-            &workorder_json,
+            &staged_runtime.runtime_dir,
             workorder
                 .trace_context
                 .as_ref()
@@ -357,6 +474,8 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
                     built_packages: Vec::new(),
                     failed_packages: failed_packages_for_atoms(&workorder.atoms, &reason),
                     binhost_uri: state.config.binhost_url.clone(),
+                    fetched_distfiles: Default::default(),
+                    parity_manifest: ParityManifest::default(),
                 },
             );
 
@@ -660,6 +779,106 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
 
     // ── 6. Scan binpkg directory for real results ───────────────────
     let build_duration = build_start.elapsed().as_secs();
+    let parity_manifest = match runtime::ingest_final_state_parity(
+        &state.config.state_dir,
+        &staged_runtime.runtime_dir,
+    )
+    .await
+    {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            let reason = format!("Failed to ingest final-state parity: {error:#}");
+            set_workorder_status(
+                state,
+                &tx,
+                id,
+                &trace_id,
+                WorkorderStatus::Failed {
+                    reason: reason.clone(),
+                },
+            )
+            .await;
+
+            let result = WorkorderResult {
+                workorder_id: id,
+                built_packages: Vec::new(),
+                failed_packages: failed_packages_for_atoms(&workorder.atoms, &reason),
+                binhost_uri: state.config.binhost_url.clone(),
+                fetched_distfiles: Default::default(),
+                parity_manifest: ParityManifest::default(),
+            };
+            state.results.write().await.insert(id, result);
+            let _ = tx.send(build_progress(
+                id,
+                &trace_id,
+                BuildEvent::Finished {
+                    built: Vec::new(),
+                    failed: workorder.atoms.clone(),
+                },
+            ));
+            state
+                .metrics
+                .builds_total_duration_secs
+                .fetch_add(build_duration, Ordering::Relaxed);
+            state.metrics.builds_active.fetch_sub(1, Ordering::Relaxed);
+            state
+                .metrics
+                .workorders_failed
+                .fetch_add(1, Ordering::Relaxed);
+            cleanup_workorder_runtime(state, &workorder, id, Some(&container_id)).await;
+            return Ok(());
+        }
+    };
+    let fetched_distfiles = match runtime::ingest_fetched_distfiles(
+        &state.config.state_dir,
+        &staged_runtime.runtime_dir,
+    )
+    .await
+    {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            let reason = format!("Failed to ingest fetched distfiles: {error:#}");
+            set_workorder_status(
+                state,
+                &tx,
+                id,
+                &trace_id,
+                WorkorderStatus::Failed {
+                    reason: reason.clone(),
+                },
+            )
+            .await;
+
+            let result = WorkorderResult {
+                workorder_id: id,
+                built_packages: Vec::new(),
+                failed_packages: failed_packages_for_atoms(&workorder.atoms, &reason),
+                binhost_uri: state.config.binhost_url.clone(),
+                fetched_distfiles: Default::default(),
+                parity_manifest,
+            };
+            state.results.write().await.insert(id, result);
+            let _ = tx.send(build_progress(
+                id,
+                &trace_id,
+                BuildEvent::Finished {
+                    built: Vec::new(),
+                    failed: workorder.atoms.clone(),
+                },
+            ));
+            state
+                .metrics
+                .builds_total_duration_secs
+                .fetch_add(build_duration, Ordering::Relaxed);
+            state.metrics.builds_active.fetch_sub(1, Ordering::Relaxed);
+            state
+                .metrics
+                .workorders_failed
+                .fetch_add(1, Ordering::Relaxed);
+            cleanup_workorder_runtime(state, &workorder, id, Some(&container_id)).await;
+            return Ok(());
+        }
+    };
 
     if matches!(wait_outcome, Ok(0)) {
         set_workorder_status(state, &tx, id, &trace_id, WorkorderStatus::Completed).await;
@@ -725,6 +944,8 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
             },
             failed_packages: failed_atoms,
             binhost_uri: state.config.binhost_url.clone(),
+            fetched_distfiles,
+            parity_manifest,
         };
 
         let built_list: Vec<String> = result
@@ -791,6 +1012,8 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
                 failed_atoms
             },
             binhost_uri: state.config.binhost_url.clone(),
+            fetched_distfiles,
+            parity_manifest,
         };
 
         let built_list: Vec<String> = result

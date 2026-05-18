@@ -116,6 +116,138 @@ INPUT_DEVICES="libinput"
     (tmp, root)
 }
 
+/// Create a temp directory with a local overlay repo and matching distfiles.
+///
+/// Returns `(TempDir, root, overlay_name, distfile_name)`.
+pub fn portage_tree_with_local_overlay() -> (TempDir, PathBuf, String, String) {
+    let (tmp, root) = portage_tree();
+    let portage = root.join("etc/portage");
+
+    let overlay_name = "local-overlay".to_string();
+    let distfile_name = "demo-1.0.tar.xz".to_string();
+    let overlay_root = root.join("var/db/repos").join(&overlay_name);
+    let package_dir = overlay_root.join("dev-libs/demo");
+    let metadata_dir = package_dir.join("metadata");
+    std::fs::create_dir_all(&metadata_dir).unwrap();
+    std::fs::create_dir_all(overlay_root.join("profiles")).unwrap();
+
+    std::fs::write(
+        overlay_root.join("profiles/repo_name"),
+        format!("{overlay_name}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        package_dir.join("demo-1.0.ebuild"),
+        "EAPI=8\nDESCRIPTION=\"demo\"\nSRC_URI=\"https://example.invalid/demo-1.0.tar.xz\"\nSLOT=\"0\"\nKEYWORDS=\"~amd64\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        package_dir.join("Manifest"),
+        format!("DIST {distfile_name} 12 BLAKE2B deadbeef SHA512 cafefood\n"),
+    )
+    .unwrap();
+    std::fs::write(metadata_dir.join("layout.conf"), "masters = gentoo\n").unwrap();
+    std::fs::create_dir_all(overlay_root.join(".git")).unwrap();
+    std::fs::write(overlay_root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    std::fs::write(
+        portage.join("repos.conf/local-overlay.conf"),
+        format!(
+            "[local-overlay]\nlocation = {}\nauto-sync = no\nmasters = gentoo\n",
+            overlay_root.display()
+        ),
+    )
+    .unwrap();
+
+    let distdir = root.join("var/cache/distfiles");
+    std::fs::create_dir_all(&distdir).unwrap();
+    std::fs::write(distdir.join(&distfile_name), b"demo-distfile").unwrap();
+
+    (tmp, root, overlay_name, distfile_name)
+}
+
+/// Create a temp directory with both `/etc/portage/make.conf` and
+/// `/etc/make.conf` populated so tests can verify merged path behavior.
+pub fn portage_tree_with_dual_make_conf() -> (TempDir, PathBuf) {
+    let (tmp, root) = portage_tree();
+
+    std::fs::create_dir_all(root.join("etc")).unwrap();
+    std::fs::write(
+        root.join("etc/make.conf"),
+        r#"CFLAGS="-O3 -pipe"
+ACCEPT_KEYWORDS="~amd64"
+FEATURES="buildpkg test"
+CUSTOM_LEGACY="yes"
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("etc/portage/make.conf"),
+        r#"CFLAGS="-O2 -pipe"
+CXXFLAGS="${CFLAGS}"
+LDFLAGS="-Wl,-O1 -Wl,--as-needed"
+MAKEOPTS="-j4"
+USE="X wayland -systemd"
+FEATURES="buildpkg noclean"
+ACCEPT_LICENSE="-* @FREE"
+ACCEPT_KEYWORDS="amd64"
+EMERGE_DEFAULT_OPTS="--quiet"
+CHOST="x86_64-pc-linux-gnu"
+VIDEO_CARDS="amdgpu"
+INPUT_DEVICES="libinput"
+CUSTOM_PORTAGE="yes"
+"#,
+    )
+    .unwrap();
+
+    (tmp, root)
+}
+
+/// Add nested directory entries under package.use and package.accept_keywords.
+pub fn portage_tree_with_nested_package_dirs() -> (TempDir, PathBuf) {
+    let (tmp, root) = portage_tree();
+    let portage = root.join("etc/portage");
+
+    let nested_use_dir = portage.join("package.use/nested/deeper");
+    std::fs::create_dir_all(&nested_use_dir).unwrap();
+    std::fs::write(
+        nested_use_dir.join("extra"),
+        "media-libs/mesa llvm\nsys-libs/zlib minizip\n",
+    )
+    .unwrap();
+
+    let nested_keywords_dir = portage.join("package.accept_keywords/nested/deeper");
+    std::fs::create_dir_all(&nested_keywords_dir).unwrap();
+    std::fs::write(nested_keywords_dir.join("extra"), "dev-util/re2c ~amd64\n").unwrap();
+
+    (tmp, root)
+}
+
+/// Overwrite the fixture's global ACCEPT_KEYWORDS and package.accept_keywords
+/// content for empty-entry semantics tests.
+pub fn portage_tree_with_empty_accept_keywords(global_accept_keywords: &str) -> (TempDir, PathBuf) {
+    let (tmp, root) = portage_tree();
+    let portage = root.join("etc/portage");
+
+    std::fs::write(
+        portage.join("make.conf"),
+        format!(
+            "CFLAGS=\"-O2 -pipe\"\nCXXFLAGS=\"${{CFLAGS}}\"\nLDFLAGS=\"-Wl,-O1 -Wl,--as-needed\"\nMAKEOPTS=\"-j4\"\nUSE=\"X wayland -systemd\"\nFEATURES=\"buildpkg noclean\"\nACCEPT_LICENSE=\"-* @FREE\"\nACCEPT_KEYWORDS=\"{}\"\nEMERGE_DEFAULT_OPTS=\"\"\nCHOST=\"x86_64-pc-linux-gnu\"\nVIDEO_CARDS=\"amdgpu\"\nINPUT_DEVICES=\"libinput\"\n",
+            global_accept_keywords
+        ),
+    )
+    .unwrap();
+
+    std::fs::write(
+        portage.join("package.accept_keywords/custom"),
+        "sys-kernel/gentoo-sources\n",
+    )
+    .unwrap();
+
+    (tmp, root)
+}
+
 /// Create a temp directory with a populated `/var/db/pkg/` VDB.
 pub fn vdb_tree(packages: &[(&str, &str)]) -> (TempDir, PathBuf) {
     let tmp = TempDir::new().expect("failed to create temp dir");
@@ -143,7 +275,13 @@ pub fn minimal_portage_config() -> PortageConfig {
         package_env: Vec::new(),
         env_files: BTreeMap::new(),
         repos_conf: BTreeMap::new(),
+        snapshot_manifest: Default::default(),
+        repo_snapshots: BTreeMap::new(),
+        repo_snapshot_refs: BTreeMap::new(),
+        repo_snapshot_trees: BTreeMap::new(),
         patches: BTreeMap::new(),
+        distfile_snapshots: BTreeMap::new(),
+        distfile_snapshot_refs: BTreeMap::new(),
         profile_overlay: BTreeMap::new(),
         profile: "default/linux/amd64/23.0".into(),
         world: Vec::new(),
@@ -171,6 +309,15 @@ pub fn full_portage_config() -> PortageConfig {
         "[gentoo]\nlocation = /var/db/repos/gentoo\nsync-type = rsync\n".to_string(),
     );
 
+    let mut repo_snapshots = BTreeMap::new();
+    repo_snapshots.insert(
+        "local-overlay".to_string(),
+        BTreeMap::from([(
+            "dev-libs/demo/demo-1.0.ebuild".to_string(),
+            "EAPI=8\nDESCRIPTION=\"demo\"\n".to_string(),
+        )]),
+    );
+
     let mut patches = BTreeMap::new();
     patches.insert(
         "dev-libs/openssl/fix.patch".to_string(),
@@ -189,6 +336,9 @@ pub fn full_portage_config() -> PortageConfig {
         "no-lto.conf".to_string(),
         "CFLAGS=\"-fno-lto\"\n".to_string(),
     );
+
+    let mut distfile_snapshots = BTreeMap::new();
+    distfile_snapshots.insert("demo-1.0.tar.xz".to_string(), b"demo-distfile".to_vec());
 
     PortageConfig {
         make_conf: MakeConf {
@@ -248,7 +398,13 @@ pub fn full_portage_config() -> PortageConfig {
         }],
         env_files,
         repos_conf,
+        snapshot_manifest: Default::default(),
+        repo_snapshots,
+        repo_snapshot_refs: BTreeMap::new(),
+        repo_snapshot_trees: BTreeMap::new(),
         patches,
+        distfile_snapshots,
+        distfile_snapshot_refs: BTreeMap::new(),
         profile_overlay,
         profile: "default/linux/amd64/23.0".into(),
         world: vec!["dev-libs/openssl".into(), "sys-apps/systemd".into()],

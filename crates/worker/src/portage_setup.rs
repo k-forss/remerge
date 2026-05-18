@@ -35,6 +35,18 @@ pub async fn apply_config(
     write_package_env(config).await?;
     write_env_files(config).await?;
     write_repos_conf(config).await?;
+    restore_staged_snapshots_inner(
+        Path::new("/etc/portage/repos.conf"),
+        Path::new("/var/cache/distfiles"),
+        Path::new("/var/cache/remerge/workorder/snapshots"),
+    )
+    .await?;
+    restore_snapshots_inner(
+        config,
+        Path::new("/etc/portage/repos.conf"),
+        Path::new("/var/cache/distfiles"),
+    )
+    .await?;
     write_profile_overlay(config).await?;
     write_patches(config).await?;
     set_profile(config).await?;
@@ -704,6 +716,241 @@ pub async fn rewrite_repo_location_inner(
     Ok(())
 }
 
+pub async fn restore_snapshots_inner(
+    config: &PortageConfig,
+    repos_conf_base: &Path,
+    distfiles_base: &Path,
+) -> Result<()> {
+    let repo_locations = read_repo_locations(repos_conf_base).await;
+
+    for (repo_name, snapshot) in &config.repo_snapshots {
+        let Some(location) = repo_locations.get(repo_name) else {
+            tracing::warn!(repo = %repo_name, "Repo snapshot has no matching repos.conf location");
+            continue;
+        };
+
+        let repo_root = Path::new(location);
+        for (relative_path, content) in snapshot {
+            use std::path::Component;
+            let has_unsafe_component = Path::new(relative_path)
+                .components()
+                .any(|c| !matches!(c, Component::Normal(_)));
+            if has_unsafe_component || relative_path.is_empty() {
+                tracing::warn!(repo = %repo_name, path = %relative_path, "Skipping repo snapshot file with invalid path");
+                continue;
+            }
+
+            let full_path = repo_root.join(relative_path);
+            if let Some(parent) = full_path.parent() {
+                fs::create_dir_all(parent).await.with_context(|| {
+                    format!(
+                        "Failed to create parent dir for repo snapshot {}",
+                        full_path.display()
+                    )
+                })?;
+            }
+            fs::write(&full_path, content).await.with_context(|| {
+                format!("Failed to write repo snapshot {}", full_path.display())
+            })?;
+        }
+    }
+
+    if !config.distfile_snapshots.is_empty() {
+        fs::create_dir_all(distfiles_base).await.with_context(|| {
+            format!(
+                "Failed to create distfiles dir {}",
+                distfiles_base.display()
+            )
+        })?;
+    }
+    for (filename, bytes) in &config.distfile_snapshots {
+        if !is_valid_distfile_basename(filename) {
+            tracing::warn!(filename, "Skipping distfile snapshot with invalid filename");
+            continue;
+        }
+        let path = distfiles_base.join(filename);
+        fs::write(&path, bytes)
+            .await
+            .with_context(|| format!("Failed to write distfile snapshot {}", path.display()))?;
+    }
+
+    Ok(())
+}
+
+pub async fn restore_staged_snapshots_inner(
+    repos_conf_base: &Path,
+    distfiles_base: &Path,
+    staged_snapshots_base: &Path,
+) -> Result<()> {
+    let repo_locations = read_repo_locations(repos_conf_base).await;
+    let staged_repos_base = staged_snapshots_base.join("repos");
+
+    if let Ok(mut dir) = fs::read_dir(&staged_repos_base).await {
+        while let Ok(Some(entry)) = dir.next_entry().await {
+            let repo_root = entry.path();
+            if !repo_root.is_dir() {
+                continue;
+            }
+
+            let Some(repo_name) = repo_root.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(location) = repo_locations.get(repo_name) else {
+                tracing::warn!(repo = %repo_name, "Staged repo snapshot has no matching repos.conf location");
+                continue;
+            };
+
+            copy_tree_recursive(&repo_root, Path::new(location), &repo_root).await?;
+        }
+    }
+
+    let staged_distfiles_base = staged_snapshots_base.join("distfiles");
+    if let Ok(mut dir) = fs::read_dir(&staged_distfiles_base).await {
+        fs::create_dir_all(distfiles_base).await.with_context(|| {
+            format!(
+                "Failed to create distfiles dir {}",
+                distfiles_base.display()
+            )
+        })?;
+
+        while let Ok(Some(entry)) = dir.next_entry().await {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !is_valid_distfile_basename(filename) {
+                tracing::warn!(filename, "Skipping staged distfile with invalid filename");
+                continue;
+            }
+
+            let destination = distfiles_base.join(filename);
+            fs::copy(&path, &destination).await.with_context(|| {
+                format!(
+                    "Failed to restore staged distfile {} into {}",
+                    path.display(),
+                    destination.display()
+                )
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
+fn is_valid_distfile_basename(filename: &str) -> bool {
+    use std::path::Component;
+
+    if filename.trim().is_empty() {
+        return false;
+    }
+
+    let mut components = Path::new(filename).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
+async fn read_repo_locations(repos_conf_base: &Path) -> std::collections::BTreeMap<String, String> {
+    let mut repo_locations = std::collections::BTreeMap::new();
+
+    if let Ok(mut dir) = fs::read_dir(repos_conf_base).await {
+        while let Ok(Some(entry)) = dir.next_entry().await {
+            let path = entry.path();
+            if path.is_file()
+                && let Ok(content) = fs::read_to_string(&path).await
+            {
+                for section in parse_repo_sections_full(&content) {
+                    repo_locations.insert(section.name, section.location);
+                }
+            }
+        }
+    }
+
+    repo_locations
+}
+
+async fn copy_tree_recursive(
+    source_root: &Path,
+    destination_root: &Path,
+    current: &Path,
+) -> Result<()> {
+    let mut stack = vec![current.to_path_buf()];
+
+    while let Some(dir_path) = stack.pop() {
+        let mut dir = match fs::read_dir(&dir_path).await {
+            Ok(dir) => dir,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to read staged snapshot directory {}",
+                        dir_path.display()
+                    )
+                });
+            }
+        };
+
+        while let Some(entry) = dir.next_entry().await.with_context(|| {
+            format!(
+                "Failed to iterate staged snapshot directory {}",
+                dir_path.display()
+            )
+        })? {
+            let source_path = entry.path();
+            let file_type = entry.file_type().await.with_context(|| {
+                format!(
+                    "Failed to stat staged snapshot path {}",
+                    source_path.display()
+                )
+            })?;
+            let relative = source_path.strip_prefix(source_root).with_context(|| {
+                format!(
+                    "Failed to strip staged snapshot prefix {} from {}",
+                    source_root.display(),
+                    source_path.display()
+                )
+            })?;
+            let destination = destination_root.join(relative);
+
+            if file_type.is_dir() {
+                fs::create_dir_all(&destination).await.with_context(|| {
+                    format!(
+                        "Failed to create staged snapshot dir {}",
+                        destination.display()
+                    )
+                })?;
+                stack.push(source_path);
+                continue;
+            }
+
+            if !file_type.is_file() {
+                continue;
+            }
+
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent).await.with_context(|| {
+                    format!(
+                        "Failed to create parent dir for staged snapshot {}",
+                        destination.display()
+                    )
+                })?;
+            }
+            fs::copy(&source_path, &destination)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to restore staged snapshot {} into {}",
+                        source_path.display(),
+                        destination.display()
+                    )
+                })?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Write the local profile overlay to `/etc/portage/profile/`.
 ///
 /// This directory overrides profile-level settings (USE masks/forces,
@@ -1173,6 +1420,15 @@ sync-type = git
         );
     }
 
+    #[test]
+    fn distfile_basename_validation_allows_literal_double_dot_but_rejects_paths() {
+        assert!(is_valid_distfile_basename("foo..bar.tar.xz"));
+        assert!(is_valid_distfile_basename("hello-1.0.tar.xz"));
+        assert!(!is_valid_distfile_basename("../escape.tar.xz"));
+        assert!(!is_valid_distfile_basename("nested/file.tar.xz"));
+        assert!(!is_valid_distfile_basename(""));
+    }
+
     // ── write_profile_overlay_inner ──────────────────────────────────────────
 
     /// Build a minimal PortageConfig with only `profile_overlay` populated.
@@ -1189,7 +1445,13 @@ sync-type = git
             package_env: vec![],
             env_files: Default::default(),
             repos_conf: Default::default(),
+            snapshot_manifest: Default::default(),
+            repo_snapshots: Default::default(),
+            repo_snapshot_refs: Default::default(),
+            repo_snapshot_trees: Default::default(),
             patches: Default::default(),
+            distfile_snapshots: Default::default(),
+            distfile_snapshot_refs: Default::default(),
             profile_overlay: files
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -1213,10 +1475,16 @@ sync-type = git
             package_env: vec![],
             env_files: Default::default(),
             repos_conf: Default::default(),
+            snapshot_manifest: Default::default(),
+            repo_snapshots: Default::default(),
+            repo_snapshot_refs: Default::default(),
+            repo_snapshot_trees: Default::default(),
             patches: files
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
+            distfile_snapshots: Default::default(),
+            distfile_snapshot_refs: Default::default(),
             profile_overlay: Default::default(),
             profile: String::new(),
             world: vec![],

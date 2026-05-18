@@ -8,9 +8,54 @@
 mod common;
 
 #[cfg(feature = "integration")]
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
+#[cfg(feature = "integration")]
+use remerge::client::RemergeClient;
 #[cfg(feature = "integration")]
 use remerge_types::api::*;
+#[cfg(feature = "integration")]
+use sha2::{Digest, Sha256};
+#[cfg(feature = "integration")]
+use std::collections::BTreeMap;
+#[cfg(feature = "integration")]
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "integration")]
+use std::sync::{Arc, Mutex};
+
+#[cfg(feature = "integration")]
+async fn submit_workorder_for_test(
+    server: &common::server::TestServer,
+    req: &SubmitWorkorderRequest,
+) -> SubmitWorkorderResponse {
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/api/v1/workorders", server.base_url))
+        .json(req)
+        .send()
+        .await
+        .expect("submit workorder request");
+    assert_eq!(resp.status(), 200, "workorder submission should succeed");
+    resp.json::<SubmitWorkorderResponse>()
+        .await
+        .expect("parse submit workorder response")
+}
+
+#[cfg(feature = "integration")]
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+#[cfg(feature = "integration")]
+fn blob_stream_ws_url(base_url: &str) -> String {
+    if let Some(rest) = base_url.strip_prefix("https://") {
+        format!("wss://{rest}/api/v1/snapshots/blobs/stream")
+    } else {
+        format!(
+            "ws://{}/api/v1/snapshots/blobs/stream",
+            base_url.trim_start_matches("http://")
+        )
+    }
+}
 
 /// Sentinel: Docker must be available when running integration tests.
 #[cfg(feature = "integration")]
@@ -389,6 +434,1782 @@ async fn submit_workorder_valid() {
     assert!(
         !submit_resp.progress_ws_url.is_empty(),
         "WebSocket URL should be set"
+    );
+}
+
+/// POST /api/v1/snapshots/missing-blobs reports which digests are absent.
+#[cfg(feature = "integration")]
+#[tokio::test]
+async fn missing_blobs_endpoint_reports_only_absent_digests() {
+    require_docker();
+    let server = common::server::TestServer::start().await;
+
+    let present_bytes = b"present-blob";
+    let present_digest = sha256_hex(present_bytes);
+    let missing_digest = sha256_hex(b"missing-blob");
+    remerge_server::blob_store::store_blob(server.state.config.state_dir.as_path(), present_bytes)
+        .await
+        .expect("store present blob");
+
+    let req = FindMissingBlobsRequest {
+        digests: vec![present_digest.clone(), missing_digest.clone()],
+    };
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "{}/api/v1/snapshots/missing-blobs",
+            server.base_url
+        ))
+        .json(&req)
+        .send()
+        .await
+        .expect("missing-blobs request");
+    assert_eq!(resp.status(), 200);
+
+    let body: FindMissingBlobsResponse = resp.json().await.expect("parse response");
+    assert_eq!(body.missing_digests, vec![missing_digest]);
+}
+
+/// PUT /api/v1/snapshots/blobs/{digest} stores a verified blob and is idempotent.
+#[cfg(feature = "integration")]
+#[tokio::test]
+async fn upload_blob_endpoint_stores_verified_blob() {
+    require_docker();
+    let server = common::server::TestServer::start().await;
+
+    let bytes = b"upload-me";
+    let digest = sha256_hex(bytes);
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .put(format!(
+            "{}/api/v1/snapshots/blobs/{digest}",
+            server.base_url
+        ))
+        .body(bytes.to_vec())
+        .send()
+        .await
+        .expect("upload blob request");
+    assert_eq!(resp.status(), 200);
+    let uploaded: UploadBlobResponse = resp.json().await.expect("parse upload response");
+    assert_eq!(uploaded.digest, digest);
+    assert!(uploaded.uploaded);
+
+    let resp = client
+        .put(format!(
+            "{}/api/v1/snapshots/blobs/{}",
+            server.base_url, uploaded.digest
+        ))
+        .body(bytes.to_vec())
+        .send()
+        .await
+        .expect("second upload blob request");
+    assert_eq!(resp.status(), 200);
+    let second: UploadBlobResponse = resp.json().await.expect("parse second upload response");
+    assert!(!second.uploaded);
+}
+
+/// PUT /api/v1/snapshots/blobs/{digest} rejects mismatched content.
+#[cfg(feature = "integration")]
+#[tokio::test]
+async fn upload_blob_endpoint_rejects_digest_mismatch() {
+    require_docker();
+    let server = common::server::TestServer::start().await;
+
+    let digest = sha256_hex(b"expected-bytes");
+    let client = reqwest::Client::new();
+    let resp = client
+        .put(format!(
+            "{}/api/v1/snapshots/blobs/{digest}",
+            server.base_url
+        ))
+        .body(b"wrong-bytes".to_vec())
+        .send()
+        .await
+        .expect("upload mismatch request");
+    assert_eq!(resp.status(), 400);
+}
+
+/// GET /api/v1/snapshots/blobs/{digest} serves a zstd sidecar when the client accepts it.
+#[cfg(feature = "integration")]
+#[tokio::test]
+async fn download_blob_endpoint_serves_zstd_variant_when_requested() {
+    require_docker();
+    let server = common::server::TestServer::start().await;
+
+    let payload = vec![b'a'; 256 * 1024];
+    let digest = sha256_hex(&payload);
+    remerge_server::blob_store::store_blob(server.state.config.state_dir.as_path(), &payload)
+        .await
+        .expect("store compressible blob");
+    let metadata = remerge_server::blob_store::load_blob_metadata(
+        server.state.config.state_dir.as_path(),
+        &digest,
+    )
+    .await
+    .expect("load blob metadata");
+    assert!(
+        metadata
+            .encoded_variants
+            .contains_key(&remerge_server::blob_store::BlobEncoding::Zstd)
+    );
+
+    let client = reqwest::Client::builder()
+        .no_zstd()
+        .build()
+        .expect("build reqwest client");
+    let resp = client
+        .get(format!(
+            "{}/api/v1/snapshots/blobs/{digest}",
+            server.base_url
+        ))
+        .header(reqwest::header::ACCEPT_ENCODING, "zstd")
+        .send()
+        .await
+        .expect("download blob request");
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get(reqwest::header::CONTENT_ENCODING)
+            .and_then(|value| value.to_str().ok()),
+        Some("zstd")
+    );
+
+    let encoded_bytes = resp.bytes().await.expect("read encoded blob body");
+    let decoded = zstd::stream::decode_all(std::io::Cursor::new(encoded_bytes))
+        .expect("decode zstd blob response");
+    assert_eq!(decoded, payload);
+}
+
+/// GET /api/v1/snapshots/blobs/{digest} falls back to raw bytes when no zstd variant exists.
+#[cfg(feature = "integration")]
+#[tokio::test]
+async fn download_blob_endpoint_falls_back_to_raw_payload() {
+    require_docker();
+    let server = common::server::TestServer::start().await;
+
+    let payload = b"small-raw-blob";
+    let digest = sha256_hex(payload);
+    remerge_server::blob_store::store_blob(server.state.config.state_dir.as_path(), payload)
+        .await
+        .expect("store small blob");
+
+    let client = reqwest::Client::builder()
+        .no_zstd()
+        .build()
+        .expect("build reqwest client");
+    let resp = client
+        .get(format!(
+            "{}/api/v1/snapshots/blobs/{digest}",
+            server.base_url
+        ))
+        .header(reqwest::header::ACCEPT_ENCODING, "zstd")
+        .send()
+        .await
+        .expect("download blob request");
+    assert_eq!(resp.status(), 200);
+    assert!(
+        resp.headers()
+            .get(reqwest::header::CONTENT_ENCODING)
+            .is_none()
+    );
+    assert_eq!(
+        resp.bytes().await.expect("read raw blob body").as_ref(),
+        payload
+    );
+}
+
+/// The CLI blob streamer does not advance send state speculatively when an ack is lost.
+#[cfg(feature = "integration")]
+#[tokio::test]
+async fn blob_stream_client_retries_from_confirmed_resume_point_after_missing_ack() {
+    use axum::{
+        Router,
+        extract::{State, WebSocketUpgrade, ws},
+        response::IntoResponse,
+        routing::get,
+    };
+
+    #[derive(Clone)]
+    struct TestState {
+        attempts: Arc<AtomicUsize>,
+        seen_frames: Arc<Mutex<Vec<(u64, u64)>>>,
+    }
+
+    async fn test_ws_handler(
+        State(state): State<TestState>,
+        ws: WebSocketUpgrade,
+    ) -> impl IntoResponse {
+        ws.on_upgrade(move |socket| async move {
+            let (mut write, mut read) = socket.split();
+
+            let init = read
+                .next()
+                .await
+                .expect("init frame")
+                .expect("init message");
+            let init = match init {
+                ws::Message::Text(text) => {
+                    serde_json::from_str::<SnapshotBlobClientControlMessage>(&text)
+                        .expect("parse upload_init")
+                }
+                other => panic!("expected upload_init text frame, got {other:?}"),
+            };
+            let SnapshotBlobClientControlMessage::UploadInit {
+                version,
+                workorder_id,
+                digest,
+                total_size_bytes,
+                chunk_size_bytes,
+                ..
+            } = init;
+
+            let attempt = state.attempts.fetch_add(1, Ordering::SeqCst);
+            write
+                .send(ws::Message::Text(
+                    serde_json::to_string(&SnapshotBlobServerControlMessage::UploadResume {
+                        version,
+                        workorder_id,
+                        digest: digest.clone(),
+                        next_offset_bytes: 0,
+                        next_sequence: 0,
+                        selected_encoding: None,
+                        expected_size_bytes: total_size_bytes,
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .expect("send upload_resume");
+
+            let chunk = read
+                .next()
+                .await
+                .expect("chunk frame")
+                .expect("chunk message");
+            let chunk = match chunk {
+                ws::Message::Binary(frame) => frame,
+                other => panic!("expected chunk binary frame, got {other:?}"),
+            };
+            let (header, payload) = SnapshotBlobChunkHeader::decode(&chunk).expect("decode chunk");
+            assert_eq!(payload.len() as u64, total_size_bytes);
+            assert_eq!(header.payload_size_bytes, total_size_bytes);
+            assert_eq!(chunk_size_bytes, SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES);
+            state
+                .seen_frames
+                .lock()
+                .unwrap()
+                .push((header.sequence, header.offset_bytes));
+
+            if attempt == 0 {
+                let _ = write.send(ws::Message::Close(None)).await;
+                return;
+            }
+
+            write
+                .send(ws::Message::Text(
+                    serde_json::to_string(&SnapshotBlobServerControlMessage::UploadAck {
+                        version,
+                        workorder_id,
+                        digest: digest.clone(),
+                        sequence: header.sequence,
+                        offset_bytes: header.offset_bytes,
+                        size_bytes: header.payload_size_bytes,
+                        received_bytes: header.payload_size_bytes,
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .expect("send upload_ack");
+            write
+                .send(ws::Message::Text(
+                    serde_json::to_string(&SnapshotBlobServerControlMessage::UploadComplete {
+                        version,
+                        workorder_id,
+                        digest,
+                        uploaded: true,
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .expect("send upload_complete");
+            let _ = write.send(ws::Message::Close(None)).await;
+        })
+    }
+
+    let state = TestState {
+        attempts: Arc::new(AtomicUsize::new(0)),
+        seen_frames: Arc::new(Mutex::new(Vec::new())),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test listener");
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new()
+        .route("/api/v1/snapshots/blobs/stream", get(test_ws_handler))
+        .with_state(state.clone());
+    let server_handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let client = RemergeClient::new(&format!("http://127.0.0.1:{port}")).expect("client");
+    let payload = b"single-chunk-payload";
+    let digest = sha256_hex(payload);
+    let uploaded = client
+        .stream_upload_blob(&digest, payload)
+        .await
+        .expect("stream upload after reconnect");
+    assert!(uploaded);
+
+    let seen_frames = state.seen_frames.lock().unwrap().clone();
+    assert_eq!(seen_frames, vec![(0, 0), (0, 0)]);
+    assert_eq!(state.attempts.load(Ordering::SeqCst), 2);
+
+    server_handle.abort();
+}
+
+/// The CLI blob streamer adapts chunk size: starts at 10 MiB, shrinks after a slow ack,
+/// and only grows again after a stable run of healthy acknowledgements.
+#[cfg(feature = "integration")]
+#[tokio::test]
+async fn blob_stream_client_adapts_chunk_size_after_slow_ack() {
+    use axum::{
+        Router,
+        extract::{State, WebSocketUpgrade, ws},
+        response::IntoResponse,
+        routing::get,
+    };
+    use tokio::time::Duration;
+
+    #[derive(Clone)]
+    struct TestState {
+        chunk_sizes: Arc<Mutex<Vec<u64>>>,
+    }
+
+    async fn test_ws_handler(
+        State(state): State<TestState>,
+        ws: WebSocketUpgrade,
+    ) -> impl IntoResponse {
+        ws.on_upgrade(move |socket| async move {
+            let (mut write, mut read) = socket.split();
+
+            let init = read
+                .next()
+                .await
+                .expect("init frame")
+                .expect("init message");
+            let init = match init {
+                ws::Message::Text(text) => {
+                    serde_json::from_str::<SnapshotBlobClientControlMessage>(&text)
+                        .expect("parse upload_init")
+                }
+                other => panic!("expected upload_init text frame, got {other:?}"),
+            };
+            let SnapshotBlobClientControlMessage::UploadInit {
+                version,
+                workorder_id,
+                digest,
+                total_size_bytes,
+                ..
+            } = init;
+
+            write
+                .send(ws::Message::Text(
+                    serde_json::to_string(&SnapshotBlobServerControlMessage::UploadResume {
+                        version,
+                        workorder_id,
+                        digest: digest.clone(),
+                        next_offset_bytes: 0,
+                        next_sequence: 0,
+                        selected_encoding: None,
+                        expected_size_bytes: total_size_bytes,
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .expect("send upload_resume");
+
+            let mut received_bytes = 0u64;
+            let mut chunk_index = 0u64;
+            while received_bytes < total_size_bytes {
+                let frame = read
+                    .next()
+                    .await
+                    .expect("chunk frame")
+                    .expect("chunk message");
+                let frame = match frame {
+                    ws::Message::Binary(frame) => frame,
+                    other => panic!("expected chunk binary frame, got {other:?}"),
+                };
+                let (header, payload) =
+                    SnapshotBlobChunkHeader::decode(&frame).expect("decode chunk");
+                assert_eq!(header.sequence, chunk_index);
+                assert_eq!(header.offset_bytes, received_bytes);
+                received_bytes += payload.len() as u64;
+                state.chunk_sizes.lock().unwrap().push(payload.len() as u64);
+
+                if chunk_index == 0 {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+
+                write
+                    .send(ws::Message::Text(
+                        serde_json::to_string(&SnapshotBlobServerControlMessage::UploadAck {
+                            version,
+                            workorder_id,
+                            digest: digest.clone(),
+                            sequence: header.sequence,
+                            offset_bytes: header.offset_bytes,
+                            size_bytes: payload.len() as u64,
+                            received_bytes,
+                        })
+                        .unwrap()
+                        .into(),
+                    ))
+                    .await
+                    .expect("send upload_ack");
+                chunk_index += 1;
+            }
+
+            write
+                .send(ws::Message::Text(
+                    serde_json::to_string(&SnapshotBlobServerControlMessage::UploadComplete {
+                        version,
+                        workorder_id,
+                        digest,
+                        uploaded: true,
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .expect("send upload_complete");
+            let _ = write.send(ws::Message::Close(None)).await;
+        })
+    }
+
+    let state = TestState {
+        chunk_sizes: Arc::new(Mutex::new(Vec::new())),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test listener");
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new()
+        .route("/api/v1/snapshots/blobs/stream", get(test_ws_handler))
+        .with_state(state.clone());
+    let server_handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let client = RemergeClient::new(&format!("http://127.0.0.1:{port}")).expect("client");
+    let ten_mib = SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES as usize;
+    let payload_len = ten_mib * 3;
+    let payload: Vec<u8> = (0..payload_len).map(|idx| (idx % 233) as u8).collect();
+    let digest = sha256_hex(&payload);
+    let uploaded = client
+        .stream_upload_blob(&digest, &payload)
+        .await
+        .expect("adaptive stream upload");
+    assert!(uploaded);
+
+    let observed = state.chunk_sizes.lock().unwrap().clone();
+    assert_eq!(
+        observed,
+        vec![
+            SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES,
+            SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES / 2,
+            SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES / 2,
+            SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES,
+        ]
+    );
+
+    server_handle.abort();
+}
+
+/// Websocket blob streaming uploads multi-chunk blobs and remains idempotent.
+#[cfg(feature = "integration")]
+#[tokio::test]
+async fn blob_stream_endpoint_uploads_verified_blob_in_chunks() {
+    require_docker();
+    let server = common::server::TestServer::start().await;
+    let client = RemergeClient::new(&server.base_url).expect("client");
+
+    let payload_len = SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES as usize + 8192;
+    let payload: Vec<u8> = (0..payload_len).map(|idx| (idx % 251) as u8).collect();
+    let digest = sha256_hex(&payload);
+
+    let uploaded = client
+        .stream_upload_blob(&digest, &payload)
+        .await
+        .expect("stream upload blob");
+    assert!(uploaded, "the first stream upload should store the blob");
+
+    let stored_path =
+        remerge_server::blob_store::blob_path(server.state.config.state_dir.as_path(), &digest)
+            .expect("blob path");
+    assert_eq!(tokio::fs::read(&stored_path).await.unwrap(), payload);
+
+    let uploaded_again = client
+        .stream_upload_blob(&digest, &payload)
+        .await
+        .expect("second stream upload blob");
+    assert!(
+        !uploaded_again,
+        "stream upload should be idempotent when the blob already exists"
+    );
+}
+
+/// Websocket blob streaming may negotiate zstd transport while keeping the raw digest canonical.
+#[cfg(feature = "integration")]
+#[tokio::test]
+async fn blob_stream_endpoint_negotiates_zstd_upload_and_preserves_raw_digest() {
+    require_docker();
+    let server = common::server::TestServer::start().await;
+    let client = RemergeClient::new(&server.base_url).expect("client");
+
+    let payload = vec![b'a'; 256 * 1024];
+    let digest = sha256_hex(&payload);
+    let uploaded = client
+        .stream_upload_blob(&digest, &payload)
+        .await
+        .expect("stream upload with zstd negotiation");
+    assert!(uploaded);
+
+    let stored_path =
+        remerge_server::blob_store::blob_path(server.state.config.state_dir.as_path(), &digest)
+            .expect("blob path");
+    let stored_metadata = remerge_server::blob_store::load_blob_metadata(
+        server.state.config.state_dir.as_path(),
+        &digest,
+    )
+    .await
+    .expect("blob metadata");
+
+    assert_eq!(tokio::fs::read(&stored_path).await.unwrap(), payload);
+    assert!(
+        stored_metadata
+            .encoded_variants
+            .contains_key(&remerge_server::blob_store::BlobEncoding::Zstd)
+    );
+}
+
+/// Websocket blob streaming rejects corrupted chunk payloads.
+#[cfg(feature = "integration")]
+#[tokio::test]
+async fn blob_stream_endpoint_rejects_invalid_chunk_checksum() {
+    require_docker();
+    let server = common::server::TestServer::start().await;
+
+    let payload = b"expected-payload";
+    let digest = sha256_hex(payload);
+    let workorder_id = uuid::Uuid::new_v4();
+    let ws_url = blob_stream_ws_url(&server.base_url);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("connect blob stream websocket");
+
+    let init = SnapshotBlobClientControlMessage::UploadInit {
+        version: SNAPSHOT_BLOB_PROTOCOL_VERSION,
+        workorder_id,
+        digest: digest.clone(),
+        total_size_bytes: payload.len() as u64,
+        chunk_size_bytes: SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES,
+        capability_flags: Vec::new(),
+        offered_encodings: Vec::new(),
+    };
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&init).unwrap().into(),
+    ))
+    .await
+    .expect("send upload init");
+
+    let resume = ws
+        .next()
+        .await
+        .expect("resume frame")
+        .expect("resume websocket message");
+    let resume = match resume {
+        tokio_tungstenite::tungstenite::Message::Text(text) => {
+            serde_json::from_str::<SnapshotBlobServerControlMessage>(&text).unwrap()
+        }
+        other => panic!("expected text resume frame, got {other:?}"),
+    };
+    assert!(matches!(
+        resume,
+        SnapshotBlobServerControlMessage::UploadResume {
+            version: SNAPSHOT_BLOB_PROTOCOL_VERSION,
+            workorder_id: id,
+            digest: ref response_digest,
+            next_offset_bytes: 0,
+            next_sequence: 0,
+            selected_encoding: None,
+            expected_size_bytes,
+        } if id == workorder_id
+            && response_digest == &digest
+            && expected_size_bytes == payload.len() as u64
+    ));
+
+    let header = SnapshotBlobChunkHeader::from_payload(0, 0, payload);
+    let mut frame = header
+        .encode_with_payload(payload)
+        .expect("encode payload frame");
+    let last = frame.len() - 1;
+    frame[last] ^= 0x7f;
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Binary(
+        frame.into(),
+    ))
+    .await
+    .expect("send corrupted chunk");
+
+    let error_frame = ws
+        .next()
+        .await
+        .expect("error frame")
+        .expect("error websocket message");
+    let error = match error_frame {
+        tokio_tungstenite::tungstenite::Message::Text(text) => {
+            serde_json::from_str::<SnapshotBlobServerControlMessage>(&text).unwrap()
+        }
+        other => panic!("expected text error frame, got {other:?}"),
+    };
+
+    match error {
+        SnapshotBlobServerControlMessage::UploadError {
+            version,
+            workorder_id: Some(id),
+            digest: Some(response_digest),
+            code,
+            message,
+        } => {
+            assert_eq!(version, SNAPSHOT_BLOB_PROTOCOL_VERSION);
+            assert_eq!(id, workorder_id);
+            assert_eq!(response_digest, digest);
+            assert_eq!(code, "invalid_chunk_frame");
+            assert!(
+                message.contains("checksum mismatch"),
+                "unexpected message: {message}"
+            );
+        }
+        other => panic!("expected upload_error, got {other:?}"),
+    }
+}
+
+/// Websocket blob streaming resumes from the last acknowledged offset after reconnect.
+#[cfg(feature = "integration")]
+#[tokio::test]
+async fn blob_stream_endpoint_resumes_after_disconnect() {
+    require_docker();
+    let server = common::server::TestServer::start().await;
+
+    let chunk_size = SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES as usize;
+    let payload_len = chunk_size + 4096;
+    let payload: Vec<u8> = (0..payload_len).map(|idx| (idx % 241) as u8).collect();
+    let digest = sha256_hex(&payload);
+    let workorder_id = uuid::Uuid::new_v4();
+    let ws_url = blob_stream_ws_url(&server.base_url);
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("connect blob stream websocket");
+    let init = SnapshotBlobClientControlMessage::UploadInit {
+        version: SNAPSHOT_BLOB_PROTOCOL_VERSION,
+        workorder_id,
+        digest: digest.clone(),
+        total_size_bytes: payload.len() as u64,
+        chunk_size_bytes: SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES,
+        capability_flags: Vec::new(),
+        offered_encodings: Vec::new(),
+    };
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&init).unwrap().into(),
+    ))
+    .await
+    .expect("send upload init");
+
+    let first_resume = ws
+        .next()
+        .await
+        .expect("resume frame")
+        .expect("resume message");
+    let first_resume = match first_resume {
+        tokio_tungstenite::tungstenite::Message::Text(text) => {
+            serde_json::from_str::<SnapshotBlobServerControlMessage>(&text).unwrap()
+        }
+        other => panic!("expected text resume frame, got {other:?}"),
+    };
+    assert!(matches!(
+        first_resume,
+        SnapshotBlobServerControlMessage::UploadResume {
+            version: SNAPSHOT_BLOB_PROTOCOL_VERSION,
+            workorder_id: id,
+            digest: ref response_digest,
+            next_offset_bytes: 0,
+            next_sequence: 0,
+            selected_encoding: None,
+            expected_size_bytes,
+        } if id == workorder_id
+            && response_digest == &digest
+            && expected_size_bytes == payload.len() as u64
+    ));
+
+    let first_chunk = &payload[..chunk_size];
+    let frame = SnapshotBlobChunkHeader::from_payload(0, 0, first_chunk)
+        .encode_with_payload(first_chunk)
+        .expect("encode first chunk");
+    ws.send(tokio_tungstenite::tungstenite::Message::Binary(
+        frame.into(),
+    ))
+    .await
+    .expect("send first chunk");
+
+    let first_ack = ws.next().await.expect("ack frame").expect("ack message");
+    let first_ack = match first_ack {
+        tokio_tungstenite::tungstenite::Message::Text(text) => {
+            serde_json::from_str::<SnapshotBlobServerControlMessage>(&text).unwrap()
+        }
+        other => panic!("expected text ack frame, got {other:?}"),
+    };
+    assert!(matches!(
+        first_ack,
+        SnapshotBlobServerControlMessage::UploadAck {
+            version: SNAPSHOT_BLOB_PROTOCOL_VERSION,
+            workorder_id: id,
+            digest: ref response_digest,
+            sequence: 0,
+            offset_bytes: 0,
+            size_bytes,
+            received_bytes,
+        } if id == workorder_id
+            && response_digest == &digest
+            && size_bytes == chunk_size as u64
+            && received_bytes == chunk_size as u64
+    ));
+    ws.close(None).await.expect("close first websocket");
+
+    let (mut resumed_ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("reconnect blob stream websocket");
+    resumed_ws
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&init).unwrap().into(),
+        ))
+        .await
+        .expect("send resumed upload init");
+
+    let resumed = resumed_ws
+        .next()
+        .await
+        .expect("resumed frame")
+        .expect("resumed message");
+    let resumed = match resumed {
+        tokio_tungstenite::tungstenite::Message::Text(text) => {
+            serde_json::from_str::<SnapshotBlobServerControlMessage>(&text).unwrap()
+        }
+        other => panic!("expected text resumed frame, got {other:?}"),
+    };
+    assert!(matches!(
+        resumed,
+        SnapshotBlobServerControlMessage::UploadResume {
+            version: SNAPSHOT_BLOB_PROTOCOL_VERSION,
+            workorder_id: id,
+            digest: ref response_digest,
+            next_offset_bytes,
+            next_sequence,
+            selected_encoding: None,
+            expected_size_bytes,
+        } if id == workorder_id
+            && response_digest == &digest
+            && next_offset_bytes == chunk_size as u64
+            && next_sequence == 1
+            && expected_size_bytes == payload.len() as u64
+    ));
+
+    let remaining = &payload[chunk_size..];
+    let resumed_frame = SnapshotBlobChunkHeader::from_payload(1, chunk_size as u64, remaining)
+        .encode_with_payload(remaining)
+        .expect("encode resumed chunk");
+    resumed_ws
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            resumed_frame.into(),
+        ))
+        .await
+        .expect("send resumed chunk");
+
+    let resumed_ack = resumed_ws
+        .next()
+        .await
+        .expect("resumed ack frame")
+        .expect("resumed ack message");
+    let resumed_ack = match resumed_ack {
+        tokio_tungstenite::tungstenite::Message::Text(text) => {
+            serde_json::from_str::<SnapshotBlobServerControlMessage>(&text).unwrap()
+        }
+        other => panic!("expected text resumed ack frame, got {other:?}"),
+    };
+    assert!(matches!(
+        resumed_ack,
+        SnapshotBlobServerControlMessage::UploadAck {
+            version: SNAPSHOT_BLOB_PROTOCOL_VERSION,
+            workorder_id: id,
+            digest: ref response_digest,
+            sequence: 1,
+            offset_bytes,
+            size_bytes,
+            received_bytes,
+        } if id == workorder_id
+            && response_digest == &digest
+            && offset_bytes == chunk_size as u64
+            && size_bytes == remaining.len() as u64
+            && received_bytes == payload.len() as u64
+    ));
+
+    let complete = resumed_ws
+        .next()
+        .await
+        .expect("complete frame")
+        .expect("complete message");
+    let complete = match complete {
+        tokio_tungstenite::tungstenite::Message::Text(text) => {
+            serde_json::from_str::<SnapshotBlobServerControlMessage>(&text).unwrap()
+        }
+        other => panic!("expected text complete frame, got {other:?}"),
+    };
+    assert!(matches!(
+        complete,
+        SnapshotBlobServerControlMessage::UploadComplete {
+            version: SNAPSHOT_BLOB_PROTOCOL_VERSION,
+            workorder_id: id,
+            digest: ref response_digest,
+            uploaded: true,
+        } if id == workorder_id && response_digest == &digest
+    ));
+
+    let stored_path =
+        remerge_server::blob_store::blob_path(server.state.config.state_dir.as_path(), &digest)
+            .expect("blob path");
+    assert_eq!(tokio::fs::read(&stored_path).await.unwrap(), payload);
+}
+
+/// Websocket blob streaming resumes with the exact next sequence after smaller
+/// chunks have already advanced the stream past the initial 10 MiB stride.
+#[cfg(feature = "integration")]
+#[tokio::test]
+async fn blob_stream_endpoint_resumes_after_shrunk_chunks() {
+    require_docker();
+    let server = common::server::TestServer::start().await;
+
+    let default_chunk = SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES as usize;
+    let shrunk_chunk = default_chunk / 4;
+    let payload_len = default_chunk + shrunk_chunk + shrunk_chunk + 4096;
+    let payload: Vec<u8> = (0..payload_len).map(|idx| (idx % 239) as u8).collect();
+    let digest = sha256_hex(&payload);
+    let workorder_id = uuid::Uuid::new_v4();
+    let ws_url = blob_stream_ws_url(&server.base_url);
+
+    let init = SnapshotBlobClientControlMessage::UploadInit {
+        version: SNAPSHOT_BLOB_PROTOCOL_VERSION,
+        workorder_id,
+        digest: digest.clone(),
+        total_size_bytes: payload.len() as u64,
+        chunk_size_bytes: SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES,
+        capability_flags: Vec::new(),
+        offered_encodings: Vec::new(),
+    };
+
+    let (mut first_ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("connect first blob stream websocket");
+    first_ws
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&init).unwrap().into(),
+        ))
+        .await
+        .expect("send first upload init");
+
+    let first_resume = first_ws
+        .next()
+        .await
+        .expect("first resume frame")
+        .expect("first resume message");
+    let first_resume = match first_resume {
+        tokio_tungstenite::tungstenite::Message::Text(text) => {
+            serde_json::from_str::<SnapshotBlobServerControlMessage>(&text).unwrap()
+        }
+        other => panic!("expected text first resume frame, got {other:?}"),
+    };
+    assert!(matches!(
+        first_resume,
+        SnapshotBlobServerControlMessage::UploadResume {
+            next_offset_bytes: 0,
+            next_sequence: 0,
+            ..
+        }
+    ));
+
+    for (sequence, offset, end) in [
+        (0u64, 0usize, default_chunk),
+        (1u64, default_chunk, default_chunk + shrunk_chunk),
+        (
+            2u64,
+            default_chunk + shrunk_chunk,
+            default_chunk + shrunk_chunk + shrunk_chunk,
+        ),
+    ] {
+        let chunk = &payload[offset..end];
+        let frame = SnapshotBlobChunkHeader::from_payload(sequence, offset as u64, chunk)
+            .encode_with_payload(chunk)
+            .expect("encode upload chunk");
+        first_ws
+            .send(tokio_tungstenite::tungstenite::Message::Binary(
+                frame.into(),
+            ))
+            .await
+            .expect("send upload chunk");
+
+        let ack = first_ws
+            .next()
+            .await
+            .expect("ack frame")
+            .expect("ack message");
+        let ack = match ack {
+            tokio_tungstenite::tungstenite::Message::Text(text) => {
+                serde_json::from_str::<SnapshotBlobServerControlMessage>(&text).unwrap()
+            }
+            other => panic!("expected text ack frame, got {other:?}"),
+        };
+        assert!(matches!(
+            ack,
+            SnapshotBlobServerControlMessage::UploadAck {
+                sequence: ack_sequence,
+                offset_bytes,
+                received_bytes,
+                ..
+            } if ack_sequence == sequence
+                && offset_bytes == offset as u64
+                && received_bytes == end as u64
+        ));
+    }
+    first_ws.close(None).await.expect("close first websocket");
+
+    let resumed_offset = (default_chunk + shrunk_chunk + shrunk_chunk) as u64;
+    let (mut resumed_ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("reconnect blob stream websocket");
+    resumed_ws
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&init).unwrap().into(),
+        ))
+        .await
+        .expect("send resumed upload init");
+
+    let resumed = resumed_ws
+        .next()
+        .await
+        .expect("resumed frame")
+        .expect("resumed message");
+    let resumed = match resumed {
+        tokio_tungstenite::tungstenite::Message::Text(text) => {
+            serde_json::from_str::<SnapshotBlobServerControlMessage>(&text).unwrap()
+        }
+        other => panic!("expected text resumed frame, got {other:?}"),
+    };
+    assert!(matches!(
+        resumed,
+        SnapshotBlobServerControlMessage::UploadResume {
+            version: SNAPSHOT_BLOB_PROTOCOL_VERSION,
+            workorder_id: id,
+            digest: ref response_digest,
+            next_offset_bytes,
+            next_sequence,
+            selected_encoding: None,
+            expected_size_bytes,
+        } if id == workorder_id
+            && response_digest == &digest
+            && next_offset_bytes == resumed_offset
+            && next_sequence == 3
+            && expected_size_bytes == payload.len() as u64
+    ));
+
+    let final_chunk = &payload[resumed_offset as usize..];
+    let final_frame = SnapshotBlobChunkHeader::from_payload(3, resumed_offset, final_chunk)
+        .encode_with_payload(final_chunk)
+        .expect("encode final upload chunk");
+    resumed_ws
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            final_frame.into(),
+        ))
+        .await
+        .expect("send final upload chunk");
+
+    let final_ack = resumed_ws
+        .next()
+        .await
+        .expect("final ack frame")
+        .expect("final ack message");
+    let final_ack = match final_ack {
+        tokio_tungstenite::tungstenite::Message::Text(text) => {
+            serde_json::from_str::<SnapshotBlobServerControlMessage>(&text).unwrap()
+        }
+        other => panic!("expected text final ack frame, got {other:?}"),
+    };
+    assert!(matches!(
+        final_ack,
+        SnapshotBlobServerControlMessage::UploadAck {
+            sequence: 3,
+            offset_bytes,
+            received_bytes,
+            ..
+        } if offset_bytes == resumed_offset && received_bytes == payload.len() as u64
+    ));
+
+    let complete = resumed_ws
+        .next()
+        .await
+        .expect("complete frame")
+        .expect("complete message");
+    let complete = match complete {
+        tokio_tungstenite::tungstenite::Message::Text(text) => {
+            serde_json::from_str::<SnapshotBlobServerControlMessage>(&text).unwrap()
+        }
+        other => panic!("expected text complete frame, got {other:?}"),
+    };
+    assert!(matches!(
+        complete,
+        SnapshotBlobServerControlMessage::UploadComplete {
+            version: SNAPSHOT_BLOB_PROTOCOL_VERSION,
+            workorder_id: id,
+            digest: ref response_digest,
+            uploaded: true,
+        } if id == workorder_id && response_digest == &digest
+    ));
+
+    let stored_path =
+        remerge_server::blob_store::blob_path(server.state.config.state_dir.as_path(), &digest)
+            .expect("blob path");
+    assert_eq!(tokio::fs::read(&stored_path).await.unwrap(), payload);
+}
+
+/// Websocket blob streaming rejects duplicate replay outside the confirmed resume point.
+#[cfg(feature = "integration")]
+#[tokio::test]
+async fn blob_stream_endpoint_rejects_duplicate_replay_outside_resume_point() {
+    require_docker();
+    let server = common::server::TestServer::start().await;
+
+    let chunk_size = SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES as usize;
+    let payload_len = chunk_size + 2048;
+    let payload: Vec<u8> = (0..payload_len).map(|idx| (idx % 239) as u8).collect();
+    let digest = sha256_hex(&payload);
+    let workorder_id = uuid::Uuid::new_v4();
+    let ws_url = blob_stream_ws_url(&server.base_url);
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("connect blob stream websocket");
+    let init = SnapshotBlobClientControlMessage::UploadInit {
+        version: SNAPSHOT_BLOB_PROTOCOL_VERSION,
+        workorder_id,
+        digest: digest.clone(),
+        total_size_bytes: payload.len() as u64,
+        chunk_size_bytes: SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES,
+        capability_flags: Vec::new(),
+        offered_encodings: Vec::new(),
+    };
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&init).unwrap().into(),
+    ))
+    .await
+    .expect("send upload init");
+
+    let _ = ws
+        .next()
+        .await
+        .expect("resume frame")
+        .expect("resume message");
+    let first_chunk = &payload[..chunk_size];
+    let frame = SnapshotBlobChunkHeader::from_payload(0, 0, first_chunk)
+        .encode_with_payload(first_chunk)
+        .expect("encode first chunk");
+    ws.send(tokio_tungstenite::tungstenite::Message::Binary(
+        frame.into(),
+    ))
+    .await
+    .expect("send first chunk");
+    let _ = ws.next().await.expect("ack frame").expect("ack message");
+    ws.close(None).await.expect("close first websocket");
+
+    let (mut resumed_ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("reconnect blob stream websocket");
+    resumed_ws
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&init).unwrap().into(),
+        ))
+        .await
+        .expect("send resumed upload init");
+
+    let resumed = resumed_ws
+        .next()
+        .await
+        .expect("resumed frame")
+        .expect("resumed message");
+    let resumed = match resumed {
+        tokio_tungstenite::tungstenite::Message::Text(text) => {
+            serde_json::from_str::<SnapshotBlobServerControlMessage>(&text).unwrap()
+        }
+        other => panic!("expected text resumed frame, got {other:?}"),
+    };
+    assert!(matches!(
+        resumed,
+        SnapshotBlobServerControlMessage::UploadResume {
+            next_offset_bytes,
+            next_sequence,
+            selected_encoding: None,
+            expected_size_bytes,
+            ..
+        } if next_offset_bytes == chunk_size as u64
+            && next_sequence == 1
+            && expected_size_bytes == payload.len() as u64
+    ));
+
+    let duplicate_frame = SnapshotBlobChunkHeader::from_payload(0, 0, first_chunk)
+        .encode_with_payload(first_chunk)
+        .expect("encode duplicate chunk");
+    resumed_ws
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            duplicate_frame.into(),
+        ))
+        .await
+        .expect("send duplicate replay chunk");
+
+    let error_frame = resumed_ws
+        .next()
+        .await
+        .expect("error frame")
+        .expect("error message");
+    let error = match error_frame {
+        tokio_tungstenite::tungstenite::Message::Text(text) => {
+            serde_json::from_str::<SnapshotBlobServerControlMessage>(&text).unwrap()
+        }
+        other => panic!("expected text error frame, got {other:?}"),
+    };
+    match error {
+        SnapshotBlobServerControlMessage::UploadError {
+            version,
+            workorder_id: Some(id),
+            digest: Some(response_digest),
+            code,
+            message,
+        } => {
+            assert_eq!(version, SNAPSHOT_BLOB_PROTOCOL_VERSION);
+            assert_eq!(id, workorder_id);
+            assert_eq!(response_digest, digest);
+            assert_eq!(code, "unexpected_sequence");
+            assert!(message.contains("Expected chunk sequence 1, got 0"));
+        }
+        other => panic!("expected upload_error, got {other:?}"),
+    }
+}
+
+/// Websocket blob streaming rejects chunks that would exceed the negotiated blob length.
+#[cfg(feature = "integration")]
+#[tokio::test]
+async fn blob_stream_endpoint_rejects_payload_beyond_declared_length() {
+    require_docker();
+    let server = common::server::TestServer::start().await;
+
+    let payload = b"declared";
+    let digest = sha256_hex(payload);
+    let workorder_id = uuid::Uuid::new_v4();
+    let ws_url = blob_stream_ws_url(&server.base_url);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("connect blob stream websocket");
+
+    let init = SnapshotBlobClientControlMessage::UploadInit {
+        version: SNAPSHOT_BLOB_PROTOCOL_VERSION,
+        workorder_id,
+        digest: digest.clone(),
+        total_size_bytes: payload.len() as u64,
+        chunk_size_bytes: SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES,
+        capability_flags: Vec::new(),
+        offered_encodings: Vec::new(),
+    };
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&init).unwrap().into(),
+    ))
+    .await
+    .expect("send upload init");
+
+    let _ = ws
+        .next()
+        .await
+        .expect("resume frame")
+        .expect("resume message");
+
+    let oversized_payload = b"declared-and-extra";
+    let oversized_frame = SnapshotBlobChunkHeader::from_payload(0, 0, oversized_payload)
+        .encode_with_payload(oversized_payload)
+        .expect("encode oversized chunk");
+    ws.send(tokio_tungstenite::tungstenite::Message::Binary(
+        oversized_frame.into(),
+    ))
+    .await
+    .expect("send oversized chunk");
+
+    let error_frame = ws
+        .next()
+        .await
+        .expect("error frame")
+        .expect("error message");
+    let error = match error_frame {
+        tokio_tungstenite::tungstenite::Message::Text(text) => {
+            serde_json::from_str::<SnapshotBlobServerControlMessage>(&text).unwrap()
+        }
+        other => panic!("expected text error frame, got {other:?}"),
+    };
+
+    match error {
+        SnapshotBlobServerControlMessage::UploadError {
+            version,
+            workorder_id: Some(id),
+            digest: Some(response_digest),
+            code,
+            message,
+        } => {
+            assert_eq!(version, SNAPSHOT_BLOB_PROTOCOL_VERSION);
+            assert_eq!(id, workorder_id);
+            assert_eq!(response_digest, digest);
+            assert_eq!(code, "blob_too_large");
+            assert!(message.contains("exceeds the declared blob length"));
+        }
+        other => panic!("expected upload_error, got {other:?}"),
+    }
+}
+
+/// Websocket blob streaming rejects overlapping byte ranges outside the confirmed resume offset.
+#[cfg(feature = "integration")]
+#[tokio::test]
+async fn blob_stream_endpoint_rejects_overlapping_offset_outside_resume_point() {
+    require_docker();
+    let server = common::server::TestServer::start().await;
+
+    let chunk_size = SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES as usize;
+    let payload_len = chunk_size + 2048;
+    let payload: Vec<u8> = (0..payload_len).map(|idx| (idx % 227) as u8).collect();
+    let digest = sha256_hex(&payload);
+    let workorder_id = uuid::Uuid::new_v4();
+    let ws_url = blob_stream_ws_url(&server.base_url);
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("connect blob stream websocket");
+    let init = SnapshotBlobClientControlMessage::UploadInit {
+        version: SNAPSHOT_BLOB_PROTOCOL_VERSION,
+        workorder_id,
+        digest: digest.clone(),
+        total_size_bytes: payload.len() as u64,
+        chunk_size_bytes: SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES,
+        capability_flags: Vec::new(),
+        offered_encodings: Vec::new(),
+    };
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&init).unwrap().into(),
+    ))
+    .await
+    .expect("send upload init");
+
+    let _ = ws
+        .next()
+        .await
+        .expect("resume frame")
+        .expect("resume message");
+    let first_chunk = &payload[..chunk_size];
+    let first_frame = SnapshotBlobChunkHeader::from_payload(0, 0, first_chunk)
+        .encode_with_payload(first_chunk)
+        .expect("encode first chunk");
+    ws.send(tokio_tungstenite::tungstenite::Message::Binary(
+        first_frame.into(),
+    ))
+    .await
+    .expect("send first chunk");
+    let _ = ws.next().await.expect("ack frame").expect("ack message");
+    ws.close(None).await.expect("close first websocket");
+
+    let (mut resumed_ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("reconnect blob stream websocket");
+    resumed_ws
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&init).unwrap().into(),
+        ))
+        .await
+        .expect("send resumed upload init");
+    let _ = resumed_ws
+        .next()
+        .await
+        .expect("resumed frame")
+        .expect("resumed message");
+
+    let overlap_offset = (chunk_size / 2) as u64;
+    let overlapping_chunk = &payload[chunk_size / 2..chunk_size];
+    let overlapping_frame =
+        SnapshotBlobChunkHeader::from_payload(1, overlap_offset, overlapping_chunk)
+            .encode_with_payload(overlapping_chunk)
+            .expect("encode overlapping chunk");
+    resumed_ws
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            overlapping_frame.into(),
+        ))
+        .await
+        .expect("send overlapping chunk");
+
+    let error_frame = resumed_ws
+        .next()
+        .await
+        .expect("error frame")
+        .expect("error message");
+    let error = match error_frame {
+        tokio_tungstenite::tungstenite::Message::Text(text) => {
+            serde_json::from_str::<SnapshotBlobServerControlMessage>(&text).unwrap()
+        }
+        other => panic!("expected text error frame, got {other:?}"),
+    };
+
+    match error {
+        SnapshotBlobServerControlMessage::UploadError {
+            version,
+            workorder_id: Some(id),
+            digest: Some(response_digest),
+            code,
+            message,
+        } => {
+            assert_eq!(version, SNAPSHOT_BLOB_PROTOCOL_VERSION);
+            assert_eq!(id, workorder_id);
+            assert_eq!(response_digest, digest);
+            assert_eq!(code, "unexpected_offset");
+            assert!(message.contains(&format!(
+                "Expected chunk offset {}, got {}",
+                chunk_size, overlap_offset
+            )));
+        }
+        other => panic!("expected upload_error, got {other:?}"),
+    }
+}
+
+/// Client-side manifest negotiation only uploads missing blobs and refs-only
+/// submission is enough for the server to materialize runtime snapshots.
+#[cfg(feature = "integration")]
+#[tokio::test]
+async fn refs_only_submission_materializes_uploaded_and_preexisting_blobs() {
+    require_docker();
+    let server = common::server::TestServer::start().await;
+    let client = RemergeClient::new(&server.base_url).expect("client");
+
+    let repo_bytes = b"EAPI=8\nDESCRIPTION=\"demo\"\n";
+    let distfile_bytes = b"demo-distfile";
+    let repo_digest = sha256_hex(repo_bytes);
+    let distfile_digest = sha256_hex(distfile_bytes);
+
+    remerge_server::blob_store::store_blob(server.state.config.state_dir.as_path(), repo_bytes)
+        .await
+        .expect("store preexisting repo blob");
+
+    let missing = client
+        .find_missing_blobs(&[repo_digest.clone(), distfile_digest.clone()])
+        .await
+        .expect("find missing blobs");
+    assert_eq!(missing, vec![distfile_digest.clone()]);
+
+    let uploaded = client
+        .upload_blob(&distfile_digest, distfile_bytes)
+        .await
+        .expect("upload missing distfile blob");
+    assert!(uploaded, "the missing distfile blob should be uploaded");
+
+    let repo_refs = BTreeMap::from([(
+        "dev-libs/demo/demo-1.0.ebuild".to_string(),
+        repo_digest.clone(),
+    )]);
+    let repo_tree =
+        remerge_server::tree_store::store_tree(server.state.config.state_dir.as_path(), &repo_refs)
+            .await
+            .expect("store repo tree manifest");
+
+    let mut portage_config = common::fixtures::minimal_portage_config();
+    portage_config.repos_conf.insert(
+        "local-overlay.conf".into(),
+        "[local-overlay]\nlocation = /var/db/repos/local-overlay\nauto-sync = no\n".into(),
+    );
+    portage_config
+        .repo_snapshot_refs
+        .insert("local-overlay".into(), repo_refs);
+    portage_config
+        .repo_snapshot_trees
+        .insert("local-overlay".into(), repo_tree.digest.clone());
+    portage_config
+        .distfile_snapshot_refs
+        .insert("demo-1.0.tar.xz".into(), distfile_digest.clone());
+
+    let atoms = vec!["dev-libs/demo".to_string()];
+    let emerge_args = atoms.clone();
+    let resp = client
+        .submit_workorder(
+            uuid::Uuid::new_v4(),
+            remerge_types::client::ClientRole::Main,
+            &atoms,
+            &emerge_args,
+            &portage_config,
+            &common::fixtures::minimal_system_identity(),
+        )
+        .await
+        .expect("submit refs-only workorder");
+
+    let stored_workorder = server
+        .state
+        .workorders
+        .read()
+        .await
+        .get(&resp.workorder_id)
+        .cloned()
+        .expect("stored workorder");
+    assert!(stored_workorder.portage_config.repo_snapshots.is_empty());
+    assert!(
+        stored_workorder
+            .portage_config
+            .distfile_snapshots
+            .is_empty()
+    );
+
+    let staged = remerge_server::runtime::stage_workorder_runtime(
+        server.state.config.state_dir.as_path(),
+        &stored_workorder,
+    )
+    .await
+    .expect("stage refs-only workorder");
+
+    assert_eq!(
+        tokio::fs::read(
+            staged
+                .runtime_dir
+                .join("snapshots/repos/local-overlay/dev-libs/demo/demo-1.0.ebuild"),
+        )
+        .await
+        .unwrap(),
+        repo_bytes
+    );
+    assert_eq!(
+        tokio::fs::read(
+            staged
+                .runtime_dir
+                .join("snapshots/distfiles/demo-1.0.tar.xz")
+        )
+        .await
+        .unwrap(),
+        distfile_bytes
+    );
+
+    let missing_after = client
+        .find_missing_blobs(&[repo_digest, distfile_digest])
+        .await
+        .expect("find missing blobs after upload");
+    assert!(
+        missing_after.is_empty(),
+        "all referenced blobs should now be present"
+    );
+}
+
+/// Inline snapshot submission deduplicates blobs and trees across distinct client IDs.
+#[cfg(feature = "integration")]
+#[tokio::test]
+async fn inline_snapshot_submission_deduplicates_across_distinct_clients() {
+    require_docker();
+    let server = common::server::TestServer::start().await;
+
+    let client_one_id = uuid::Uuid::new_v4();
+    let client_two_id = uuid::Uuid::new_v4();
+    let portage_config = common::fixtures::full_portage_config();
+    let system_id = common::fixtures::minimal_system_identity();
+    let atoms = vec!["app-misc/hello".to_string()];
+
+    let first_req = SubmitWorkorderRequest {
+        client_id: client_one_id,
+        role: remerge_types::client::ClientRole::Main,
+        atoms: atoms.clone(),
+        emerge_args: vec!["--pretend".to_string()],
+        portage_config: portage_config.clone(),
+        system_id: system_id.clone(),
+    };
+    let first_resp = submit_workorder_for_test(&server, &first_req).await;
+
+    let first_workorder = server
+        .state
+        .workorders
+        .read()
+        .await
+        .get(&first_resp.workorder_id)
+        .cloned()
+        .expect("first stored workorder");
+    let first_blob_count =
+        remerge_server::blob_store::list_blob_metadata(server.state.config.state_dir.as_path())
+            .await
+            .expect("list blob metadata after first submit")
+            .len();
+    let first_tree_count =
+        remerge_server::tree_store::list_tree_metadata(server.state.config.state_dir.as_path())
+            .await
+            .expect("list tree metadata after first submit")
+            .len();
+    assert!(
+        first_blob_count > 0,
+        "first submit should populate snapshot blobs"
+    );
+    assert!(
+        first_tree_count > 0,
+        "first submit should populate snapshot trees"
+    );
+
+    let second_req = SubmitWorkorderRequest {
+        client_id: client_two_id,
+        role: remerge_types::client::ClientRole::Main,
+        atoms,
+        emerge_args: vec!["--pretend".to_string()],
+        portage_config,
+        system_id,
+    };
+    let second_resp = submit_workorder_for_test(&server, &second_req).await;
+
+    let second_workorder = server
+        .state
+        .workorders
+        .read()
+        .await
+        .get(&second_resp.workorder_id)
+        .cloned()
+        .expect("second stored workorder");
+    let second_blob_count =
+        remerge_server::blob_store::list_blob_metadata(server.state.config.state_dir.as_path())
+            .await
+            .expect("list blob metadata after second submit")
+            .len();
+    let second_tree_count =
+        remerge_server::tree_store::list_tree_metadata(server.state.config.state_dir.as_path())
+            .await
+            .expect("list tree metadata after second submit")
+            .len();
+
+    assert_eq!(
+        second_blob_count, first_blob_count,
+        "second distinct client should reuse existing snapshot blobs"
+    );
+    assert_eq!(
+        second_tree_count, first_tree_count,
+        "second distinct client should reuse existing tree manifests"
+    );
+    assert_eq!(
+        first_workorder.portage_config.repo_snapshot_refs,
+        second_workorder.portage_config.repo_snapshot_refs,
+        "distinct clients should reference the same deduplicated repo blobs"
+    );
+    assert_eq!(
+        first_workorder.portage_config.repo_snapshot_trees,
+        second_workorder.portage_config.repo_snapshot_trees,
+        "distinct clients should reference the same deduplicated repo trees"
+    );
+    assert_eq!(
+        first_workorder.portage_config.distfile_snapshot_refs,
+        second_workorder.portage_config.distfile_snapshot_refs,
+        "distinct clients should reference the same deduplicated distfile blobs"
+    );
+
+    let first_staged = remerge_server::runtime::stage_workorder_runtime(
+        server.state.config.state_dir.as_path(),
+        &first_workorder,
+    )
+    .await
+    .expect("stage first workorder runtime");
+    let second_staged = remerge_server::runtime::stage_workorder_runtime(
+        server.state.config.state_dir.as_path(),
+        &second_workorder,
+    )
+    .await
+    .expect("stage second workorder runtime");
+
+    assert_eq!(
+        first_staged.snapshot_references.blob_digests,
+        second_staged.snapshot_references.blob_digests,
+        "both clients should stage the same deduplicated blob set"
+    );
+    assert_eq!(
+        first_staged.snapshot_references.tree_digests,
+        second_staged.snapshot_references.tree_digests,
+        "both clients should stage the same deduplicated tree set"
+    );
+}
+
+/// Snapshot reuse survives a same-client config change because cleanup honors the grace window.
+#[cfg(feature = "integration")]
+#[tokio::test]
+async fn snapshot_reuse_survives_client_config_change_within_grace_window() {
+    require_docker();
+    let config = remerge_server::config::ServerConfig {
+        snapshot_cache_grace_period_hours: 7 * 24,
+        snapshot_cache_hard_delete_hours: 30 * 24,
+        snapshot_min_retained_bytes: 0,
+        ..Default::default()
+    };
+    let server = common::server::TestServer::start_with_config(Some(config)).await;
+
+    let shared_client_id = uuid::Uuid::new_v4();
+    let mut initial_config = common::fixtures::full_portage_config();
+    let system_id = common::fixtures::minimal_system_identity();
+    let first_req = SubmitWorkorderRequest {
+        client_id: shared_client_id,
+        role: remerge_types::client::ClientRole::Main,
+        atoms: vec!["app-misc/hello".to_string()],
+        emerge_args: vec!["--pretend".to_string()],
+        portage_config: initial_config.clone(),
+        system_id: system_id.clone(),
+    };
+    let first_resp = submit_workorder_for_test(&server, &first_req).await;
+
+    let first_workorder = server
+        .state
+        .workorders
+        .read()
+        .await
+        .get(&first_resp.workorder_id)
+        .cloned()
+        .expect("first stored workorder");
+    let first_client_state = server
+        .state
+        .clients
+        .get(&shared_client_id)
+        .await
+        .expect("first client registry state");
+    let first_staged = remerge_server::runtime::stage_workorder_runtime(
+        server.state.config.state_dir.as_path(),
+        &first_workorder,
+    )
+    .await
+    .expect("stage first workorder runtime");
+    let first_blob_count =
+        remerge_server::blob_store::list_blob_metadata(server.state.config.state_dir.as_path())
+            .await
+            .expect("list blob metadata after first submit")
+            .len();
+
+    let cancel_client = reqwest::Client::new();
+    let cancel_resp = cancel_client
+        .delete(format!(
+            "{}/api/v1/workorders/{}",
+            server.base_url, first_resp.workorder_id
+        ))
+        .send()
+        .await
+        .expect("cancel first workorder");
+    assert_eq!(
+        cancel_resp.status(),
+        200,
+        "first workorder cancellation should succeed"
+    );
+
+    let cleanup_time = chrono::Utc::now() + chrono::Duration::hours(12);
+    let cleanup_summary = remerge_server::runtime::cleanup_snapshot_storage_at(
+        server.state.config.state_dir.as_path(),
+        &server.state.config,
+        &[],
+        cleanup_time,
+    )
+    .await
+    .expect("cleanup within grace window");
+    assert_eq!(
+        cleanup_summary.deleted_blobs, 0,
+        "recently unreferenced snapshot blobs should survive the grace window"
+    );
+    assert_eq!(
+        cleanup_summary.deleted_trees, 0,
+        "recently unreferenced snapshot trees should survive the grace window"
+    );
+
+    initial_config
+        .make_conf
+        .use_flags
+        .push("new-config-flag".to_string());
+    let second_req = SubmitWorkorderRequest {
+        client_id: shared_client_id,
+        role: remerge_types::client::ClientRole::Main,
+        atoms: vec!["app-misc/hello".to_string()],
+        emerge_args: vec!["--pretend".to_string()],
+        portage_config: initial_config,
+        system_id,
+    };
+    let second_resp = submit_workorder_for_test(&server, &second_req).await;
+
+    let second_workorder = server
+        .state
+        .workorders
+        .read()
+        .await
+        .get(&second_resp.workorder_id)
+        .cloned()
+        .expect("second stored workorder");
+    let second_client_state = server
+        .state
+        .clients
+        .get(&shared_client_id)
+        .await
+        .expect("second client registry state");
+    let second_staged = remerge_server::runtime::stage_workorder_runtime(
+        server.state.config.state_dir.as_path(),
+        &second_workorder,
+    )
+    .await
+    .expect("stage second workorder runtime");
+    let second_blob_count =
+        remerge_server::blob_store::list_blob_metadata(server.state.config.state_dir.as_path())
+            .await
+            .expect("list blob metadata after config change")
+            .len();
+
+    assert_ne!(
+        first_client_state.config_hash, second_client_state.config_hash,
+        "same client should register a new config hash after the config change"
+    );
+    assert_eq!(
+        first_blob_count, second_blob_count,
+        "config changes should reuse warm snapshot blobs instead of creating duplicates"
+    );
+    assert_eq!(
+        first_workorder.portage_config.repo_snapshot_refs,
+        second_workorder.portage_config.repo_snapshot_refs,
+        "config changes should preserve deduplicated repo blob references"
+    );
+    assert_eq!(
+        first_workorder.portage_config.repo_snapshot_trees,
+        second_workorder.portage_config.repo_snapshot_trees,
+        "config changes should preserve deduplicated tree references"
+    );
+    assert_eq!(
+        first_workorder.portage_config.distfile_snapshot_refs,
+        second_workorder.portage_config.distfile_snapshot_refs,
+        "config changes should preserve deduplicated distfile references"
+    );
+    assert_eq!(
+        first_staged.snapshot_references.blob_digests,
+        second_staged.snapshot_references.blob_digests,
+        "the replacement workorder should reuse the same warm blob set"
+    );
+    assert_eq!(
+        first_staged.snapshot_references.tree_digests,
+        second_staged.snapshot_references.tree_digests,
+        "the replacement workorder should reuse the same warm tree set"
     );
 }
 

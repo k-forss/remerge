@@ -5,12 +5,14 @@
 //! workorder, matches or creates a worker container, and reports progress back
 //! to the originating CLI.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::client::{ClientId, ClientRole};
-use crate::portage::{PortageConfig, SystemIdentity};
+use crate::portage::{PortageConfig, SnapshotEntry, SystemIdentity};
 use crate::trace::TraceContext;
 
 /// Unique identifier for a workorder.
@@ -125,6 +127,51 @@ pub struct WorkorderResult {
     pub failed_packages: Vec<FailedPackage>,
     /// URI of the binhost directory for this build.
     pub binhost_uri: String,
+    /// Distfiles present in the worker distdir after the build finished.
+    #[serde(default)]
+    pub fetched_distfiles: BTreeMap<String, SnapshotEntry>,
+    /// Captured client-parity metadata that must be restored locally before
+    /// any follow-up local emerge step.
+    #[serde(default)]
+    pub parity_manifest: ParityManifest,
+}
+
+/// Path-based parity manifest returned with a finished workorder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ParityManifest {
+    /// Parity-managed files rooted relative to the client ROOT, for example
+    /// `var/db/repos/gentoo/metadata/timestamp.chk` or
+    /// `var/cache/eclass/5-23/amd64.cache`.
+    #[serde(default)]
+    pub files: BTreeMap<String, ParityFileEntry>,
+    /// Parity-managed directories whose mtime must match the worker result.
+    #[serde(default)]
+    pub directories: BTreeMap<String, ParityDirectoryEntry>,
+    /// Parity-managed symlinks whose link target bytes and mtime must match.
+    #[serde(default)]
+    pub symlinks: BTreeMap<String, ParitySymlinkEntry>,
+}
+
+/// Content-addressed metadata for one parity-managed file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParityFileEntry {
+    pub digest: String,
+    pub size: u64,
+    pub mtime_secs: i64,
+}
+
+/// Metadata for one parity-managed directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParityDirectoryEntry {
+    pub mtime_secs: i64,
+}
+
+/// Content-addressed metadata for one parity-managed symlink target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParitySymlinkEntry {
+    pub digest: String,
+    pub size: u64,
+    pub mtime_secs: i64,
 }
 
 /// A successfully built binary package.
