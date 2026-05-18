@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
+use remerge_types::portage::SnapshotEntry;
 use remerge_types::workorder::{
     ParityDirectoryEntry, ParityFileEntry, ParityManifest, ParitySymlinkEntry,
 };
-use remerge_types::portage::SnapshotEntry;
 
 const REPO_METADATA_ROOT: &str = "/var/db/repos";
 const ECLASS_CACHE_ROOT: &str = "/var/cache/eclass";
@@ -64,7 +64,9 @@ pub async fn capture_final_state_parity_from(
     Ok(manifest)
 }
 
-pub async fn capture_fetched_distfiles(output_dir: &Path) -> Result<std::collections::BTreeMap<String, SnapshotEntry>> {
+pub async fn capture_fetched_distfiles(
+    output_dir: &Path,
+) -> Result<std::collections::BTreeMap<String, SnapshotEntry>> {
     capture_fetched_distfiles_from(output_dir, Path::new(DISTFILES_ROOT)).await
 }
 
@@ -83,7 +85,10 @@ pub async fn capture_fetched_distfiles_from(
     let mut manifest = std::collections::BTreeMap::new();
     let root_metadata = match tokio::fs::symlink_metadata(distfiles_root).await {
         Ok(metadata) if metadata.is_dir() => metadata,
-        Ok(_) => anyhow::bail!("Expected distfiles dir for capture: {}", distfiles_root.display()),
+        Ok(_) => anyhow::bail!(
+            "Expected distfiles dir for capture: {}",
+            distfiles_root.display()
+        ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             write_distfile_manifest(output_dir, &manifest).await?;
             return Ok(manifest);
@@ -94,7 +99,10 @@ pub async fn capture_fetched_distfiles_from(
         }
     };
     if !root_metadata.is_dir() {
-        anyhow::bail!("Expected distfiles dir for capture: {}", distfiles_root.display());
+        anyhow::bail!(
+            "Expected distfiles dir for capture: {}",
+            distfiles_root.display()
+        );
     }
 
     let mut stack = vec![distfiles_root.to_path_buf()];
@@ -116,7 +124,11 @@ pub async fn capture_fetched_distfiles_from(
             }
 
             let relative = entry_path.strip_prefix(distfiles_root).with_context(|| {
-                format!("{} is outside {}", entry_path.display(), distfiles_root.display())
+                format!(
+                    "{} is outside {}",
+                    entry_path.display(),
+                    distfiles_root.display()
+                )
             })?;
             let relative = relative.to_string_lossy().replace('\\', "/");
             let bytes = tokio::fs::read(&entry_path)
@@ -538,6 +550,11 @@ mod tests {
         assert!(manifest.contains_key("demo-1.0.tar.xz"));
         assert!(manifest.contains_key("dev-libs/helper.patch"));
         assert!(output.path().join("distfiles.json").is_file());
-        assert_eq!(std::fs::read_dir(output.path().join("blobs")).unwrap().count(), 2);
+        assert_eq!(
+            std::fs::read_dir(output.path().join("blobs"))
+                .unwrap()
+                .count(),
+            2
+        );
     }
 }

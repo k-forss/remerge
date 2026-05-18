@@ -657,7 +657,10 @@ impl PortageReader {
             let refs = repo_snapshot_refs
                 .get(repo_name)
                 .with_context(|| format!("Missing repo snapshot refs for repo '{repo_name}'"))?;
-            let tree_digest = repo_snapshot_trees.get(repo_name).cloned().unwrap_or_default();
+            let tree_digest = repo_snapshot_trees
+                .get(repo_name)
+                .cloned()
+                .unwrap_or_default();
             let repo_root = repo_locations
                 .get(repo_name)
                 .with_context(|| format!("Missing repo location for repo '{repo_name}'"))?;
@@ -682,7 +685,10 @@ impl PortageReader {
 
             manifest.repo_snapshots.insert(
                 repo_name.clone(),
-                RepoSnapshotManifest { tree_digest, entries },
+                RepoSnapshotManifest {
+                    tree_digest,
+                    entries,
+                },
             );
         }
 

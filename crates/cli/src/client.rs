@@ -244,7 +244,11 @@ impl RemergeClient {
         debug!(
             digest,
             raw_size_bytes = bytes.len(),
-            transport_encoding = if upload_payload.zstd_bytes.is_some() { "zstd_optional" } else { "raw_only" },
+            transport_encoding = if upload_payload.zstd_bytes.is_some() {
+                "zstd_optional"
+            } else {
+                "raw_only"
+            },
             attempts,
             "Starting websocket snapshot blob upload"
         );

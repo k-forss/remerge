@@ -336,7 +336,8 @@ impl Metrics {
             &mut out,
             "remerge_snapshot_blob_upload_bytes_total",
             "Total raw snapshot blob bytes accepted by the server.",
-            self.snapshot_blob_upload_bytes_total.load(Ordering::Relaxed),
+            self.snapshot_blob_upload_bytes_total
+                .load(Ordering::Relaxed),
         );
         write_counter(
             &mut out,

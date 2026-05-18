@@ -1366,7 +1366,9 @@ async fn blob_stream_endpoint_resumes_after_shrunk_chunks() {
             .encode_with_payload(chunk)
             .expect("encode upload chunk");
         first_ws
-            .send(tokio_tungstenite::tungstenite::Message::Binary(frame.into()))
+            .send(tokio_tungstenite::tungstenite::Message::Binary(
+                frame.into(),
+            ))
             .await
             .expect("send upload chunk");
 
@@ -1954,20 +1956,24 @@ async fn inline_snapshot_submission_deduplicates_across_distinct_clients() {
         .get(&first_resp.workorder_id)
         .cloned()
         .expect("first stored workorder");
-    let first_blob_count = remerge_server::blob_store::list_blob_metadata(
-        server.state.config.state_dir.as_path(),
-    )
-    .await
-    .expect("list blob metadata after first submit")
-    .len();
-    let first_tree_count = remerge_server::tree_store::list_tree_metadata(
-        server.state.config.state_dir.as_path(),
-    )
-    .await
-    .expect("list tree metadata after first submit")
-    .len();
-    assert!(first_blob_count > 0, "first submit should populate snapshot blobs");
-    assert!(first_tree_count > 0, "first submit should populate snapshot trees");
+    let first_blob_count =
+        remerge_server::blob_store::list_blob_metadata(server.state.config.state_dir.as_path())
+            .await
+            .expect("list blob metadata after first submit")
+            .len();
+    let first_tree_count =
+        remerge_server::tree_store::list_tree_metadata(server.state.config.state_dir.as_path())
+            .await
+            .expect("list tree metadata after first submit")
+            .len();
+    assert!(
+        first_blob_count > 0,
+        "first submit should populate snapshot blobs"
+    );
+    assert!(
+        first_tree_count > 0,
+        "first submit should populate snapshot trees"
+    );
 
     let second_req = SubmitWorkorderRequest {
         client_id: client_two_id,
@@ -1987,18 +1993,16 @@ async fn inline_snapshot_submission_deduplicates_across_distinct_clients() {
         .get(&second_resp.workorder_id)
         .cloned()
         .expect("second stored workorder");
-    let second_blob_count = remerge_server::blob_store::list_blob_metadata(
-        server.state.config.state_dir.as_path(),
-    )
-    .await
-    .expect("list blob metadata after second submit")
-    .len();
-    let second_tree_count = remerge_server::tree_store::list_tree_metadata(
-        server.state.config.state_dir.as_path(),
-    )
-    .await
-    .expect("list tree metadata after second submit")
-    .len();
+    let second_blob_count =
+        remerge_server::blob_store::list_blob_metadata(server.state.config.state_dir.as_path())
+            .await
+            .expect("list blob metadata after second submit")
+            .len();
+    let second_tree_count =
+        remerge_server::tree_store::list_tree_metadata(server.state.config.state_dir.as_path())
+            .await
+            .expect("list tree metadata after second submit")
+            .len();
 
     assert_eq!(
         second_blob_count, first_blob_count,
@@ -2095,12 +2099,11 @@ async fn snapshot_reuse_survives_client_config_change_within_grace_window() {
     )
     .await
     .expect("stage first workorder runtime");
-    let first_blob_count = remerge_server::blob_store::list_blob_metadata(
-        server.state.config.state_dir.as_path(),
-    )
-    .await
-    .expect("list blob metadata after first submit")
-    .len();
+    let first_blob_count =
+        remerge_server::blob_store::list_blob_metadata(server.state.config.state_dir.as_path())
+            .await
+            .expect("list blob metadata after first submit")
+            .len();
 
     let cancel_client = reqwest::Client::new();
     let cancel_resp = cancel_client
@@ -2111,7 +2114,11 @@ async fn snapshot_reuse_survives_client_config_change_within_grace_window() {
         .send()
         .await
         .expect("cancel first workorder");
-    assert_eq!(cancel_resp.status(), 200, "first workorder cancellation should succeed");
+    assert_eq!(
+        cancel_resp.status(),
+        200,
+        "first workorder cancellation should succeed"
+    );
 
     let cleanup_time = chrono::Utc::now() + chrono::Duration::hours(12);
     let cleanup_summary = remerge_server::runtime::cleanup_snapshot_storage_at(
@@ -2165,12 +2172,11 @@ async fn snapshot_reuse_survives_client_config_change_within_grace_window() {
     )
     .await
     .expect("stage second workorder runtime");
-    let second_blob_count = remerge_server::blob_store::list_blob_metadata(
-        server.state.config.state_dir.as_path(),
-    )
-    .await
-    .expect("list blob metadata after config change")
-    .len();
+    let second_blob_count =
+        remerge_server::blob_store::list_blob_metadata(server.state.config.state_dir.as_path())
+            .await
+            .expect("list blob metadata after config change")
+            .len();
 
     assert_ne!(
         first_client_state.config_hash, second_client_state.config_hash,

@@ -78,8 +78,9 @@ pub async fn reconcile_final_state_parity_into(
         }
     }
 
-    if let Err(mut verification_issues) =
-        verify_parity_manifest(parity_root, &result.parity_manifest).await
+    if issues.is_empty()
+        && let Err(mut verification_issues) =
+            verify_parity_manifest(parity_root, &result.parity_manifest).await
     {
         issues.append(&mut verification_issues);
     }
@@ -222,8 +223,7 @@ async fn snapshot_file_matches(target: &Path, entry: &SnapshotEntry) -> Result<b
         }
     };
 
-    if !metadata.is_file() || metadata.len() != entry.size || metadata.mtime() != entry.mtime_secs
-    {
+    if !metadata.is_file() || metadata.len() != entry.size || metadata.mtime() != entry.mtime_secs {
         return Ok(false);
     }
 
@@ -515,16 +515,17 @@ fn is_approved_parity_path(path: &Path) -> bool {
         .collect();
     let components: Vec<&str> = components.iter().map(String::as_str).collect();
 
-    match components.as_slice() {
-        ["var", "cache", "binpkgs", "Packages"] => true,
-        ["var", "cache", "eclass"] | ["var", "cache", "eclass", _, ..] => true,
-        ["var", "db", "repos", _, "Packages"] => true,
-        ["var", "db", "repos", _, "metadata"] | ["var", "db", "repos", _, "metadata", _, ..] => {
-            true
-        }
-        ["var", "lib", "portage"] | ["var", "lib", "portage", _, ..] => true,
-        _ => false,
-    }
+    matches!(
+        components.as_slice(),
+        ["var", "cache", "binpkgs", "Packages"]
+            | ["var", "cache", "eclass"]
+            | ["var", "cache", "eclass", _, ..]
+            | ["var", "db", "repos", _, "Packages"]
+            | ["var", "db", "repos", _, "metadata"]
+            | ["var", "db", "repos", _, "metadata", _, ..]
+            | ["var", "lib", "portage"]
+            | ["var", "lib", "portage", _, ..]
+    )
 }
 
 fn parity_directory_matches(path: &Path, entry: &ParityDirectoryEntry) -> Result<bool> {
@@ -1189,8 +1190,14 @@ impl Cli {
 
             for (relative_path, content) in snapshot {
                 let digest = manifest_entries
-                    .and_then(|entries| entries.get(relative_path).map(|entry| entry.digest.as_str()))
-                    .or_else(|| snapshot_refs.and_then(|refs| refs.get(relative_path).map(String::as_str)))
+                    .and_then(|entries| {
+                        entries
+                            .get(relative_path)
+                            .map(|entry| entry.digest.as_str())
+                    })
+                    .or_else(|| {
+                        snapshot_refs.and_then(|refs| refs.get(relative_path).map(String::as_str))
+                    })
                     .with_context(|| {
                         format!("Missing repo snapshot digest for '{repo_name}:{relative_path}'")
                     })?;
@@ -1310,13 +1317,13 @@ impl Cli {
 
         for package in &result.built_packages {
             match self
-                .sync_single_binpkg(client, result, &pkgdir, package, &mut reporter)
+                .sync_single_binpkg(client, result, pkgdir, package, &mut reporter)
                 .await
             {
                 Ok(status) => reporter.record_result(&status),
                 Err(error) => {
                     reporter.record_failure(&package.atom, &error);
-                    reporter.finish(&pkgdir);
+                    reporter.finish(pkgdir);
                     return Err(error).with_context(|| {
                         format!("Failed to sync local binpkg cache for {}", package.atom)
                     });
@@ -1331,7 +1338,7 @@ impl Cli {
             tracing::warn!(%error, url = %packages_url, "Failed to refresh local Packages index");
         }
 
-        reporter.finish(&pkgdir);
+        reporter.finish(pkgdir);
         Ok(())
     }
 
@@ -2330,8 +2337,14 @@ mod tests {
             .expect("reconcile fetched distfiles");
 
         let restored_path = distdir.path().join(restored_relative);
-        assert_eq!(tokio::fs::read(&restored_path).await.unwrap(), restored_bytes);
-        assert_eq!(tokio::fs::metadata(&restored_path).await.unwrap().mtime(), 1_700_000_102);
+        assert_eq!(
+            tokio::fs::read(&restored_path).await.unwrap(),
+            restored_bytes
+        );
+        assert_eq!(
+            tokio::fs::metadata(&restored_path).await.unwrap().mtime(),
+            1_700_000_102
+        );
         assert_eq!(requests.lock().unwrap().clone(), vec![restored_digest]);
     }
 

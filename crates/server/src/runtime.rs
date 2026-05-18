@@ -9,8 +9,8 @@ use crate::blob_store;
 use crate::config::ServerConfig;
 use crate::tree_store;
 use remerge_types::portage::{
-    PortageConfig, RepoSnapshotManifest, SnapshotEntry, SnapshotManifest,
-    SNAPSHOT_MANIFEST_VERSION_V1,
+    PortageConfig, RepoSnapshotManifest, SNAPSHOT_MANIFEST_VERSION_V1, SnapshotEntry,
+    SnapshotManifest,
 };
 use remerge_types::workorder::{ParityManifest, Workorder, WorkorderId};
 
@@ -62,7 +62,12 @@ pub async fn collect_snapshot_references(
         .repo_snapshots
         .values()
         .flat_map(|repo| repo.entries.values().map(|entry| entry.digest.clone()))
-        .chain(manifest.distfiles.values().map(|entry| entry.digest.clone()))
+        .chain(
+            manifest
+                .distfiles
+                .values()
+                .map(|entry| entry.digest.clone()),
+        )
         .collect();
     let tree_digests: BTreeSet<String> = manifest
         .repo_snapshots
@@ -171,7 +176,7 @@ pub async fn stage_workorder_runtime(
     let mut distfile_snapshot_refs = std::collections::BTreeMap::new();
 
     for (repo_name, repo_manifest) in &manifest.repo_snapshots {
-        let repo_base = repos_dir.join(sanitize_file_name(&repo_name)?);
+        let repo_base = repos_dir.join(sanitize_file_name(repo_name)?);
         let snapshot_refs = repo_manifest
             .entries
             .iter()
@@ -197,7 +202,7 @@ pub async fn stage_workorder_runtime(
     }
 
     for (name, entry) in &manifest.distfiles {
-        let target = distfiles_dir.join(sanitize_file_name(&name)?);
+        let target = distfiles_dir.join(sanitize_file_name(name)?);
         let digest = materialize_blob_for_digest(state_dir, &target, &entry.digest).await?;
         distfile_snapshot_refs.insert(name.clone(), digest);
     }
@@ -420,6 +425,13 @@ pub async fn ingest_final_state_parity(
             .with_context(|| format!("Failed to read {}", blob_path.display()))?;
         blob_store::store_blob_for_digest(state_dir, &entry.digest, &bytes).await?;
     }
+    for entry in manifest.symlinks.values() {
+        let blob_path = parity_dir.join("blobs").join(&entry.digest);
+        let bytes = tokio::fs::read(&blob_path)
+            .await
+            .with_context(|| format!("Failed to read {}", blob_path.display()))?;
+        blob_store::store_blob_for_digest(state_dir, &entry.digest, &bytes).await?;
+    }
 
     info!(
         runtime_dir = %runtime_dir.display(),
@@ -528,7 +540,8 @@ async fn effective_snapshot_manifest(
         .cloned()
         .collect();
     for repo_name in repo_names {
-        let repo_manifest = build_repo_snapshot_manifest(state_dir, portage_config, &manifest, &repo_name).await?;
+        let repo_manifest =
+            build_repo_snapshot_manifest(state_dir, portage_config, &manifest, &repo_name).await?;
         if !repo_manifest.entries.is_empty() {
             manifest.repo_snapshots.insert(repo_name, repo_manifest);
         }
@@ -542,7 +555,8 @@ async fn effective_snapshot_manifest(
         .cloned()
         .collect();
     for name in distfile_names {
-        let entry = build_distfile_snapshot_entry(state_dir, portage_config, &manifest, &name).await?;
+        let entry =
+            build_distfile_snapshot_entry(state_dir, portage_config, &manifest, &name).await?;
         if let Some(entry) = entry {
             manifest.distfiles.insert(name, entry);
         }
@@ -561,7 +575,9 @@ async fn build_repo_snapshot_manifest(
         let mut entries = std::collections::BTreeMap::new();
         let existing_manifest = manifest.repo_snapshots.get(repo_name);
         for (relative_path, content) in snapshot {
-            let digest = blob_store::store_blob(state_dir, content.as_bytes()).await?.digest;
+            let digest = blob_store::store_blob(state_dir, content.as_bytes())
+                .await?
+                .digest;
             let existing_entry = existing_manifest.and_then(|repo| repo.entries.get(relative_path));
             if let Some(expected_digest) = portage_config
                 .repo_snapshot_refs
@@ -596,7 +612,9 @@ async fn build_repo_snapshot_manifest(
                     .map(String::as_str)
                     .filter(|digest| !digest.is_empty())
             });
-        if let Some(expected_tree) = expected_tree && tree.digest != expected_tree {
+        if let Some(expected_tree) = expected_tree
+            && tree.digest != expected_tree
+        {
             anyhow::bail!("repo snapshot tree digest mismatch for '{repo_name}'");
         }
 
@@ -616,7 +634,8 @@ async fn build_repo_snapshot_manifest(
             .map(|(relative_path, entry)| (relative_path.clone(), entry.digest.clone()))
             .collect::<std::collections::BTreeMap<_, _>>();
         let tree = tree_store::store_tree(state_dir, &snapshot_refs).await?;
-        if !existing_manifest.tree_digest.is_empty() && tree.digest != existing_manifest.tree_digest {
+        if !existing_manifest.tree_digest.is_empty() && tree.digest != existing_manifest.tree_digest
+        {
             anyhow::bail!("repo snapshot tree digest mismatch for '{repo_name}'");
         }
         return Ok(RepoSnapshotManifest {
@@ -699,9 +718,9 @@ async fn build_distfile_snapshot_entry(
 
 async fn ensure_blob_exists(state_dir: &Path, digest: &str) -> Result<()> {
     let source = blob_store::blob_path(state_dir, digest)?;
-    tokio::fs::metadata(&source).await.with_context(|| {
-        format!("Missing referenced blob {} at {}", digest, source.display())
-    })?;
+    tokio::fs::metadata(&source)
+        .await
+        .with_context(|| format!("Missing referenced blob {} at {}", digest, source.display()))?;
     Ok(())
 }
 
@@ -761,9 +780,9 @@ async fn try_reflink(source: &Path, target: &Path) -> Result<bool> {
     {
         let source = source.to_path_buf();
         let target = target.to_path_buf();
-        return tokio::task::spawn_blocking(move || try_reflink_blocking(&source, &target))
+        tokio::task::spawn_blocking(move || try_reflink_blocking(&source, &target))
             .await
-            .context("reflink task failed to join")?;
+            .context("reflink task failed to join")?
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -787,8 +806,7 @@ fn try_reflink_blocking(source: &Path, target: &Path) -> Result<bool> {
         Ok(file) => file,
         Err(error) if error.kind() == ErrorKind::AlreadyExists => return Ok(false),
         Err(error) => {
-            return Err(error)
-                .with_context(|| format!("Failed to create {}", target.display()));
+            return Err(error).with_context(|| format!("Failed to create {}", target.display()));
         }
     };
 

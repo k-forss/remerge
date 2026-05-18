@@ -16,8 +16,8 @@ use tracing::{Instrument, error, info, warn};
 
 use remerge_types::workorder::*;
 
-use crate::repo::BinpkgRepo;
 use crate::persistence;
+use crate::repo::BinpkgRepo;
 use crate::runtime;
 use crate::state::AppState;
 
@@ -80,9 +80,17 @@ async fn set_workorder_status(
         },
     ));
 
-    let workorders = state.workorders.read().await;
-    if let Err(error) = persistence::save_workorders(state.config.state_dir.as_path(), &workorders).await {
-        warn!(?workorder_id, "Failed to persist workorder state change: {error:#}");
+    let workorders = {
+        let workorders = state.workorders.read().await;
+        workorders.clone()
+    };
+    if let Err(error) =
+        persistence::save_workorders(state.config.state_dir.as_path(), &workorders).await
+    {
+        warn!(
+            ?workorder_id,
+            "Failed to persist workorder state change: {error:#}"
+        );
     }
 }
 

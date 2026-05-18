@@ -112,7 +112,9 @@ impl AppState {
             persisted_workorders.get(id).is_some_and(|workorder| {
                 matches!(
                     workorder.status,
-                    WorkorderStatus::Pending | WorkorderStatus::Provisioning | WorkorderStatus::Building
+                    WorkorderStatus::Pending
+                        | WorkorderStatus::Provisioning
+                        | WorkorderStatus::Building
                 )
             })
         }) {

@@ -10,7 +10,7 @@ not be used as an active task tracker.
 - It claimed that 18 unchecked integration-test tasks remained, which became
   stale after the final integration-test milestone was completed.
 - It duplicated project overview and test-quality guidance that now belongs in
-  [README.md](README.md) or test documentation.
+  [README.md](../../README.md) or test documentation.
 - It was written as one-off agent instructions, not maintainer documentation.
 
 ## Durable guidance retained
@@ -23,6 +23,6 @@ Future tests should preserve the useful constraints from the prompt:
 - No `eprintln!` in place of assertions.
 - Every task must have a concrete verification step before being marked done.
 
-Use [README.md](README.md) for active project context and
-[docs/archive/integration-test-suite.md](docs/archive/integration-test-suite.md)
+Use [README.md](../../README.md) for active project context and
+[docs/archive/integration-test-suite.md](./integration-test-suite.md)
 for the completed milestone summary.

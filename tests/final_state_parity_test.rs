@@ -353,9 +353,12 @@ async fn capture_final_state_parity_excludes_client_owned_and_temporary_paths() 
     tokio::fs::create_dir_all(eclass_root.path().join("regen"))
         .await
         .unwrap();
-    tokio::fs::write(eclass_root.path().join("regen/metadata.swp"), b"swap noise\n")
-        .await
-        .unwrap();
+    tokio::fs::write(
+        eclass_root.path().join("regen/metadata.swp"),
+        b"swap noise\n",
+    )
+    .await
+    .unwrap();
     tokio::fs::write(
         binpkg_root.path().join("dev-libs-demo-1.0.gpkg.tar"),
         b"binpkg payload\n",
@@ -787,7 +790,9 @@ async fn remerge_followup_restores_fetched_distfiles_for_plain_local_emerge() {
     let binhost_uri = "file:///tmp/remerge-test-binpkgs";
 
     write_file_with_mtime(
-        &baseline_root.path().join("var/cache/distfiles/demo-1.0.tar.xz"),
+        &baseline_root
+            .path()
+            .join("var/cache/distfiles/demo-1.0.tar.xz"),
         &distfile_bytes,
         1_700_000_071,
     );

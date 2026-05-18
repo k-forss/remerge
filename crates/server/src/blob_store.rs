@@ -77,7 +77,7 @@ pub async fn store_blob_for_digest(
         anyhow::bail!("blob digest mismatch: expected {digest}, got {actual}");
     }
 
-    let target = blob_path(state_dir, &digest)?;
+    let target = blob_path(state_dir, digest)?;
     let raw_size_bytes = bytes.len() as u64;
 
     if tokio::fs::metadata(&target).await.is_ok() {
@@ -100,7 +100,7 @@ pub async fn store_blob_for_digest(
         .await
         .with_context(|| format!("Failed to create {}", parent.display()))?;
 
-    let uploaded = write_bytes_atomically(parent, &target, file_name(&digest)?, bytes).await?;
+    let uploaded = write_bytes_atomically(parent, &target, file_name(digest)?, bytes).await?;
     ensure_blob_metadata(state_dir, digest, raw_size_bytes).await?;
     maybe_store_zstd_variant(state_dir, digest, bytes).await?;
     touch_blob(state_dir, digest, Utc::now()).await?;

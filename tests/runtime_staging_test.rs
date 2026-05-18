@@ -227,7 +227,8 @@ async fn stage_workorder_runtime_reuses_blob_store_for_identical_snapshots() {
 #[tokio::test]
 async fn client_overlay_snapshot_roundtrip_supports_local_only_package_versions() {
     let state_dir = tempfile::TempDir::new().unwrap();
-    let (_tmp, root, overlay_name, distfile_name) = common::fixtures::portage_tree_with_local_overlay();
+    let (_tmp, root, overlay_name, distfile_name) =
+        common::fixtures::portage_tree_with_local_overlay();
     let _root_guard = common::set_root_env(&root);
 
     let portage_config = PortageReader::new()
@@ -266,19 +267,21 @@ async fn client_overlay_snapshot_roundtrip_supports_local_only_package_versions(
         .expect("stage overlay workorder");
 
     assert_eq!(
-        tokio::fs::read(
-            staged
-                .runtime_dir
-                .join(format!("snapshots/repos/{overlay_name}/dev-libs/demo/demo-1.0.ebuild"))
-        )
+        tokio::fs::read(staged.runtime_dir.join(format!(
+            "snapshots/repos/{overlay_name}/dev-libs/demo/demo-1.0.ebuild"
+        )))
         .await
         .unwrap(),
         overlay_bytes
     );
     assert_eq!(
-        tokio::fs::read(staged.runtime_dir.join(format!("snapshots/distfiles/{distfile_name}")))
-            .await
-            .unwrap(),
+        tokio::fs::read(
+            staged
+                .runtime_dir
+                .join(format!("snapshots/distfiles/{distfile_name}"))
+        )
+        .await
+        .unwrap(),
         b"demo-distfile"
     );
 }
@@ -443,11 +446,17 @@ async fn persisted_refs_only_workorder_can_be_reloaded_and_restaged_after_restar
         remerge_types::workorder::WorkorderStatus::Pending
     ));
     assert!(reloaded_workorder.portage_config.repo_snapshots.is_empty());
-    assert!(reloaded_workorder.portage_config.distfile_snapshots.is_empty());
+    assert!(
+        reloaded_workorder
+            .portage_config
+            .distfile_snapshots
+            .is_empty()
+    );
 
-    let staged = remerge_server::runtime::stage_workorder_runtime(state_dir.path(), reloaded_workorder)
-        .await
-        .expect("restage persisted workorder");
+    let staged =
+        remerge_server::runtime::stage_workorder_runtime(state_dir.path(), reloaded_workorder)
+            .await
+            .expect("restage persisted workorder");
     assert_eq!(
         tokio::fs::read(
             staged
@@ -459,9 +468,13 @@ async fn persisted_refs_only_workorder_can_be_reloaded_and_restaged_after_restar
         b"EAPI=8\n"
     );
     assert_eq!(
-        tokio::fs::read(staged.runtime_dir.join("snapshots/distfiles/demo-1.0.tar.xz"))
-            .await
-            .unwrap(),
+        tokio::fs::read(
+            staged
+                .runtime_dir
+                .join("snapshots/distfiles/demo-1.0.tar.xz")
+        )
+        .await
+        .unwrap(),
         b"demo-distfile"
     );
 }
@@ -516,7 +529,9 @@ async fn ingest_fetched_distfiles_stores_captured_blobs() {
 
     let payload = b"fetched-distfile\n";
     let digest = sha256_hex(payload);
-    tokio::fs::write(blobs_dir.join(&digest), payload).await.unwrap();
+    tokio::fs::write(blobs_dir.join(&digest), payload)
+        .await
+        .unwrap();
     tokio::fs::write(
         runtime_dir.join("parity/distfiles.json"),
         serde_json::to_vec(&std::collections::BTreeMap::from([(
@@ -532,14 +547,18 @@ async fn ingest_fetched_distfiles_stores_captured_blobs() {
     .await
     .unwrap();
 
-    let manifest = remerge_server::runtime::ingest_fetched_distfiles(state_dir.path(), &runtime_dir)
-        .await
-        .expect("ingest fetched distfiles");
+    let manifest =
+        remerge_server::runtime::ingest_fetched_distfiles(state_dir.path(), &runtime_dir)
+            .await
+            .expect("ingest fetched distfiles");
 
     assert_eq!(manifest.len(), 1);
     assert_eq!(manifest["demo-1.0.tar.xz"].digest, digest);
-    let stored_path = remerge_server::blob_store::blob_path(state_dir.path(), &manifest["demo-1.0.tar.xz"].digest)
-        .unwrap();
+    let stored_path = remerge_server::blob_store::blob_path(
+        state_dir.path(),
+        &manifest["demo-1.0.tar.xz"].digest,
+    )
+    .unwrap();
     assert_eq!(tokio::fs::read(stored_path).await.unwrap(), payload);
 }
 
@@ -579,10 +598,12 @@ async fn store_tree_creates_zstd_variant_for_worthwhile_manifest() {
 #[tokio::test]
 async fn cleanup_snapshot_storage_deletes_grace_eligible_unreferenced_entries() {
     let state_dir = tempfile::TempDir::new().unwrap();
-    let mut config = remerge_server::config::ServerConfig::default();
-    config.snapshot_cache_grace_period_hours = 7 * 24;
-    config.snapshot_cache_hard_delete_hours = 30 * 24;
-    config.snapshot_min_retained_bytes = 0;
+    let config = remerge_server::config::ServerConfig {
+        snapshot_cache_grace_period_hours: 7 * 24,
+        snapshot_cache_hard_delete_hours: 30 * 24,
+        snapshot_min_retained_bytes: 0,
+        ..Default::default()
+    };
 
     let blob_bytes = b"stale-blob";
     let blob = remerge_server::blob_store::store_blob(state_dir.path(), blob_bytes)
@@ -630,10 +651,12 @@ async fn cleanup_snapshot_storage_deletes_grace_eligible_unreferenced_entries() 
 #[tokio::test]
 async fn cleanup_snapshot_storage_handles_many_eligible_entries() {
     let state_dir = tempfile::TempDir::new().unwrap();
-    let mut config = remerge_server::config::ServerConfig::default();
-    config.snapshot_cache_grace_period_hours = 24;
-    config.snapshot_cache_hard_delete_hours = 24 * 30;
-    config.snapshot_min_retained_bytes = 0;
+    let config = remerge_server::config::ServerConfig {
+        snapshot_cache_grace_period_hours: 24,
+        snapshot_cache_hard_delete_hours: 24 * 30,
+        snapshot_min_retained_bytes: 0,
+        ..Default::default()
+    };
 
     let stale_at = chrono::Utc::now() - chrono::Duration::days(2);
     let mut tree_digests = Vec::new();
@@ -671,7 +694,11 @@ async fn cleanup_snapshot_storage_handles_many_eligible_entries() {
     assert_eq!(summary.deleted_blobs, 24);
     assert_eq!(summary.deleted_trees, 24);
     for digest in blob_digests {
-        assert!(!remerge_server::blob_store::has_blob(state_dir.path(), &digest).await.unwrap());
+        assert!(
+            !remerge_server::blob_store::has_blob(state_dir.path(), &digest)
+                .await
+                .unwrap()
+        );
     }
     for digest in tree_digests {
         let tree_path = remerge_server::tree_store::tree_path(state_dir.path(), &digest).unwrap();
@@ -682,10 +709,12 @@ async fn cleanup_snapshot_storage_handles_many_eligible_entries() {
 #[tokio::test]
 async fn cleanup_snapshot_storage_is_idempotent_after_deletion() {
     let state_dir = tempfile::TempDir::new().unwrap();
-    let mut config = remerge_server::config::ServerConfig::default();
-    config.snapshot_cache_grace_period_hours = 7 * 24;
-    config.snapshot_cache_hard_delete_hours = 30 * 24;
-    config.snapshot_min_retained_bytes = 0;
+    let config = remerge_server::config::ServerConfig {
+        snapshot_cache_grace_period_hours: 7 * 24,
+        snapshot_cache_hard_delete_hours: 30 * 24,
+        snapshot_min_retained_bytes: 0,
+        ..Default::default()
+    };
 
     let blob = remerge_server::blob_store::store_blob(state_dir.path(), b"stale-blob")
         .await
@@ -721,10 +750,12 @@ async fn cleanup_snapshot_storage_is_idempotent_after_deletion() {
 #[tokio::test]
 async fn cleanup_snapshot_storage_keeps_active_and_floor_protected_entries() {
     let state_dir = tempfile::TempDir::new().unwrap();
-    let mut config = remerge_server::config::ServerConfig::default();
-    config.snapshot_cache_grace_period_hours = 7 * 24;
-    config.snapshot_cache_hard_delete_hours = 30 * 24;
-    config.snapshot_min_retained_bytes = 1_000_000;
+    let config = remerge_server::config::ServerConfig {
+        snapshot_cache_grace_period_hours: 7 * 24,
+        snapshot_cache_hard_delete_hours: 30 * 24,
+        snapshot_min_retained_bytes: 1_000_000,
+        ..Default::default()
+    };
 
     let active_blob = remerge_server::blob_store::store_blob(state_dir.path(), b"active-blob")
         .await
@@ -786,10 +817,12 @@ async fn cleanup_snapshot_storage_keeps_active_and_floor_protected_entries() {
 #[tokio::test]
 async fn cleanup_snapshot_storage_keeps_recently_unreferenced_entries_for_grace_window() {
     let state_dir = tempfile::TempDir::new().unwrap();
-    let mut config = remerge_server::config::ServerConfig::default();
-    config.snapshot_cache_grace_period_hours = 7 * 24;
-    config.snapshot_cache_hard_delete_hours = 30 * 24;
-    config.snapshot_min_retained_bytes = 0;
+    let config = remerge_server::config::ServerConfig {
+        snapshot_cache_grace_period_hours: 7 * 24,
+        snapshot_cache_hard_delete_hours: 30 * 24,
+        snapshot_min_retained_bytes: 0,
+        ..Default::default()
+    };
 
     let blob = remerge_server::blob_store::store_blob(state_dir.path(), b"recently-unreferenced")
         .await
@@ -819,10 +852,12 @@ async fn cleanup_snapshot_storage_keeps_recently_unreferenced_entries_for_grace_
 #[tokio::test]
 async fn cleanup_snapshot_storage_keeps_hard_delete_eligible_entries_below_floor() {
     let state_dir = tempfile::TempDir::new().unwrap();
-    let mut config = remerge_server::config::ServerConfig::default();
-    config.snapshot_cache_grace_period_hours = 7 * 24;
-    config.snapshot_cache_hard_delete_hours = 30 * 24;
-    config.snapshot_min_retained_bytes = 1_000_000;
+    let config = remerge_server::config::ServerConfig {
+        snapshot_cache_grace_period_hours: 7 * 24,
+        snapshot_cache_hard_delete_hours: 30 * 24,
+        snapshot_min_retained_bytes: 1_000_000,
+        ..Default::default()
+    };
 
     let expired_blob = remerge_server::blob_store::store_blob(state_dir.path(), b"expired-blob")
         .await

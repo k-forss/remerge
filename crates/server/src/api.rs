@@ -282,13 +282,17 @@ async fn submit_workorder(
 
     {
         let workorders = state.workorders.read().await;
-        if let Err(error) = persistence::save_workorders(state.config.state_dir.as_path(), &workorders).await {
+        if let Err(error) =
+            persistence::save_workorders(state.config.state_dir.as_path(), &workorders).await
+        {
             warn!(error = ?error, workorder_id = %id, "Failed to persist submitted workorder");
         }
     }
     {
         let clients = state.clients.snapshot().await;
-        if let Err(error) = persistence::save_clients(state.config.state_dir.as_path(), &clients).await {
+        if let Err(error) =
+            persistence::save_clients(state.config.state_dir.as_path(), &clients).await
+        {
             warn!(error = ?error, workorder_id = %id, "Failed to persist client registry after submission");
         }
     }
@@ -1055,8 +1059,7 @@ async fn load_blob_upload_state(
             .map_err(anyhow::Error::from)
             .map_err(|error| error.context(format!("Failed to parse {}", meta_path.display()))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error)
-            .map_err(anyhow::Error::from)
+        Err(error) => Err(anyhow::Error::from(error))
             .map_err(|error| error.context(format!("Failed to read {}", meta_path.display()))),
     }
 }
@@ -1231,9 +1234,7 @@ async fn append_blob_upload_chunk(
         );
     }
     if payload.is_empty() && next_received < stream_size_bytes {
-        anyhow::bail!(
-            "Non-final chunk for {digest} must not be empty"
-        );
+        anyhow::bail!("Non-final chunk for {digest} must not be empty");
     }
 
     let part_path = blob_upload_session_part_path(state_dir, digest);

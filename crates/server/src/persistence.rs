@@ -23,7 +23,8 @@ pub async fn save_workorders(
     workorders: &HashMap<WorkorderId, Workorder>,
 ) -> Result<()> {
     let path = workorders_path(state_dir);
-    let json = serde_json::to_string_pretty(workorders).context("Failed to serialise workorders")?;
+    let json =
+        serde_json::to_string_pretty(workorders).context("Failed to serialise workorders")?;
     tokio::fs::write(&path, json)
         .await
         .context("Failed to write workorders.json")?;
@@ -152,7 +153,10 @@ pub async fn run_periodic_save(
 
         // Save results.
         {
-            let results = state.results.read().await;
+            let results = {
+                let results = state.results.read().await;
+                results.clone()
+            };
             if let Err(e) = save_results(state_dir, &results).await {
                 warn!("Failed to persist results: {e:#}");
             }
@@ -160,7 +164,10 @@ pub async fn run_periodic_save(
 
         // Save workorders.
         {
-            let workorders = state.workorders.read().await;
+            let workorders = {
+                let workorders = state.workorders.read().await;
+                workorders.clone()
+            };
             if let Err(e) = save_workorders(state_dir, &workorders).await {
                 warn!("Failed to persist workorders: {e:#}");
             }
@@ -247,8 +254,14 @@ mod tests {
             .await
             .expect("load workorders");
 
-        assert!(matches!(loaded[&building.id].status, WorkorderStatus::Pending));
-        assert!(matches!(loaded[&completed.id].status, WorkorderStatus::Completed));
+        assert!(matches!(
+            loaded[&building.id].status,
+            WorkorderStatus::Pending
+        ));
+        assert!(matches!(
+            loaded[&completed.id].status,
+            WorkorderStatus::Completed
+        ));
     }
 
     #[tokio::test]
@@ -257,19 +270,16 @@ mod tests {
         let mut workorder = test_workorder(WorkorderStatus::Pending);
         workorder.portage_config.repo_snapshot_refs.insert(
             "local-overlay".to_string(),
-            BTreeMap::from([(
-                "dev-libs/demo/demo-1.0.ebuild".to_string(),
-                "ab".repeat(32),
-            )]),
+            BTreeMap::from([("dev-libs/demo/demo-1.0.ebuild".to_string(), "ab".repeat(32))]),
         );
-        workorder.portage_config.repo_snapshot_trees.insert(
-            "local-overlay".to_string(),
-            "cd".repeat(32),
-        );
-        workorder.portage_config.distfile_snapshot_refs.insert(
-            "demo-1.0.tar.xz".to_string(),
-            "ef".repeat(32),
-        );
+        workorder
+            .portage_config
+            .repo_snapshot_trees
+            .insert("local-overlay".to_string(), "cd".repeat(32));
+        workorder
+            .portage_config
+            .distfile_snapshot_refs
+            .insert("demo-1.0.tar.xz".to_string(), "ef".repeat(32));
         let workorders = std::collections::HashMap::from([(workorder.id, workorder.clone())]);
 
         save_workorders(state_dir.path(), &workorders)
@@ -279,10 +289,29 @@ mod tests {
             .await
             .expect("load workorders");
 
-        assert_eq!(loaded[&workorder.id].portage_config.repo_snapshot_refs, workorder.portage_config.repo_snapshot_refs);
-        assert_eq!(loaded[&workorder.id].portage_config.repo_snapshot_trees, workorder.portage_config.repo_snapshot_trees);
-        assert_eq!(loaded[&workorder.id].portage_config.distfile_snapshot_refs, workorder.portage_config.distfile_snapshot_refs);
-        assert!(loaded[&workorder.id].portage_config.repo_snapshots.is_empty());
-        assert!(loaded[&workorder.id].portage_config.distfile_snapshots.is_empty());
+        assert_eq!(
+            loaded[&workorder.id].portage_config.repo_snapshot_refs,
+            workorder.portage_config.repo_snapshot_refs
+        );
+        assert_eq!(
+            loaded[&workorder.id].portage_config.repo_snapshot_trees,
+            workorder.portage_config.repo_snapshot_trees
+        );
+        assert_eq!(
+            loaded[&workorder.id].portage_config.distfile_snapshot_refs,
+            workorder.portage_config.distfile_snapshot_refs
+        );
+        assert!(
+            loaded[&workorder.id]
+                .portage_config
+                .repo_snapshots
+                .is_empty()
+        );
+        assert!(
+            loaded[&workorder.id]
+                .portage_config
+                .distfile_snapshots
+                .is_empty()
+        );
     }
 }
