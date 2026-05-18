@@ -919,3 +919,54 @@ async fn cleanup_snapshot_storage_keeps_hard_delete_eligible_entries_below_floor
             .unwrap()
     );
 }
+
+#[tokio::test]
+async fn cleanup_snapshot_storage_deletes_oldest_hard_delete_entries_first() {
+    let state_dir = tempfile::TempDir::new().unwrap();
+    let config = remerge_server::config::ServerConfig {
+        snapshot_cache_grace_period_hours: 7 * 24,
+        snapshot_cache_hard_delete_hours: 30 * 24,
+        snapshot_min_retained_bytes: b"newer-hard-delete".len() as u64,
+        ..Default::default()
+    };
+
+    let older = remerge_server::blob_store::store_blob(state_dir.path(), b"older-hard-delete")
+        .await
+        .expect("store older expired blob");
+    let newer = remerge_server::blob_store::store_blob(state_dir.path(), b"newer-hard-delete")
+        .await
+        .expect("store newer expired blob");
+
+    let now = chrono::Utc::now();
+    remerge_server::blob_store::touch_blob(
+        state_dir.path(),
+        &older.digest,
+        now - chrono::Duration::days(40),
+    )
+    .await
+    .expect("touch older expired blob");
+    remerge_server::blob_store::touch_blob(
+        state_dir.path(),
+        &newer.digest,
+        now - chrono::Duration::days(31),
+    )
+    .await
+    .expect("touch newer expired blob");
+
+    let summary =
+        remerge_server::runtime::cleanup_snapshot_storage_at(state_dir.path(), &config, &[], now)
+            .await
+            .expect("cleanup snapshot storage");
+
+    assert_eq!(summary.deleted_blobs, 1);
+    assert!(
+        !remerge_server::blob_store::has_blob(state_dir.path(), &older.digest)
+            .await
+            .unwrap()
+    );
+    assert!(
+        remerge_server::blob_store::has_blob(state_dir.path(), &newer.digest)
+            .await
+            .unwrap()
+    );
+}

@@ -414,7 +414,7 @@ async fn link_or_copy_into_place(source: &Path, target: &Path) -> Result<bool> {
         Err(error)
             if matches!(
                 error.raw_os_error(),
-                Some(libc::EXDEV | libc::EMLINK | libc::EPERM | libc::EOPNOTSUPP)
+                Some(libc::EXDEV) | Some(libc::EMLINK) | Some(libc::EPERM) | Some(libc::EOPNOTSUPP)
             ) => {}
         Err(error) => {
             return Err(error).with_context(|| {

@@ -17,6 +17,27 @@ fn workorders_path(state_dir: &Path) -> std::path::PathBuf {
     state_dir.join("workorders.json")
 }
 
+async fn write_json_with_atomic_replace(path: &Path, json: &str) -> Result<()> {
+    let parent = path.parent().context("persistence path must have parent")?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .with_context(|| format!("Failed to create {}", parent.display()))?;
+    let temp = parent.join(format!(
+        ".{}.tmp-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .context("persistence path must have utf-8 file name")?,
+        uuid::Uuid::new_v4()
+    ));
+    tokio::fs::write(&temp, json)
+        .await
+        .with_context(|| format!("Failed to write {}", temp.display()))?;
+    tokio::fs::rename(&temp, path)
+        .await
+        .with_context(|| format!("Failed to move {} into {}", temp.display(), path.display()))?;
+    Ok(())
+}
+
 /// Save workorders to disk.
 pub async fn save_workorders(
     state_dir: &Path,
@@ -25,7 +46,7 @@ pub async fn save_workorders(
     let path = workorders_path(state_dir);
     let json =
         serde_json::to_string_pretty(workorders).context("Failed to serialise workorders")?;
-    tokio::fs::write(&path, json)
+    write_json_with_atomic_replace(&path, &json)
         .await
         .context("Failed to write workorders.json")?;
     Ok(())
@@ -71,7 +92,7 @@ pub async fn save_results(
 ) -> Result<()> {
     let path = state_dir.join("results.json");
     let json = serde_json::to_string_pretty(results).context("Failed to serialise results")?;
-    tokio::fs::write(&path, json)
+    write_json_with_atomic_replace(&path, &json)
         .await
         .context("Failed to write results.json")?;
     Ok(())
@@ -99,7 +120,7 @@ pub async fn save_clients(
 ) -> Result<()> {
     let path = state_dir.join("clients.json");
     let json = serde_json::to_string_pretty(clients).context("Failed to serialise clients")?;
-    tokio::fs::write(&path, json)
+    write_json_with_atomic_replace(&path, &json)
         .await
         .context("Failed to write clients.json")?;
     Ok(())
@@ -313,5 +334,33 @@ mod tests {
                 .distfile_snapshots
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn save_workorders_atomically_replaces_existing_file() {
+        let state_dir = tempfile::TempDir::new().expect("temp state dir");
+        let original = test_workorder(WorkorderStatus::Pending);
+        let replacement = test_workorder(WorkorderStatus::Completed);
+
+        save_workorders(
+            state_dir.path(),
+            &std::collections::HashMap::from([(original.id, original.clone())]),
+        )
+        .await
+        .expect("save original workorders");
+        save_workorders(
+            state_dir.path(),
+            &std::collections::HashMap::from([(replacement.id, replacement.clone())]),
+        )
+        .await
+        .expect("save replacement workorders");
+
+        let loaded = load_workorders(state_dir.path())
+            .await
+            .expect("load replacement workorders");
+
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded.contains_key(&replacement.id));
+        assert!(!loaded.contains_key(&original.id));
     }
 }

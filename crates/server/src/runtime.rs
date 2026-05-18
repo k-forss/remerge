@@ -350,6 +350,7 @@ pub async fn cleanup_snapshot_storage_at(
     }
 
     let mut summary = SnapshotCleanupSummary::default();
+    hard_delete.sort_by_key(|entry| entry.last_referenced_at);
     for entry in &hard_delete {
         if total_retained_bytes <= config.snapshot_min_retained_bytes {
             break;
