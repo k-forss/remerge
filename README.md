@@ -15,6 +15,8 @@ binary packages locally via portage's native binhost support.
 Current project status, release-readiness gates, and implementation-ordered
 future work are tracked in [`ROADMAP.md`](ROADMAP.md).  Historical integration
 test planning has been archived under [`docs/archive/`](docs/archive/).
+Portage compatibility requirements and current compliance gaps are tracked in
+[`docs/portage-compatibility.md`](docs/portage-compatibility.md).
 Production deployment, backup, rollback, and monitoring procedures live in
 [`docs/operations.md`](docs/operations.md).
 
