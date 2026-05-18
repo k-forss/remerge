@@ -149,3 +149,15 @@ async fn store_blob_skips_zstd_variant_for_incompressible_payloads() {
     assert!(!encoded_path.exists());
     assert!(metadata.encoded_variants.is_empty());
 }
+
+#[tokio::test]
+async fn store_blob_streaming_copy_fallback_handles_large_payloads() {
+    let state_dir = tempfile::TempDir::new().unwrap();
+    let raw_bytes = vec![b'a'; 512 * 1024];
+
+    let stored = remerge_server::blob_store::store_blob(state_dir.path(), &raw_bytes)
+        .await
+        .expect("store canonical blob");
+
+    assert_eq!(tokio::fs::read(&stored.path).await.unwrap(), raw_bytes);
+}

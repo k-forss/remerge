@@ -126,6 +126,42 @@ async fn stage_workorder_runtime_writes_snapshot_files_and_strips_payload() {
 }
 
 #[tokio::test]
+async fn stage_workorder_runtime_allows_distfile_basenames_with_literal_double_dot() {
+    let state_dir = tempfile::TempDir::new().unwrap();
+    let workorder_id = uuid::Uuid::new_v4();
+
+    let mut workorder = remerge_types::workorder::Workorder {
+        id: workorder_id,
+        client_id: uuid::Uuid::new_v4(),
+        role: remerge_types::client::ClientRole::Main,
+        atoms: vec!["dev-libs/demo".into()],
+        emerge_args: vec!["dev-libs/demo".into()],
+        portage_config: common::fixtures::full_portage_config(),
+        system_id: common::fixtures::minimal_system_identity(),
+        trace_context: None,
+        status: remerge_types::workorder::WorkorderStatus::Pending,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+
+    workorder
+        .portage_config
+        .distfile_snapshots
+        .insert("foo..bar.tar.xz".into(), b"demo-distfile".to_vec());
+
+    let staged = remerge_server::runtime::stage_workorder_runtime(state_dir.path(), &workorder)
+        .await
+        .expect("stage_workorder_runtime");
+
+    assert!(
+        staged
+            .runtime_dir
+            .join("snapshots/distfiles/foo..bar.tar.xz")
+            .is_file()
+    );
+}
+
+#[tokio::test]
 async fn normalize_portage_config_snapshots_converts_inline_payloads_to_refs_only() {
     let state_dir = tempfile::TempDir::new().unwrap();
     let mut portage_config = common::fixtures::minimal_portage_config();

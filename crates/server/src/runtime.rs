@@ -202,7 +202,7 @@ pub async fn stage_workorder_runtime(
     }
 
     for (name, entry) in &manifest.distfiles {
-        let target = distfiles_dir.join(sanitize_file_name(name)?);
+        let target = distfiles_dir.join(sanitize_distfile_name(name)?);
         let digest = materialize_blob_for_digest(state_dir, &target, &entry.digest).await?;
         distfile_snapshot_refs.insert(name.clone(), digest);
     }
@@ -497,10 +497,22 @@ fn runtime_dir(state_dir: &Path, id: WorkorderId) -> PathBuf {
 }
 
 fn sanitize_file_name(name: &str) -> Result<&str> {
-    if name.is_empty() || name.contains('/') || name.contains("..") {
+    if !is_single_normal_path_component(name) {
         anyhow::bail!("invalid file name '{name}'");
     }
     Ok(name)
+}
+
+fn sanitize_distfile_name(name: &str) -> Result<&str> {
+    if !is_single_normal_path_component(name) {
+        anyhow::bail!("invalid distfile name '{name}'");
+    }
+    Ok(name)
+}
+
+fn is_single_normal_path_component(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
 }
 
 fn sanitize_relative_path(path: &str) -> Result<PathBuf> {

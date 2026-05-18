@@ -440,16 +440,18 @@ async fn link_or_copy_into_place(source: &Path, target: &Path) -> Result<bool> {
         }
     };
 
-    let bytes = tokio::fs::read(source)
+    let mut source_file = tokio::fs::File::open(source)
         .await
-        .with_context(|| format!("Failed to read {}", source.display()))?;
-    use tokio::io::AsyncWriteExt;
-    file.write_all(&bytes)
+        .with_context(|| format!("Failed to open {}", source.display()))?;
+    tokio::io::copy(&mut source_file, &mut file)
         .await
-        .with_context(|| format!("Failed to write {}", target.display()))?;
-    file.flush()
-        .await
-        .with_context(|| format!("Failed to flush {}", target.display()))?;
+        .with_context(|| {
+            format!(
+                "Failed to copy {} into {}",
+                source.display(),
+                target.display()
+            )
+        })?;
     Ok(true)
 }
 
