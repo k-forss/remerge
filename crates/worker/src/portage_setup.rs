@@ -595,6 +595,8 @@ pub async fn ensure_repo_locations_inner(
     use std::path::Component;
 
     let repos_mounted_ro = std::env::var("REMERGE_SKIP_SYNC").is_ok();
+    let repos_base_str = repos_base.to_string_lossy();
+    let repos_prefix = format!("{repos_base_str}/");
 
     for (filename, content) in &config.repos_conf {
         for (name, location) in parse_repo_sections(content) {
@@ -612,9 +614,30 @@ pub async fn ensure_repo_locations_inner(
                 );
             }
 
+            let bind_path = repos_base.join(&name);
+            let needs_remap =
+                repos_mounted_ro && location.starts_with(&repos_prefix) && !bind_path.is_dir();
+
             // Check if the path already exists (use symlink_metadata to
             // detect dangling symlinks too).
             if let Ok(meta) = loc.symlink_metadata() {
+                if needs_remap && (meta.is_dir() || (meta.is_symlink() && loc.is_dir())) {
+                    let alt = remap_base.join(&name);
+                    let alt_str = alt.to_string_lossy().to_string();
+                    fs::create_dir_all(&alt)
+                        .await
+                        .with_context(|| format!("Failed to create writable repo dir {alt_str}"))?;
+                    rewrite_repo_location_inner(repos_conf_base, filename, &location, &alt_str)
+                        .await?;
+                    info!(
+                        repo = %name,
+                        original = %location,
+                        remapped = %alt_str,
+                        "Remapped existing overlay to writable path (bind-mount is read-only)"
+                    );
+                    continue;
+                }
+
                 if meta.is_dir() || (meta.is_symlink() && loc.is_dir()) {
                     // Already a directory (or valid symlink to one).
                     continue;
@@ -627,7 +650,6 @@ pub async fn ensure_repo_locations_inner(
             }
 
             // Check if the repo is available under the bind-mount.
-            let bind_path = repos_base.join(&name);
             if bind_path.is_dir() {
                 if let Some(parent) = loc.parent() {
                     fs::create_dir_all(parent)
@@ -648,9 +670,7 @@ pub async fn ensure_repo_locations_inner(
 
             // Repo not in bind-mount.  If the location is under the
             // read-only mount, remap to a writable alternative path.
-            let repos_base_str = repos_base.to_string_lossy();
-            let repos_prefix = format!("{repos_base_str}/");
-            if repos_mounted_ro && location.starts_with(&repos_prefix) {
+            if needs_remap {
                 let alt = remap_base.join(&name);
                 let alt_str = alt.to_string_lossy().to_string();
                 fs::create_dir_all(&alt)
