@@ -79,6 +79,18 @@ impl Verbosity {
             match token {
                 "--quiet" | "-q" => return Verbosity::Quiet,
                 "--verbose" | "-v" => verbose_count = verbose_count.saturating_add(1),
+                // Clustered short flags: -vv (debug), -vvv (trace), -qq, etc.
+                t if t.starts_with('-')
+                    && t.len() > 1
+                    && t[1..].chars().all(|c| c == 'v' || c == 'q') =>
+                {
+                    let ch = t.chars().nth(1).unwrap();
+                    if ch == 'q' {
+                        return Verbosity::Quiet;
+                    }
+                    // Each 'v' in the cluster counts as one verbose flag.
+                    verbose_count = verbose_count.saturating_add((t.len() - 1) as u8);
+                }
                 _ => {}
             }
         }

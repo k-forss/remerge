@@ -745,9 +745,6 @@ impl RemergeClient {
                         // Binary frames carry raw PTY bytes — write directly to stdout.
                         // In log_json mode they are skipped to avoid corrupting the
                         // NDJSON stream; CI tooling should not need raw terminal bytes.
-                        // Binary frames carry raw PTY bytes — write directly to stdout.
-                        // In log_json mode they are skipped to avoid corrupting the
-                        // NDJSON stream; CI tooling should not need raw terminal bytes.
                         tokio_tungstenite::tungstenite::Message::Binary(data)
                             if !log_json =>
                         {

@@ -422,10 +422,12 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
             "REMERGE_WORKORDER_PATH=/var/cache/remerge/workorder/workorder.json".to_string(),
             "REMERGE_PARITY_OUTPUT_DIR=/var/cache/remerge/parity".to_string(),
             format!("REMERGE_WORKORDER_ID={workorder_id}"),
-            // Always capture at trace level in the worker; the per-connection
-            // ceiling filter in the WS handler gates what gets forwarded to
-            // each client so no over-capture reaches the wire.
-            "REMERGE_WORKER_LOG_LEVEL=trace".to_string(),
+            // Capture at info by default.  The per-connection ceiling filter
+            // in the WS handler gates what gets forwarded to each client, so
+            // operators who need more detail can reconnect with --verbose/-vv.
+            // Set REMERGE_WORKER_LOG_LEVEL=debug/trace in the server
+            // environment to increase the capture level globally.
+            "REMERGE_WORKER_LOG_LEVEL=info".to_string(),
         ];
         if let Some(traceparent) = traceparent {
             env.push(format!("REMERGE_TRACEPARENT={traceparent}"));

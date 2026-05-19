@@ -207,8 +207,7 @@ impl MockFixtureServer {
 
         // Wait until the server is actually accepting connections instead of
         // using a fixed sleep, which is flaky on slow CI runners.
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if tokio::net::TcpStream::connect(("127.0.0.1", port))
                 .await

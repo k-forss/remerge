@@ -1031,9 +1031,15 @@ impl Cli {
         // Inject a verbosity flag if the user hasn't already provided one and
         // the verbosity differs from Normal.
         if let Some(flag) = verbosity.emerge_flag() {
-            let already_present = args
-                .iter()
-                .any(|a| matches!(a.as_str(), "-q" | "--quiet" | "-v" | "--verbose"));
+            let already_present = args.iter().any(|a| {
+                matches!(a.as_str(), "-q" | "--quiet" | "-v" | "--verbose") || {
+                    // Also recognise clustered short flags like -vv, -vvv, -qq.
+                    let s = a.as_str();
+                    s.starts_with('-')
+                        && s.len() > 2
+                        && s[1..].chars().all(|c| c == 'v' || c == 'q')
+                }
+            });
             if !already_present {
                 // Prepend so it applies before any user-supplied flags.
                 args.insert(0, flag.to_string());

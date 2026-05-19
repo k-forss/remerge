@@ -64,7 +64,7 @@ resulting `LogLevel` as a ceiling filter when forwarding events:
 
 The worker always emits up to the level configured by
 `REMERGE_WORKER_LOG_LEVEL` (default `info`).  The server stores ALL
-forwarded events in the ring buffer; each WS connection independently
+received events in the ring buffer; each WS connection independently
 applies its own ceiling.
 
 ### Scope filter invariant
@@ -89,10 +89,11 @@ discard any duplicates in the overlap window.
 ```rust
 // crates/types/src/api.rs
 pub struct LogEvent {
-    pub workorder_id: WorkorderId,
     pub level: LogLevel,
-    pub target: String,   // tracing span/target name
+    pub target: String,   // Rust module path of the log site (e.g. `remerge_worker::builder`)
     pub message: String,
+    pub workorder_id: WorkorderId,
+    pub span: Option<String>,  // active tracing span name, if any
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 

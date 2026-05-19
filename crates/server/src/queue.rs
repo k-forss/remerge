@@ -266,6 +266,87 @@ pub async fn process_queue(state: Arc<AppState>) {
     }
 }
 
+/// Run the emerge-output regex matchers against a single complete line and
+/// dispatch the appropriate `WorkerEvent` when a pattern matches.
+///
+/// This is factored out so the streaming PTY filter can call it from two
+/// different code paths (short line at line-start, and end-of-line in
+/// passthrough mode) without duplicating the match logic.
+#[allow(clippy::too_many_arguments)]
+async fn match_emerge_line(
+    line: &str,
+    re_emerging: &Regex,
+    re_completed: &Regex,
+    re_error: &Regex,
+    re_missing_dep: &Regex,
+    re_use_conflict: &Regex,
+    re_fetch_fail: &Regex,
+    current_package: &mut Option<(String, Instant)>,
+    event_tx: &tokio::sync::mpsc::Sender<WorkerEvent>,
+) {
+    if let Some(caps) = re_emerging.captures(line) {
+        if let Some(atom) = caps.get(1) {
+            *current_package = Some((atom.as_str().to_string(), Instant::now()));
+        }
+    } else if let Some(caps) = re_completed.captures(line) {
+        if let Some(atom_match) = caps.get(1) {
+            let atom = atom_match.as_str().to_string();
+            let duration = current_package
+                .as_ref()
+                .filter(|(pkg, _)| *pkg == atom)
+                .map(|(_, start)| start.elapsed().as_secs())
+                .unwrap_or(0);
+            let _ = event_tx
+                .send(WorkerEvent::PackageBuilt {
+                    atom: atom.clone(),
+                    duration_secs: duration,
+                })
+                .await;
+            *current_package = None;
+        }
+    } else if let Some(caps) = re_error.captures(line) {
+        if let Some(atom_match) = caps.get(1) {
+            let _ = event_tx
+                .send(WorkerEvent::PackageFailed {
+                    atom: atom_match.as_str().to_string(),
+                    reason: line.to_string(),
+                })
+                .await;
+        }
+    } else if let Some(caps) = re_missing_dep.captures(line) {
+        if let Some(dep) = caps.get(1) {
+            let _ = event_tx
+                .send(WorkerEvent::PackageFailed {
+                    atom: dep.as_str().to_string(),
+                    reason: format!("Missing dependency: {line}"),
+                })
+                .await;
+        }
+    } else if re_use_conflict.is_match(line) {
+        let atom = current_package
+            .as_ref()
+            .map(|(a, _)| a.clone())
+            .unwrap_or_else(|| "unknown".into());
+        let _ = event_tx
+            .send(WorkerEvent::PackageFailed {
+                atom,
+                reason: format!("USE flag conflict: {line}"),
+            })
+            .await;
+    } else if re_fetch_fail.is_match(line) {
+        let atom = current_package
+            .as_ref()
+            .map(|(a, _)| a.clone())
+            .unwrap_or_else(|| "unknown".into());
+        let _ = event_tx
+            .send(WorkerEvent::PackageFailed {
+                atom,
+                reason: format!("Fetch failure: {line}"),
+            })
+            .await;
+    }
+}
+
 /// Process a single workorder end-to-end.
 async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyhow::Result<()> {
     let id = workorder.id;
@@ -556,135 +637,152 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
         });
 
         let mut current_package: Option<(String, Instant)> = None;
-        let mut line_buf = Vec::with_capacity(8192);
+
+        // ── Streaming REMERGE_EVENT: filter ─────────────────────────────
+        //
+        // PTY bytes are forwarded to WS clients immediately (no line-level
+        // buffering) so that `\r`-terminated progress updates (e.g. download
+        // progress bars) remain low-latency.  `REMERGE_EVENT:` control lines
+        // are detected at line-start and consumed without forwarding.
+        //
+        // State machine:
+        //   at_line_start – the next incoming byte begins a new logical line
+        //   prefix_buf    – leading bytes of the current line during the
+        //                   prefix-check phase (≤ REMERGE_PREFIX.len() bytes)
+        //   skip_line     – consuming the tail of a confirmed REMERGE_EVENT:
+        //                   line (do not forward these bytes)
+        //   event_line_buf – full bytes of the current control line, built
+        //                   while skip_line is true; parsed on '\n'
+        //   pattern_buf   – secondary per-line buffer for emerge-output regex
+        //                   matching; kept in sync with each logical line but
+        //                   never gates the PTY relay
+        const REMERGE_PREFIX: &[u8] = b"REMERGE_EVENT:";
+        let mut at_line_start = true;
+        let mut prefix_buf: Vec<u8> = Vec::with_capacity(REMERGE_PREFIX.len() + 1);
+        let mut skip_line = false;
+        let mut event_line_buf: Vec<u8> = Vec::new();
+        let mut pattern_buf: Vec<u8> = Vec::with_capacity(4096);
 
         while let Some(result) = output.next().await {
             match result {
                 Ok(log_output) => {
-                    // Accumulate bytes for line-based event detection.
-                    // We extract REMERGE_EVENT: control lines before
-                    // broadcasting, so WS (PTY-relay) clients never see
-                    // raw structured-event JSON mixed in with emerge output.
-                    line_buf.extend_from_slice(&log_output.into_bytes());
+                    let bytes = log_output.into_bytes();
+                    let mut forward: Vec<u8> = Vec::with_capacity(bytes.len());
 
-                    // Cap buffer to prevent unbounded growth.
-                    const MAX_LINE_BUF: usize = 64 * 1024;
-                    if line_buf.len() > MAX_LINE_BUF {
-                        line_buf.drain(..line_buf.len() - MAX_LINE_BUF);
-                    }
-
-                    // Process complete lines: structured-event lines
-                    // (REMERGE_EVENT:) are handled internally; all other lines
-                    // are collected for broadcasting so WS clients receive
-                    // clean PTY output only.
-                    let mut clean: Vec<u8> = Vec::new();
-                    while let Some(newline_pos) = line_buf.iter().position(|&b| b == b'\n') {
-                        let line = String::from_utf8_lossy(&line_buf[..newline_pos])
-                            .trim_end_matches('\r')
-                            .to_string();
-
-                        // Check for structured events emitted by the worker.
-                        if let Some(json_str) = line.strip_prefix("REMERGE_EVENT:")
-                            && let Ok(event) = serde_json::from_str::<WorkerEvent>(json_str)
-                        {
-                            // Do NOT add to `clean` — control lines must not
-                            // reach PTY/WS clients as raw bytes.
-                            line_buf.drain(..=newline_pos);
-                            match event {
-                                WorkerEvent::Log { event: log_event } => {
-                                    // Scope-filter: reject events whose
-                                    // workorder_id does not match the running
-                                    // workorder so a misbehaving container
-                                    // cannot poison another workorder's ring
-                                    // buffer.
-                                    if log_event.workorder_id != id {
-                                        continue;
+                    for &b in bytes.iter() {
+                        if skip_line {
+                            // Consuming REMERGE_EVENT: tail — accumulate for
+                            // parsing but do NOT forward to PTY clients.
+                            event_line_buf.push(b);
+                            if b == b'\n' {
+                                // Full control line — parse and dispatch.
+                                let raw = String::from_utf8_lossy(&event_line_buf);
+                                let json_str =
+                                    raw[REMERGE_PREFIX.len()..].trim_end_matches(['\r', '\n']);
+                                if let Ok(event) = serde_json::from_str::<WorkerEvent>(json_str) {
+                                    match event {
+                                        WorkerEvent::Log { event: log_event } => {
+                                            // Scope-filter: reject events from
+                                            // other workorders so a misbehaving
+                                            // container cannot pollute the ring
+                                            // buffer of a concurrent build.
+                                            if log_event.workorder_id == id {
+                                                log_state.push_log_event(id, log_event).await;
+                                            }
+                                        }
+                                        other => {
+                                            let _ = event_tx.send(other).await;
+                                        }
                                     }
-                                    // Push directly to the ring buffer and
-                                    // broadcast — no buffering in the mpsc
-                                    // channel so WS clients see events in
-                                    // real time.
-                                    log_state.push_log_event(id, log_event).await;
                                 }
-                                other => {
-                                    let _ = event_tx.send(other).await;
-                                }
+                                event_line_buf.clear();
+                                skip_line = false;
+                                at_line_start = true;
+                            } else if event_line_buf.len() > 256 * 1024 {
+                                // Guard against runaway/unterminated control
+                                // lines to prevent unbounded memory growth.
+                                event_line_buf.clear();
+                                skip_line = false;
+                                at_line_start = true;
                             }
                             continue;
                         }
 
-                        // Regular PTY output: include in broadcast.
-                        clean.extend_from_slice(&line_buf[..=newline_pos]);
-                        line_buf.drain(..=newline_pos);
+                        if at_line_start {
+                            prefix_buf.push(b);
+                            let n = prefix_buf.len();
 
-                        // Parse emerge output patterns.
-                        if let Some(caps) = re_emerging.captures(&line) {
-                            if let Some(atom) = caps.get(1) {
-                                current_package = Some((atom.as_str().to_string(), Instant::now()));
-                            }
-                        } else if let Some(caps) = re_completed.captures(&line) {
-                            if let Some(atom_match) = caps.get(1) {
-                                let atom = atom_match.as_str().to_string();
-                                let duration = current_package
-                                    .as_ref()
-                                    .filter(|(pkg, _)| *pkg == atom)
-                                    .map(|(_, start)| start.elapsed().as_secs())
-                                    .unwrap_or(0);
-                                let _ = event_tx
-                                    .send(WorkerEvent::PackageBuilt {
-                                        atom: atom.clone(),
-                                        duration_secs: duration,
-                                    })
-                                    .await;
-                                current_package = None;
-                            }
-                        } else if let Some(caps) = re_error.captures(&line) {
-                            if let Some(atom_match) = caps.get(1) {
-                                let _ = event_tx
-                                    .send(WorkerEvent::PackageFailed {
-                                        atom: atom_match.as_str().to_string(),
-                                        reason: line.clone(),
-                                    })
-                                    .await;
-                            }
-                        } else if let Some(caps) = re_missing_dep.captures(&line) {
-                            if let Some(dep) = caps.get(1) {
-                                let _ = event_tx
-                                    .send(WorkerEvent::PackageFailed {
-                                        atom: dep.as_str().to_string(),
-                                        reason: format!("Missing dependency: {line}"),
-                                    })
-                                    .await;
-                            }
-                        } else if re_use_conflict.is_match(&line) {
-                            let atom = current_package
-                                .as_ref()
-                                .map(|(a, _)| a.clone())
-                                .unwrap_or_else(|| "unknown".into());
-                            let _ = event_tx
-                                .send(WorkerEvent::PackageFailed {
-                                    atom,
-                                    reason: format!("USE flag conflict: {line}"),
-                                })
+                            if b == b'\n' {
+                                // Line ended before we accumulated enough bytes
+                                // to match the prefix — short/empty line.
+                                // Forward immediately and run pattern matching.
+                                forward.extend_from_slice(&prefix_buf);
+                                pattern_buf.extend_from_slice(&prefix_buf);
+                                let line = String::from_utf8_lossy(&pattern_buf)
+                                    .trim_end_matches(['\r', '\n'])
+                                    .to_string();
+                                pattern_buf.clear();
+                                prefix_buf.clear();
+                                // at_line_start stays true
+                                match_emerge_line(
+                                    &line,
+                                    &re_emerging,
+                                    &re_completed,
+                                    &re_error,
+                                    &re_missing_dep,
+                                    &re_use_conflict,
+                                    &re_fetch_fail,
+                                    &mut current_package,
+                                    &event_tx,
+                                )
                                 .await;
-                        } else if re_fetch_fail.is_match(&line) {
-                            let atom = current_package
-                                .as_ref()
-                                .map(|(a, _)| a.clone())
-                                .unwrap_or_else(|| "unknown".into());
-                            let _ = event_tx
-                                .send(WorkerEvent::PackageFailed {
-                                    atom,
-                                    reason: format!("Fetch failure: {line}"),
-                                })
+                            } else if REMERGE_PREFIX[..n] != prefix_buf[..] {
+                                // Prefix does not match — regular PTY line.
+                                // Flush accumulated prefix immediately and
+                                // switch to passthrough mode for the remainder.
+                                forward.extend_from_slice(&prefix_buf);
+                                pattern_buf.extend_from_slice(&prefix_buf);
+                                prefix_buf.clear();
+                                at_line_start = false;
+                            } else if n == REMERGE_PREFIX.len() {
+                                // Exact prefix match — REMERGE_EVENT: line.
+                                // Do NOT forward; start accumulating for JSON.
+                                event_line_buf.extend_from_slice(REMERGE_PREFIX);
+                                pattern_buf.clear(); // control line, not for patterns
+                                prefix_buf.clear();
+                                skip_line = true;
+                                at_line_start = false;
+                            }
+                            // else: still building prefix — keep accumulating
+                        } else {
+                            // Passthrough: forward byte immediately.
+                            forward.push(b);
+                            pattern_buf.push(b);
+
+                            if b == b'\n' {
+                                let line = String::from_utf8_lossy(&pattern_buf)
+                                    .trim_end_matches(['\r', '\n'])
+                                    .to_string();
+                                pattern_buf.clear();
+                                at_line_start = true;
+                                match_emerge_line(
+                                    &line,
+                                    &re_emerging,
+                                    &re_completed,
+                                    &re_error,
+                                    &re_missing_dep,
+                                    &re_use_conflict,
+                                    &re_fetch_fail,
+                                    &mut current_package,
+                                    &event_tx,
+                                )
                                 .await;
+                            }
                         }
                     }
 
-                    // Broadcast only the clean (non-REMERGE_EVENT) PTY bytes
-                    // to connected WebSocket clients.
-                    if !clean.is_empty() {
-                        let _ = raw_tx.send(bytes::Bytes::from(clean));
+                    if !forward.is_empty() {
+                        let _ = raw_tx.send(bytes::Bytes::from(forward));
                     }
                 }
                 Err(e) => {
