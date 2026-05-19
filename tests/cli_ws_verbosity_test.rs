@@ -205,8 +205,23 @@ impl MockFixtureServer {
             let _ = axum::serve(listener, app).await;
         });
 
-        // Brief pause for the server to start accepting connections.
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // Wait until the server is actually accepting connections instead of
+        // using a fixed sleep, which is flaky on slow CI runners.
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "mock server did not become ready within 5 s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
 
         MockFixtureServer {
             port,

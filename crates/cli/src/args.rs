@@ -1052,7 +1052,16 @@ impl Cli {
         let bar = StatusBar::global();
         // In log_json mode suppress all status bar output so ANSI codes don't
         // pollute the NDJSON stream on stderr and CI systems receive clean JSON.
-        let bar = if self.log_json { None } else { bar };
+        // Also silence the global bar so helpers that call StatusBar::global()
+        // directly (e.g. run_with_watchdog) also become no-ops.
+        let bar = if self.log_json {
+            if let Some(b) = &bar {
+                b.silence();
+            }
+            None
+        } else {
+            bar
+        };
 
         // 0. Load persistent config (server URL + client ID).
         let cfg = CliConfig::load_or_create(&self.config).unwrap_or_else(|e| {
@@ -1118,6 +1127,10 @@ impl Cli {
                         b.println(&format!(
                             "  ⏭  {atom} — already installed (use --force to rebuild)"
                         ));
+                    } else if self.log_json {
+                        // In log-json mode stdout carries NDJSON only; route
+                        // human-readable messages to stderr.
+                        eprintln!("  ⏭  {atom} — already installed (use --force to rebuild)");
                     } else {
                         println!("  ⏭  {atom} — already installed (use --force to rebuild)");
                     }
@@ -1129,7 +1142,12 @@ impl Cli {
                 if let Some(ref b) = bar {
                     b.finish();
                 }
-                println!("All packages are already installed. Nothing to do.");
+                // In log-json mode stdout carries NDJSON only; route to stderr.
+                if self.log_json {
+                    eprintln!("All packages are already installed. Nothing to do.");
+                } else {
+                    println!("All packages are already installed. Nothing to do.");
+                }
                 return Ok(());
             }
             filtered

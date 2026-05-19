@@ -297,7 +297,18 @@ fn render(phase: &str, elapsed: Duration) -> String {
         .saturating_sub(suffix.len());
 
     let phase_str = if phase.len() > budget && budget > 1 {
-        format!("{}…", &phase[..budget.saturating_sub(1)])
+        // Reserve bytes for the 3-byte Unicode ellipsis "…" (U+2026).
+        let available = budget.saturating_sub(3);
+        // Walk char boundaries to find the largest one within `available`
+        // bytes.  `floor_char_boundary` would be cleaner but is only stable
+        // from Rust 1.91.0 and the project MSRV is 1.88.0.
+        let end = phase
+            .char_indices()
+            .map(|(i, c)| i + c.len_utf8())
+            .take_while(|&e| e <= available)
+            .last()
+            .unwrap_or(0);
+        format!("{}…", &phase[..end])
     } else {
         phase.to_string()
     };

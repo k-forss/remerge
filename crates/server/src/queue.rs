@@ -561,17 +561,11 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
         while let Some(result) = output.next().await {
             match result {
                 Ok(log_output) => {
-                    // `into_bytes()` already returns `Bytes` (reference-counted),
-                    // so the broadcast clone is a cheap pointer increment rather
-                    // than a full copy.
-                    let raw_bytes: bytes::Bytes = log_output.into_bytes();
-
-                    // Accumulate bytes for line-based event detection before
-                    // broadcasting, so we only hold one allocation.
-                    line_buf.extend_from_slice(&raw_bytes);
-
-                    // Send raw bytes to connected clients for direct PTY relay.
-                    let _ = raw_tx.send(raw_bytes);
+                    // Accumulate bytes for line-based event detection.
+                    // We extract REMERGE_EVENT: control lines before
+                    // broadcasting, so WS (PTY-relay) clients never see
+                    // raw structured-event JSON mixed in with emerge output.
+                    line_buf.extend_from_slice(&log_output.into_bytes());
 
                     // Cap buffer to prevent unbounded growth.
                     const MAX_LINE_BUF: usize = 64 * 1024;
@@ -579,17 +573,23 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
                         line_buf.drain(..line_buf.len() - MAX_LINE_BUF);
                     }
 
-                    // Process complete lines for structured event detection.
+                    // Process complete lines: structured-event lines
+                    // (REMERGE_EVENT:) are handled internally; all other lines
+                    // are collected for broadcasting so WS clients receive
+                    // clean PTY output only.
+                    let mut clean: Vec<u8> = Vec::new();
                     while let Some(newline_pos) = line_buf.iter().position(|&b| b == b'\n') {
                         let line = String::from_utf8_lossy(&line_buf[..newline_pos])
                             .trim_end_matches('\r')
                             .to_string();
-                        line_buf.drain(..=newline_pos);
 
                         // Check for structured events emitted by the worker.
                         if let Some(json_str) = line.strip_prefix("REMERGE_EVENT:")
                             && let Ok(event) = serde_json::from_str::<WorkerEvent>(json_str)
                         {
+                            // Do NOT add to `clean` — control lines must not
+                            // reach PTY/WS clients as raw bytes.
+                            line_buf.drain(..=newline_pos);
                             match event {
                                 WorkerEvent::Log { event: log_event } => {
                                     // Scope-filter: reject events whose
@@ -612,6 +612,10 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
                             }
                             continue;
                         }
+
+                        // Regular PTY output: include in broadcast.
+                        clean.extend_from_slice(&line_buf[..=newline_pos]);
+                        line_buf.drain(..=newline_pos);
 
                         // Parse emerge output patterns.
                         if let Some(caps) = re_emerging.captures(&line) {
@@ -675,6 +679,12 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
                                 })
                                 .await;
                         }
+                    }
+
+                    // Broadcast only the clean (non-REMERGE_EVENT) PTY bytes
+                    // to connected WebSocket clients.
+                    if !clean.is_empty() {
+                        let _ = raw_tx.send(bytes::Bytes::from(clean));
                     }
                 }
                 Err(e) => {
