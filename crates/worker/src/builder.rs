@@ -28,7 +28,6 @@ fn build_emerge_args(workorder: &Workorder) -> Vec<String> {
     let mut args = vec![
         "--buildpkg".to_string(),
         "--usepkg".to_string(),
-        "--verbose".to_string(),
         "--ask=n".to_string(),
         "--color=y".to_string(),
         "--keep-going".to_string(),

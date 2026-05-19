@@ -120,6 +120,8 @@ impl AppState {
 
         let mut progress_txs = HashMap::new();
         let mut raw_output_txs = HashMap::new();
+        let mut log_ring_bufs = HashMap::new();
+        let mut log_event_txs = HashMap::new();
         for id in persisted_workorders.keys().copied().filter(|id| {
             persisted_workorders.get(id).is_some_and(|workorder| {
                 matches!(
@@ -134,6 +136,9 @@ impl AppState {
             raw_output_txs.insert(id, raw_tx);
             let (tx, _) = broadcast::channel(256);
             progress_txs.insert(id, tx);
+            log_ring_bufs.insert(id, VecDeque::with_capacity(LOG_RING_CAPACITY));
+            let (log_tx, _) = broadcast::channel(LOG_RING_CAPACITY);
+            log_event_txs.insert(id, log_tx);
         }
 
         let max_workers = config.max_workers;
@@ -158,8 +163,8 @@ impl AppState {
             metrics: Metrics::new(),
             binpkg_repo,
             signing_key,
-            log_ring_bufs: RwLock::new(HashMap::new()),
-            log_event_txs: RwLock::new(HashMap::new()),
+            log_ring_bufs: RwLock::new(log_ring_bufs),
+            log_event_txs: RwLock::new(log_event_txs),
         })
     }
 
@@ -324,8 +329,8 @@ impl AppState {
         let mut raw_output_txs = self.raw_output_txs.write().await;
         let mut stdin_txs = self.stdin_txs.write().await;
         let mut container_ids = self.container_ids.write().await;
-        let mut log_event_txs = self.log_event_txs.write().await;
         let mut log_ring_bufs = self.log_ring_bufs.write().await;
+        let mut log_event_txs = self.log_event_txs.write().await;
 
         let mut evicted = 0;
 

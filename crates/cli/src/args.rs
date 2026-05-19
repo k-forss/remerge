@@ -43,7 +43,7 @@ pub async fn reconcile_final_state_parity_into(
         return Ok(());
     }
 
-    println!(
+    eprintln!(
         "Reconciling final-state parity for {} file(s), {} director(ies), and {} symlink(s)…",
         result.parity_manifest.files.len(),
         result.parity_manifest.directories.len(),
@@ -89,9 +89,9 @@ pub async fn reconcile_final_state_parity_into(
     }
 
     if !issues.is_empty() {
-        println!("Final-state parity reconciliation failed:");
+        eprintln!("Final-state parity reconciliation failed:");
         for issue in &issues {
-            println!("  - {issue}");
+            eprintln!("  - {issue}");
         }
         anyhow::bail!(
             "Final-state parity reconciliation failed for {} path(s): {}",
@@ -100,7 +100,7 @@ pub async fn reconcile_final_state_parity_into(
         );
     }
 
-    println!("Final-state parity reconciled in {}", parity_root.display());
+    eprintln!("Final-state parity reconciled in {}", parity_root.display());
     Ok(())
 }
 
@@ -113,7 +113,7 @@ pub async fn reconcile_fetched_distfiles_into(
         return Ok(());
     }
 
-    println!(
+    eprintln!(
         "Reconciling fetched distfiles for {} file(s)…",
         result.fetched_distfiles.len()
     );
@@ -128,9 +128,9 @@ pub async fn reconcile_fetched_distfiles_into(
     }
 
     if !issues.is_empty() {
-        println!("Fetched distfile reconciliation failed:");
+        eprintln!("Fetched distfile reconciliation failed:");
         for issue in &issues {
-            println!("  - {issue}");
+            eprintln!("  - {issue}");
         }
         anyhow::bail!(
             "Fetched distfile reconciliation failed for {} path(s): {}",
@@ -139,7 +139,7 @@ pub async fn reconcile_fetched_distfiles_into(
         );
     }
 
-    println!("Fetched distfiles reconciled in {}", distdir.display());
+    eprintln!("Fetched distfiles reconciled in {}", distdir.display());
     Ok(())
 }
 

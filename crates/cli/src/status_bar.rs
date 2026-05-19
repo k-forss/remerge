@@ -238,6 +238,9 @@ impl StatusBar {
     /// Use this instead of `eprintln!` for structured messages emitted while
     /// the bar might be visible.
     pub fn println(&self, msg: &str) {
+        if self.mode == StatusBarMode::Silent || self.silenced.load(Ordering::Relaxed) {
+            return;
+        }
         if self.mode == StatusBarMode::Tty {
             let state = self.state.lock().unwrap();
             if !state.hidden && !state.phase.is_empty() {
