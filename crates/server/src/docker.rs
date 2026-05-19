@@ -382,6 +382,7 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
         &self,
         container_name: &str,
         image_tag: &str,
+        workorder_id: remerge_types::workorder::WorkorderId,
         runtime_dir: &Path,
         traceparent: Option<&str>,
         server_config: &ServerConfig,
@@ -420,6 +421,11 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
         let mut env = vec![
             "REMERGE_WORKORDER_PATH=/var/cache/remerge/workorder/workorder.json".to_string(),
             "REMERGE_PARITY_OUTPUT_DIR=/var/cache/remerge/parity".to_string(),
+            format!("REMERGE_WORKORDER_ID={workorder_id}"),
+            // Always capture at trace level in the worker; the per-connection
+            // ceiling filter in the WS handler gates what gets forwarded to
+            // each client so no over-capture reaches the wire.
+            "REMERGE_WORKER_LOG_LEVEL=trace".to_string(),
         ];
         if let Some(traceparent) = traceparent {
             env.push(format!("REMERGE_TRACEPARENT={traceparent}"));

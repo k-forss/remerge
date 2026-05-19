@@ -12,6 +12,8 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
+pub mod ws_log;
+
 pub struct TelemetryGuard {
     provider: Option<SdkTracerProvider>,
 }
@@ -25,6 +27,14 @@ impl Drop for TelemetryGuard {
 }
 
 pub fn init_tracing(service_name: &'static str, json: bool) -> Result<TelemetryGuard> {
+    init_tracing_with_ws_log(service_name, json, None)
+}
+
+pub fn init_tracing_with_ws_log(
+    service_name: &'static str,
+    json: bool,
+    ws_log: Option<ws_log::WsLogLayer>,
+) -> Result<TelemetryGuard> {
     global::set_text_map_propagator(TraceContextPropagator::new());
 
     let resource = Resource::builder_empty()
@@ -49,12 +59,14 @@ pub fn init_tracing(service_name: &'static str, json: bool) -> Result<TelemetryG
 
     if json {
         tracing_subscriber::registry()
+            .with(ws_log)
             .with(env_filter)
             .with(telemetry_layer)
             .with(tracing_subscriber::fmt::layer().json())
             .init();
     } else {
         tracing_subscriber::registry()
+            .with(ws_log)
             .with(env_filter)
             .with(telemetry_layer)
             .with(tracing_subscriber::fmt::layer())

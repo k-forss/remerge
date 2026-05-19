@@ -1,6 +1,6 @@
 //! Shared application state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -9,6 +9,7 @@ use bytes::Bytes;
 use tokio::sync::{Mutex, RwLock, Semaphore, broadcast, mpsc};
 use tokio::task;
 
+use remerge_types::api::{LogEvent, LogLevel};
 use remerge_types::workorder::{
     BuildProgress, Workorder, WorkorderId, WorkorderResult, WorkorderStatus,
 };
@@ -21,6 +22,9 @@ use crate::registry::ClientRegistry;
 use crate::repo::BinpkgRepo;
 use crate::runtime::SnapshotReferenceSet;
 use crate::signing::ExportedSigningKey;
+
+/// Maximum number of log events retained per workorder for WS replay.
+const LOG_RING_CAPACITY: usize = 256;
 
 /// Central application state shared across handlers and the queue processor.
 pub struct AppState {
@@ -77,6 +81,14 @@ pub struct AppState {
 
     /// Exported public signing key, if binpkg signing is enabled.
     pub signing_key: Option<ExportedSigningKey>,
+
+    /// Per-workorder ring buffers holding the most recent log events.
+    /// Replayed to newly connected WS clients so they receive log history
+    /// even when connecting after the worker has already emitted events.
+    pub log_ring_bufs: RwLock<HashMap<WorkorderId, VecDeque<LogEvent>>>,
+
+    /// Per-workorder broadcast channels for live log event forwarding.
+    pub log_event_txs: RwLock<HashMap<WorkorderId, broadcast::Sender<LogEvent>>>,
 }
 
 impl AppState {
@@ -146,10 +158,16 @@ impl AppState {
             metrics: Metrics::new(),
             binpkg_repo,
             signing_key,
+            log_ring_bufs: RwLock::new(HashMap::new()),
+            log_event_txs: RwLock::new(HashMap::new()),
         })
     }
 
-    /// Create a broadcast channel for a workorder and return the sender.
+    /// Create broadcast channels for a workorder and return the progress sender.
+    ///
+    /// Also creates the log ring buffer and log event broadcast channel for
+    /// the workorder so log events can be stored and forwarded from the
+    /// moment the worker starts.
     pub async fn create_progress_channel(
         &self,
         id: WorkorderId,
@@ -162,7 +180,65 @@ impl AppState {
         let (tx, _) = broadcast::channel(256);
         self.progress_txs.write().await.insert(id, tx.clone());
 
+        // Set up log event storage and broadcasting.
+        self.log_ring_bufs
+            .write()
+            .await
+            .insert(id, VecDeque::with_capacity(LOG_RING_CAPACITY));
+        let (log_tx, _) = broadcast::channel(LOG_RING_CAPACITY);
+        self.log_event_txs.write().await.insert(id, log_tx);
+
         tx
+    }
+
+    /// Push a log event into the workorder's ring buffer and broadcast it to
+    /// any connected WS subscribers.
+    ///
+    /// Older events are evicted from the ring buffer when capacity is reached.
+    /// Silently does nothing if the workorder is unknown (e.g. after cleanup).
+    pub async fn push_log_event(&self, id: WorkorderId, event: LogEvent) {
+        // Store in ring buffer — evict oldest if full.
+        if let Some(buf) = self.log_ring_bufs.write().await.get_mut(&id) {
+            if buf.len() >= LOG_RING_CAPACITY {
+                buf.pop_front();
+            }
+            buf.push_back(event.clone());
+        }
+        // Broadcast to live subscribers (it is not an error if there are none).
+        if let Some(tx) = self.log_event_txs.read().await.get(&id) {
+            let _ = tx.send(event);
+        }
+    }
+
+    /// Subscribe to live log events for `id` and return a snapshot of buffered
+    /// events together with the live receiver.
+    ///
+    /// The snapshot is taken AFTER subscribing to the channel to avoid a
+    /// race where a new event is emitted between the snapshot and subscribe.
+    /// Callers replay the snapshot first, then drain from the receiver,
+    /// deduplicating any overlap by timestamp.
+    ///
+    /// Returns `None` if the workorder has no log channel (not yet started or
+    /// already cleaned up).
+    pub async fn subscribe_logs(
+        &self,
+        id: &WorkorderId,
+        level: LogLevel,
+    ) -> Option<(Vec<LogEvent>, broadcast::Receiver<LogEvent>)> {
+        let rx = self
+            .log_event_txs
+            .read()
+            .await
+            .get(id)
+            .map(|tx| tx.subscribe())?;
+        let snapshot: Vec<LogEvent> = self
+            .log_ring_bufs
+            .read()
+            .await
+            .get(id)
+            .map(|buf| buf.iter().filter(|e| e.level <= level).cloned().collect())
+            .unwrap_or_default();
+        Some((snapshot, rx))
     }
 
     /// Get a receiver for an existing workorder's progress channel.
@@ -203,8 +279,8 @@ impl AppState {
         self.stdin_txs.read().await.get(id).cloned()
     }
 
-    /// Remove all per-workorder channels (progress, raw output, stdin) when a
-    /// workorder finishes.
+    /// Remove all per-workorder channels (progress, raw output, stdin, log)
+    /// when a workorder finishes.
     ///
     /// Note: the raw output channel may already have been removed by
     /// `process_workorder` before the `Finished` event is broadcast.
@@ -214,6 +290,8 @@ impl AppState {
         self.progress_txs.write().await.remove(id);
         self.raw_output_txs.write().await.remove(id);
         self.stdin_txs.write().await.remove(id);
+        self.log_event_txs.write().await.remove(id);
+        self.log_ring_bufs.write().await.remove(id);
     }
 
     pub async fn track_staged_workorder_references(
@@ -246,6 +324,8 @@ impl AppState {
         let mut raw_output_txs = self.raw_output_txs.write().await;
         let mut stdin_txs = self.stdin_txs.write().await;
         let mut container_ids = self.container_ids.write().await;
+        let mut log_event_txs = self.log_event_txs.write().await;
+        let mut log_ring_bufs = self.log_ring_bufs.write().await;
 
         let mut evicted = 0;
 
@@ -270,6 +350,8 @@ impl AppState {
             raw_output_txs.remove(id);
             stdin_txs.remove(id);
             container_ids.remove(id);
+            log_event_txs.remove(id);
+            log_ring_bufs.remove(id);
         }
         evicted += stale_ids.len();
 
@@ -303,6 +385,8 @@ impl AppState {
                 raw_output_txs.remove(id);
                 stdin_txs.remove(id);
                 container_ids.remove(id);
+                log_event_txs.remove(id);
+                log_ring_bufs.remove(id);
             }
             evicted += to_evict.len();
         }

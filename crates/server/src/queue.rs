@@ -432,6 +432,7 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
         .start_worker(
             &container_name,
             &image_tag,
+            id,
             &staged_runtime.runtime_dir,
             workorder
                 .trace_context
@@ -589,7 +590,26 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
                         if let Some(json_str) = line.strip_prefix("REMERGE_EVENT:")
                             && let Ok(event) = serde_json::from_str::<WorkerEvent>(json_str)
                         {
-                            let _ = event_tx.send(event).await;
+                            match event {
+                                WorkerEvent::Log { event: log_event } => {
+                                    // Scope-filter: reject events whose
+                                    // workorder_id does not match the running
+                                    // workorder so a misbehaving container
+                                    // cannot poison another workorder's ring
+                                    // buffer.
+                                    if log_event.workorder_id != id {
+                                        continue;
+                                    }
+                                    // Push directly to the ring buffer and
+                                    // broadcast — no buffering in the mpsc
+                                    // channel so WS clients see events in
+                                    // real time.
+                                    log_state.push_log_event(id, log_event).await;
+                                }
+                                other => {
+                                    let _ = event_tx.send(other).await;
+                                }
+                            }
                             continue;
                         }
 
@@ -774,6 +794,9 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
                     build_log: None,
                 });
             }
+            // Log events are forwarded in real time by the log reading task;
+            // any that arrive late in the drain are silently ignored.
+            WorkerEvent::Log { .. } => {}
         }
     }
 
@@ -1062,6 +1085,16 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WorkerEvent {
-    PackageBuilt { atom: String, duration_secs: u64 },
-    PackageFailed { atom: String, reason: String },
+    PackageBuilt {
+        atom: String,
+        duration_secs: u64,
+    },
+    PackageFailed {
+        atom: String,
+        reason: String,
+    },
+    /// Tracing log event forwarded from the worker's WsLogLayer.
+    Log {
+        event: remerge_types::api::LogEvent,
+    },
 }

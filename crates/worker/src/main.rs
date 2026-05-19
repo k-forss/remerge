@@ -5,9 +5,45 @@ use tracing::{Instrument, info};
 
 use remerge_types::workorder::Workorder;
 
+/// Envelope used to emit log events back to the server via the REMERGE_EVENT
+/// stdout protocol.  The `#[serde(tag = "type")]` discriminant lets the server
+/// distinguish log events from other worker events using the same prefix.
+#[derive(serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WorkerEventEnvelope {
+    Log(remerge_types::api::LogEvent),
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _telemetry = remerge_observability::init_tracing("remerge-worker", false)?;
+    // Build an optional WsLogLayer if the server provided a workorder ID.
+    // The channel is drained by a background thread that writes
+    // `REMERGE_EVENT:<json>` to stdout so the server can relay log events
+    // over the WebSocket progress stream.
+    let ws_log = std::env::var("REMERGE_WORKORDER_ID")
+        .ok()
+        .and_then(|s| s.parse::<remerge_types::workorder::WorkorderId>().ok())
+        .map(|workorder_id| {
+            let max_level = std::env::var("REMERGE_WORKER_LOG_LEVEL")
+                .ok()
+                .and_then(|s| s.parse::<remerge_types::api::LogLevel>().ok())
+                .unwrap_or(remerge_types::api::LogLevel::Info);
+
+            let (tx, rx) = std::sync::mpsc::sync_channel::<remerge_types::api::LogEvent>(512);
+
+            std::thread::spawn(move || {
+                while let Ok(event) = rx.recv() {
+                    if let Ok(json) = serde_json::to_string(&WorkerEventEnvelope::Log(event)) {
+                        println!("REMERGE_EVENT:{json}");
+                    }
+                }
+            });
+
+            remerge_observability::ws_log::WsLogLayer::new(tx, workorder_id, max_level)
+        });
+
+    let _telemetry =
+        remerge_observability::init_tracing_with_ws_log("remerge-worker", false, ws_log)?;
 
     info!("remerge-worker starting");
 
@@ -50,6 +86,10 @@ async fn main() -> Result<()> {
 
         // Determine whether we need crossdev.
         let target_chost = &workorder.portage_config.make_conf.chost;
+        let verbose = workorder
+            .emerge_args
+            .iter()
+            .any(|a| a == "--verbose" || a == "-v");
         let (emerge_cmd, is_cross) = crossdev::emerge_command(&worker_chost, target_chost);
 
         if is_cross {
@@ -58,7 +98,7 @@ async fn main() -> Result<()> {
                 worker = %worker_chost,
                 "Cross-compilation required — setting up crossdev"
             );
-            crossdev::setup_crossdev(target_chost).await?;
+            crossdev::setup_crossdev(target_chost, verbose).await?;
         }
 
         // Read optional signing configuration injected by the server.

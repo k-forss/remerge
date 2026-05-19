@@ -45,11 +45,11 @@ pub fn emerge_command(worker_chost: &str, target_chost: &str) -> (String, bool) 
 /// This runs `crossdev --stable -t <chost>` which installs the full cross
 /// toolchain (binutils, gcc, glibc, linux-headers) and creates the
 /// `emerge-<chost>` wrapper script.
-pub async fn setup_crossdev(target_chost: &str) -> Result<()> {
+pub async fn setup_crossdev(target_chost: &str, verbose: bool) -> Result<()> {
     info!(target = %target_chost, "Setting up crossdev toolchain");
 
     // First, ensure crossdev itself is installed.
-    ensure_crossdev_installed().await?;
+    ensure_crossdev_installed(verbose).await?;
 
     // Install the cross toolchain.
     let status = Command::new("crossdev")
@@ -85,7 +85,10 @@ pub async fn setup_crossdev(target_chost: &str) -> Result<()> {
 }
 
 /// Ensure `crossdev` is installed in the worker container.
-async fn ensure_crossdev_installed() -> Result<()> {
+///
+/// `verbose`: when `true` the `--quiet` flag is omitted so the operator can
+/// see emerge output in the PTY stream.
+async fn ensure_crossdev_installed(verbose: bool) -> Result<()> {
     let check = Command::new("which").arg("crossdev").output().await;
 
     match check {
@@ -98,8 +101,13 @@ async fn ensure_crossdev_installed() -> Result<()> {
         }
     }
 
+    let mut args = vec!["--oneshot", "sys-devel/crossdev"];
+    if !verbose {
+        args.insert(1, "--quiet");
+    }
+
     let status = Command::new("emerge")
-        .args(["--oneshot", "--quiet", "sys-devel/crossdev"])
+        .args(&args)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
