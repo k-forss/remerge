@@ -4,7 +4,7 @@ This file is the active task tracker for the CLI verbosity, feedback, and
 operator-experience work on the `f-cli-ux` branch.
 
 The previous roadmap (transport and state-convergence, Phases 0–7) is archived in
-`ROADMAP-transport-convergence.md`.
+`docs/archive/ROADMAP-transport-convergence.md`.
 
 ## Goal
 
