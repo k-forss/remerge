@@ -1510,11 +1510,11 @@ mod verbosity_filter_tests {
         }
     }
 
-    // ── Quiet: all events suppressed ──────────────────────────────
+    // ── Quiet: Error passes, others suppressed ──────────────────
 
     #[test]
-    fn quiet_suppresses_error() {
-        assert!(!log_event_is_visible(
+    fn quiet_shows_error() {
+        assert!(log_event_is_visible(
             &make_event(LogLevel::Error),
             Verbosity::Quiet
         ));
