@@ -4,19 +4,29 @@ use remerge::verbosity::Verbosity;
 
 use anyhow::Result;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     // Detect verbosity early (before clap full-parse) so we can set RUST_LOG
-    // before the tracing subscriber is initialised.
+    // before the tracing subscriber and Tokio runtime are initialised.
+    // This *must* happen in a single-threaded synchronous context — before
+    // any thread is spawned — because std::env::set_var is unsafe from Rust
+    // 1.92 onward when concurrent threads might be reading the environment.
     let verbosity = Verbosity::early_detect();
     if std::env::var_os("RUST_LOG").is_none() {
-        // SAFETY: we are single-threaded at this point (before tokio spawns workers).
+        // SAFETY: we are still single-threaded here — no Tokio runtime or
+        // other threads have been spawned yet.
         #[allow(unsafe_code)]
         unsafe {
             std::env::set_var("RUST_LOG", verbosity.rust_log_level());
         }
     }
 
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main(verbosity))
+}
+
+async fn async_main(verbosity: Verbosity) -> Result<()> {
     let _telemetry = remerge_observability::init_tracing("remerge-cli", false)?;
 
     // Initialise the global status bar.  Must happen after the Tokio runtime

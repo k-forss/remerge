@@ -34,7 +34,12 @@ async fn main() -> Result<()> {
             std::thread::spawn(move || {
                 while let Ok(event) = rx.recv() {
                     if let Ok(json) = serde_json::to_string(&WorkerEventEnvelope::Log(event)) {
-                        println!("REMERGE_EVENT:{json}");
+                        // Print a leading newline to ensure we start at a
+                        // logical line boundary even if emerge has left a
+                        // partial line on stdout. The server's line-start
+                        // prefix filter relies on this to suppress forwarding
+                        // the control message to PTY relay clients.
+                        println!("\nREMERGE_EVENT:{json}");
                     }
                 }
             });

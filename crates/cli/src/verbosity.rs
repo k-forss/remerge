@@ -53,7 +53,7 @@ impl Verbosity {
         for arg in std::env::args().skip(1) {
             match arg.as_str() {
                 "-q" | "--quiet" => return Verbosity::Quiet,
-                "-v" => verbose_count = verbose_count.saturating_add(1),
+                "-v" | "--verbose" => verbose_count = verbose_count.saturating_add(1),
                 // clustered flags like -vv / -vvv
                 s if s.starts_with('-')
                     && !s.starts_with("--")

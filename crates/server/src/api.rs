@@ -1683,15 +1683,21 @@ async fn handle_ws(
         // Replay buffered log events before entering the live loop so the
         // client receives history even when connecting mid-build.
         let mut log_rx: Option<tokio::sync::broadcast::Receiver<LogEvent>> = None;
+        // Track the timestamp of the last event in the snapshot so we can
+        // skip duplicate events from the live receiver that were already
+        // included in the snapshot (possible because subscribe happens before
+        // snapshot, so a live event can appear in both).
+        let mut snapshot_cutoff: Option<chrono::DateTime<chrono::Utc>> = None;
         if let Some((snapshot, rx)) = log_sub {
-            for event in snapshot {
+            for event in &snapshot {
                 if event.level <= log_level
-                    && let Ok(text) = serde_json::to_string(&event)
+                    && let Ok(text) = serde_json::to_string(event)
                     && ws_write.send(ws::Message::Text(text.into())).await.is_err()
                 {
                     return;
                 }
             }
+            snapshot_cutoff = snapshot.last().map(|e| e.timestamp);
             log_rx = Some(rx);
         }
 
@@ -1747,10 +1753,15 @@ async fn handle_ws(
                     result = log_fut => {
                         match result {
                             Ok(event) if event.level <= log_level => {
-                                if let Ok(text) = serde_json::to_string(&event)
-                                    && ws_write.send(ws::Message::Text(text.into())).await.is_err() {
-                                        break;
-                                    }
+                                // Skip events that were already sent as part
+                                // of the snapshot to avoid duplicates.
+                                let is_duplicate = snapshot_cutoff
+                                    .is_some_and(|cut| event.timestamp <= cut);
+                                if !is_duplicate
+                                    && let Ok(text) = serde_json::to_string(&event)
+                                        && ws_write.send(ws::Message::Text(text.into())).await.is_err() {
+                                            break;
+                                        }
                             }
                             Ok(_) => {} // filtered out by level
                             Err(RecvError::Lagged(n)) => {
@@ -1821,10 +1832,15 @@ async fn handle_ws(
                     result = log_fut => {
                         match result {
                             Ok(event) if event.level <= log_level => {
-                                if let Ok(text) = serde_json::to_string(&event)
-                                    && ws_write.send(ws::Message::Text(text.into())).await.is_err() {
-                                        break;
-                                    }
+                                // Skip events that were already sent as part
+                                // of the snapshot to avoid duplicates.
+                                let is_duplicate = snapshot_cutoff
+                                    .is_some_and(|cut| event.timestamp <= cut);
+                                if !is_duplicate
+                                    && let Ok(text) = serde_json::to_string(&event)
+                                        && ws_write.send(ws::Message::Text(text.into())).await.is_err() {
+                                            break;
+                                        }
                             }
                             Ok(_) => {} // filtered out by level
                             Err(RecvError::Lagged(n)) => {

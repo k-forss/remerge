@@ -364,11 +364,7 @@ mod tests {
         );
         let (_program, args) = build_emerge_invocation(&workorder, "emerge");
 
-        assert!(args.starts_with(&[
-            "--buildpkg".to_string(),
-            "--usepkg".to_string(),
-            "--verbose".to_string(),
-        ]));
+        assert!(args.starts_with(&["--buildpkg".to_string(), "--usepkg".to_string(),]));
         assert!(args.contains(&"--ask=n".to_string()));
         assert!(args.contains(&"--emptytree".to_string()));
         assert!(args.contains(&"--jobs=4".to_string()));

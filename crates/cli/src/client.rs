@@ -764,20 +764,20 @@ impl RemergeClient {
                         }
                         // Text frames carry structured JSON events.
                         tokio_tungstenite::tungstenite::Message::Text(text) => {
-                            if log_json {
-                                // Emit each frame as a newline-delimited JSON record
-                                // so CI log-capture tooling can consume the stream.
-                                use std::io::Write;
-                                let stdout = std::io::stdout();
-                                let mut out = stdout.lock();
-                                let _ = out.write_all(text.as_bytes());
-                                let _ = out.write_all(b"\n");
-                                let _ = out.flush();
-                            }
-                            // Parse the event to handle flow control (Finished)
-                            // regardless of log_json.
+                            // Parse the event first — only emit the frame to
+                            // stdout (in --log-json mode) after we know it is
+                            // a well-formed, recognised type.  Unrecognised
+                            // frames are silently dropped from the NDJSON
+                            // stream so machine consumers are not surprised.
                             if let Ok(progress) = serde_json::from_str::<BuildProgress>(&text) {
-                                if !log_json {
+                                if log_json {
+                                    use std::io::Write;
+                                    let stdout = std::io::stdout();
+                                    let mut out = stdout.lock();
+                                    let _ = out.write_all(text.as_bytes());
+                                    let _ = out.write_all(b"\n");
+                                    let _ = out.flush();
+                                } else {
                                     Self::print_event(&progress.event, verbosity);
                                 }
                                 // If we get a Finished event, fetch the result and exit.
@@ -790,7 +790,14 @@ impl RemergeClient {
                             } else if let Ok(log_event) =
                                 serde_json::from_str::<LogEvent>(&text)
                             {
-                                if !log_json {
+                                if log_json {
+                                    use std::io::Write;
+                                    let stdout = std::io::stdout();
+                                    let mut out = stdout.lock();
+                                    let _ = out.write_all(text.as_bytes());
+                                    let _ = out.write_all(b"\n");
+                                    let _ = out.flush();
+                                } else {
                                     Self::print_log_event(&log_event, verbosity);
                                 }
                             } else {

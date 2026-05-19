@@ -688,6 +688,15 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
                     let mut clean_start: usize = 0;
                     let mut prefix_chunk_start: usize = 0;
 
+                    // If we are mid-REMERGE_EVENT: from the previous chunk,
+                    // pre-initialise forward_buf so the control-line bytes in
+                    // this chunk are not forwarded to PTY clients.  Without
+                    // this, the final forwarding path would emit the whole
+                    // chunk because forward_buf is None at chunk start.
+                    if skip_line {
+                        forward_buf = Some(Vec::new());
+                    }
+
                     for (bi, &b) in bytes.iter().enumerate() {
                         if skip_line {
                             // Consuming REMERGE_EVENT: tail — accumulate for
