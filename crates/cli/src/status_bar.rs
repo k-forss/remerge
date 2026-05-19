@@ -15,6 +15,7 @@
 //! emitted while the bar is visible.
 
 use std::io::{IsTerminal, Write, stderr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -36,6 +37,9 @@ enum StatusBarMode {
 pub struct StatusBar {
     state: Arc<Mutex<State>>,
     mode: StatusBarMode,
+    /// Set to `true` by [`silence`] when the real verbosity (post-config-read)
+    /// turns out to be quiet, overriding the initial `mode`.
+    silenced: AtomicBool,
 }
 
 struct State {
@@ -54,7 +58,7 @@ fn base_phase(phase: &str) -> &str {
     if let Some(pos) = phase.rfind(" (") {
         let tail = &phase[pos..];
         if (tail.ends_with("s)\u{2026}") || tail.ends_with("s)..."))
-            && tail[2..tail.len() - 4].chars().all(|c| c.is_ascii_digit())
+            && tail[2..tail.len() - 5].chars().all(|c| c.is_ascii_digit())
         {
             return &phase[..pos];
         }
@@ -86,6 +90,7 @@ impl StatusBar {
                 finished: false,
             })),
             mode,
+            silenced: AtomicBool::new(false),
         });
         let _ = INSTANCE.set(bar.clone());
 
@@ -121,6 +126,15 @@ impl StatusBar {
         INSTANCE.get().cloned()
     }
 
+    /// Switch to silent mode retroactively.
+    ///
+    /// Call this after reading portage config if the real verbosity (which
+    /// considers `EMERGE_DEFAULT_OPTS` from `make.conf`) turns out to be
+    /// quiet.  All subsequent [`set_phase`] calls will be no-ops.
+    pub fn silence(&self) {
+        self.silenced.store(true, Ordering::Relaxed);
+    }
+
     /// Set the current phase label and make the bar visible.
     ///
     /// - `Tty`: immediately redraws the bar so the new phase appears without
@@ -129,6 +143,9 @@ impl StatusBar {
     ///   changes; heartbeat time-suffix updates are suppressed to avoid spam.
     /// - `Silent`: no-op.
     pub fn set_phase(&self, phase: impl Into<String>) {
+        if self.silenced.load(Ordering::Relaxed) {
+            return;
+        }
         match self.mode {
             StatusBarMode::Silent => return,
             StatusBarMode::LogLine => {

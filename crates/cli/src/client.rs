@@ -668,7 +668,8 @@ impl RemergeClient {
         // Append the log-level ceiling as a query parameter so the server
         // only sends events the CLI can usefully display.
         let log_level_str = verbosity.rust_log_level();
-        let ws_url_with_level = format!("{ws_url}?log_level={log_level_str}");
+        let sep = if ws_url.contains('?') { '&' } else { '?' };
+        let ws_url_with_level = format!("{ws_url}{sep}log_level={log_level_str}");
         let ws_url = ws_url_with_level.as_str();
 
         let (ws, _) = connect_async(ws_url)
@@ -745,22 +746,25 @@ impl RemergeClient {
                         // Binary frames carry raw PTY bytes — write directly to stdout.
                         // In log_json mode they are skipped to avoid corrupting the
                         // NDJSON stream; CI tooling should not need raw terminal bytes.
-                        tokio_tungstenite::tungstenite::Message::Binary(data) => {
-                            if !log_json {
-                                // Hide the status bar on the first PTY frame —
-                                // raw bytes from the container would overwrite it.
-                                if !bar_hidden {
-                                    if let Some(bar) = crate::status_bar::StatusBar::global() {
-                                        bar.hide();
-                                    }
-                                    bar_hidden = true;
+                        // Binary frames carry raw PTY bytes — write directly to stdout.
+                        // In log_json mode they are skipped to avoid corrupting the
+                        // NDJSON stream; CI tooling should not need raw terminal bytes.
+                        tokio_tungstenite::tungstenite::Message::Binary(data)
+                            if !log_json =>
+                        {
+                            // Hide the status bar on the first PTY frame —
+                            // raw bytes from the container would overwrite it.
+                            if !bar_hidden {
+                                if let Some(bar) = crate::status_bar::StatusBar::global() {
+                                    bar.hide();
                                 }
-                                use std::io::Write;
-                                let stdout = std::io::stdout();
-                                let mut out = stdout.lock();
-                                let _ = out.write_all(&data);
-                                let _ = out.flush();
+                                bar_hidden = true;
                             }
+                            use std::io::Write;
+                            let stdout = std::io::stdout();
+                            let mut out = stdout.lock();
+                            let _ = out.write_all(&data);
+                            let _ = out.flush();
                         }
                         // Text frames carry structured JSON events.
                         tokio_tungstenite::tungstenite::Message::Text(text) => {
@@ -896,11 +900,16 @@ impl RemergeClient {
             LogLevel::Debug => "DEBUG",
             LogLevel::Trace => "TRACE",
         };
-        if verbosity.is_verbose() {
+        let msg = if verbosity.is_verbose() {
             // Show target for verbose modes so the caller can correlate.
-            eprintln!("[{prefix}] {}: {}", event.target, event.message);
+            format!("[{prefix}] {}: {}", event.target, event.message)
         } else {
-            eprintln!("{prefix}: {}", event.message);
+            format!("{prefix}: {}", event.message)
+        };
+        if let Some(bar) = crate::status_bar::StatusBar::global() {
+            bar.println(&msg);
+        } else {
+            eprintln!("{msg}");
         }
     }
 

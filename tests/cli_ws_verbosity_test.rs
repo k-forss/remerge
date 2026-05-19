@@ -173,6 +173,13 @@ struct MockFixtureServer {
     _handle: tokio::task::JoinHandle<()>,
 }
 
+impl Drop for MockFixtureServer {
+    fn drop(&mut self) {
+        // Abort the axum serve task instead of leaking it when the test ends.
+        self._handle.abort();
+    }
+}
+
 impl MockFixtureServer {
     async fn start() -> Self {
         let workorder_id = Uuid::new_v4();
@@ -365,12 +372,19 @@ async fn progress_url_with_query_string_completes() {
     // Use a URL that already has a query string appended; stream_progress will
     // re-append its own log_level param — workorder_id must be found despite
     // the query string on the base URL.
-    let base_ws = server.ws_url();
-    // stream_progress internally appends ?log_level=, so we pass the plain URL.
+    // Pass a URL that already carries a query string; stream_progress must
+    // append `&log_level=` (not `?log_level=` again) so the URL stays valid.
+    let base_ws = format!("{}?foo=bar", server.ws_url());
     let result = c
         .stream_progress(&base_ws, Verbosity::Verbose, false)
         .await
         .expect("URL with query string must be handled correctly");
 
     assert_eq!(result.built_packages.len(), 1);
+    // Confirm the server still received the log_level param correctly.
+    assert_eq!(
+        server.received_log_level().as_deref(),
+        Some("info"),
+        "log_level param must be forwarded even when base URL has a query string"
+    );
 }

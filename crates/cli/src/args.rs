@@ -1157,6 +1157,15 @@ impl Cli {
 
         // Derive final verbosity now that we have EMERGE_DEFAULT_OPTS.
         let verbosity = self.verbosity(&portage_config.make_conf.emerge_default_opts);
+        // Retroactively silence the status bar if the real verbosity (which
+        // considers EMERGE_DEFAULT_OPTS from make.conf) turns out to be quiet,
+        // even though the bar was initialised from early_detect() which only
+        // sees raw CLI flags.
+        if verbosity.is_quiet()
+            && let Some(bar) = crate::status_bar::StatusBar::global()
+        {
+            bar.silence();
+        }
 
         if self.dry_run {
             if let Some(ref b) = bar {
@@ -1223,12 +1232,14 @@ impl Cli {
                 b.println(&format!("Trace ID: {trace_id}"));
             }
         } else {
-            println!(
+            // Status messages go to stderr so they do not corrupt the NDJSON
+            // stream when --log-json is active.
+            eprintln!(
                 "Workorder {} submitted — streaming progress…",
                 resp.workorder_id
             );
             if let Some(ref trace_id) = resp.trace_id {
-                println!("Trace ID: {trace_id}");
+                eprintln!("Trace ID: {trace_id}");
             }
         }
 
@@ -1274,12 +1285,12 @@ impl Cli {
                     b.println(&format!("  Trace: {trace_id}"));
                 }
             } else {
-                println!("\n─── Build complete ───");
-                println!("  Built: {built_list}");
+                eprintln!("\n─── Build complete ───");
+                eprintln!("  Built: {built_list}");
                 if verbosity.is_verbose()
                     && let Some(ref trace_id) = resp.trace_id
                 {
-                    println!("  Trace: {trace_id}");
+                    eprintln!("  Trace: {trace_id}");
                 }
             }
         }

@@ -1094,7 +1094,12 @@ enum WorkerEvent {
         reason: String,
     },
     /// Tracing log event forwarded from the worker's WsLogLayer.
+    ///
+    /// The worker serialises this as `{"type":"log", <LogEvent fields...>}`
+    /// using `#[serde(tag = "type")]` on a tuple variant, so `LogEvent`
+    /// fields are inlined at the top level — `#[serde(flatten)]` matches that.
     Log {
+        #[serde(flatten)]
         event: remerge_types::api::LogEvent,
     },
 }

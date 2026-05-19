@@ -184,9 +184,11 @@ fi
 if [[ $RUN_FULL_STACK -eq 1 ]]; then
   step "Full-stack e2e (cargo test --features integration,e2e)"
   if ! command -v docker &>/dev/null; then
-    warn "docker not found — skipping full-stack tests"
+    fail "docker not found — full-stack tests require Docker (matches CI behaviour)"
+    exit 1
   elif ! docker info &>/dev/null 2>&1; then
-    warn "Docker daemon not running — skipping full-stack tests"
+    fail "Docker daemon not running — start Docker and retry"
+    exit 1
   else
     step "  Building worker binary"
     cargo build -p remerge-worker

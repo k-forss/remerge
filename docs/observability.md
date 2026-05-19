@@ -54,13 +54,13 @@ The CLI appends `?log_level=<level>` to the WebSocket URL.  The server
 parses this query parameter in the `ws_progress` handler and uses the
 resulting `LogLevel` as a ceiling filter when forwarding events:
 
-| CLI verbosity | `?log_level=` | Events forwarded |
-|---------------|---------------|-----------------|
-| `-q` (quiet)  | `error`       | Error only       |
-| (normal)      | `warn`        | Warn + Error     |
-| `-v`          | `info`        | Info and above   |
-| `-vv`         | `debug`       | Debug and above  |
-| `-vvv`        | `trace`       | All events       |
+| CLI verbosity | `?log_level=` | Events forwarded                  |
+|---------------|---------------|-----------------------------------|
+| `-q` (quiet)  | `error`       | Error only                        |
+| (normal)      | `warn`        | Up to Warn (Error, Warn)          |
+| `-v`          | `info`        | Up to Info (Error, Warn, Info)    |
+| `-vv`         | `debug`       | Up to Debug (Error…Debug)         |
+| `-vvv`        | `trace`       | All events (Error…Trace)          |
 
 The worker always emits up to the level configured by
 `REMERGE_WORKER_LOG_LEVEL` (default `info`).  The server stores ALL
