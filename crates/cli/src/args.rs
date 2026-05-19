@@ -1329,7 +1329,11 @@ impl Cli {
                 .map(|p| p.atom.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            eprintln!("  Failed: {failed_list}");
+            if let Some(ref b) = bar {
+                b.println(&format!("  Failed: {failed_list}"));
+            } else {
+                eprintln!("  Failed: {failed_list}");
+            }
             anyhow::bail!(
                 "Remote build failed: {} package(s) failed",
                 result.failed_packages.len()

@@ -881,8 +881,7 @@ impl RemergeClient {
 
     /// Print a forwarded worker log event based on the current verbosity.
     ///
-    /// Quiet     → suppressed entirely (server already hard-limits to Error
-    ///             ceiling, but we double-check here)
+    /// Quiet     → Error only
     /// Normal    → Warn + Error only
     /// Verbose+  → all events the server forwarded
     fn print_log_event(event: &LogEvent, verbosity: crate::verbosity::Verbosity) {
@@ -1121,7 +1120,7 @@ pub(crate) fn log_event_is_visible(
 ) -> bool {
     use crate::verbosity::Verbosity;
     let max_level = match verbosity {
-        Verbosity::Quiet => return false,
+        Verbosity::Quiet => LogLevel::Error,
         Verbosity::Normal => LogLevel::Warn,
         Verbosity::Verbose => LogLevel::Info,
         Verbosity::VerboseDebug => LogLevel::Debug,
