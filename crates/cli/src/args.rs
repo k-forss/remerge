@@ -1271,7 +1271,11 @@ impl Cli {
             if let Some(ref b) = bar {
                 b.finish();
             }
-            println!("Workorder ID: {}", resp.workorder_id);
+            if self.log_json {
+                eprintln!("Workorder ID: {}", resp.workorder_id);
+            } else {
+                println!("Workorder ID: {}", resp.workorder_id);
+            }
             return Ok(());
         }
 
@@ -1610,17 +1614,32 @@ impl Cli {
         distdir: &Path,
         parity_root: &Path,
     ) -> Result<()> {
-        println!("Restoring fetched distfiles into {}…", distdir.display());
+        if self.log_json {
+            eprintln!("Restoring fetched distfiles into {}…", distdir.display());
+        } else {
+            println!("Restoring fetched distfiles into {}…", distdir.display());
+        }
         reconcile_fetched_distfiles_into(distdir, client, result).await?;
         if self.no_local {
-            println!("Skipping final-state parity restore because --no-local was requested.");
+            if self.log_json {
+                eprintln!("Skipping final-state parity restore because --no-local was requested.");
+            } else {
+                println!("Skipping final-state parity restore because --no-local was requested.");
+            }
             return Ok(());
         }
 
-        println!(
-            "Restoring final-state parity into {}…",
-            parity_root.display()
-        );
+        if self.log_json {
+            eprintln!(
+                "Restoring final-state parity into {}…",
+                parity_root.display()
+            );
+        } else {
+            println!(
+                "Restoring final-state parity into {}…",
+                parity_root.display()
+            );
+        }
         reconcile_final_state_parity_into(parity_root, client, result).await
     }
 
@@ -1649,6 +1668,8 @@ impl Cli {
     {
         if let Some(b) = bar {
             b.set_phase("Restoring local follow-up state…");
+        } else if self.log_json {
+            eprintln!("Restoring local follow-up state…");
         } else {
             println!("Restoring local follow-up state…");
         }
@@ -1662,12 +1683,18 @@ impl Cli {
 
         if let Some(b) = bar {
             b.println("Local follow-up state restored.");
+        } else if self.log_json {
+            eprintln!("Local follow-up state restored.");
         } else {
             println!("Local follow-up state restored.");
         }
 
         if self.no_local {
-            println!("Skipping local emerge because --no-local was requested.");
+            if self.log_json {
+                eprintln!("Skipping local emerge because --no-local was requested.");
+            } else {
+                println!("Skipping local emerge because --no-local was requested.");
+            }
             if let Some(b) = bar {
                 b.finish();
             }
@@ -1676,6 +1703,8 @@ impl Cli {
 
         if let Some(b) = bar {
             b.hide();
+            eprintln!("\nRunning emerge locally with binary packages…\n");
+        } else if self.log_json {
             eprintln!("\nRunning emerge locally with binary packages…\n");
         } else {
             println!("\nRunning emerge locally with binary packages…\n");

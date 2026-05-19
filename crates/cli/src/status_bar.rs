@@ -37,6 +37,10 @@ enum StatusBarMode {
 pub struct StatusBar {
     state: Arc<Mutex<State>>,
     mode: StatusBarMode,
+    /// Serialises all terminal writes so that the background redraw task and
+    /// foreground callers (`hide`, `show`, `println`, `finish`) never
+    /// interleave their output.
+    output_lock: Arc<Mutex<()>>,
     /// Set to `true` by [`silence`] when the real verbosity (post-config-read)
     /// turns out to be quiet, overriding the initial `mode`.
     silenced: AtomicBool,
@@ -90,12 +94,14 @@ impl StatusBar {
                 finished: false,
             })),
             mode,
+            output_lock: Arc::new(Mutex::new(())),
             silenced: AtomicBool::new(false),
         });
         let _ = INSTANCE.set(bar.clone());
 
         if mode == StatusBarMode::Tty {
             let weak: Weak<Mutex<State>> = Arc::downgrade(&bar.state);
+            let output_lock_bg = bar.output_lock.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_millis(100));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -112,6 +118,7 @@ impl StatusBar {
                         let phase = guard.phase.clone();
                         let elapsed = guard.phase_started.elapsed();
                         drop(guard);
+                        let _out = output_lock_bg.lock().unwrap();
                         draw_line(&phase, elapsed);
                     }
                 }
@@ -168,6 +175,7 @@ impl StatusBar {
         state.hidden = false;
         let phase = state.phase.clone();
         drop(state);
+        let _out = self.output_lock.lock().unwrap();
         draw_line(&phase, Duration::ZERO);
     }
 
@@ -184,6 +192,7 @@ impl StatusBar {
         state.hidden = true;
         drop(state);
         if !was_hidden {
+            let _out = self.output_lock.lock().unwrap();
             clear_line();
         }
     }
@@ -199,6 +208,7 @@ impl StatusBar {
         let elapsed = state.phase_started.elapsed();
         drop(state);
         if !phase.is_empty() {
+            let _out = self.output_lock.lock().unwrap();
             draw_line(&phase, elapsed);
         }
     }
@@ -214,6 +224,7 @@ impl StatusBar {
         state.finished = true;
         state.hidden = true;
         drop(state);
+        let _out = self.output_lock.lock().unwrap();
         clear_line();
     }
 
@@ -238,10 +249,15 @@ impl StatusBar {
                 let bar_line = render(&phase, elapsed);
                 let composed = format!("\r\x1b[2K{msg}\n\r\x1b[2m{bar_line}\x1b[0m");
                 let mut err = stderr();
+                let _out = self.output_lock.lock().unwrap();
                 let _ = err.write_all(composed.as_bytes());
                 let _ = err.flush();
                 return;
             }
+            drop(state);
+            let _out = self.output_lock.lock().unwrap();
+            eprintln!("{msg}");
+            return;
         }
         // Fallback: plain stderr line.
         eprintln!("{msg}");
@@ -253,6 +269,7 @@ impl Drop for StatusBar {
         // Make sure the terminal line is clean even if `finish()` was never
         // called (e.g. early return via `?` propagation).
         if self.mode == StatusBarMode::Tty {
+            let _out = self.output_lock.lock().unwrap();
             clear_line();
         }
     }
@@ -389,6 +406,7 @@ mod tests {
                 finished: false,
             })),
             mode: StatusBarMode::LogLine,
+            output_lock: Arc::new(Mutex::new(())),
             silenced: std::sync::atomic::AtomicBool::new(false),
         };
 
@@ -413,6 +431,7 @@ mod tests {
                 finished: false,
             })),
             mode: StatusBarMode::Silent,
+            output_lock: Arc::new(Mutex::new(())),
             silenced: std::sync::atomic::AtomicBool::new(false),
         };
         bar.silence();

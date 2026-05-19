@@ -667,9 +667,28 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
             match result {
                 Ok(log_output) => {
                     let bytes = log_output.into_bytes();
-                    let mut forward: Vec<u8> = Vec::with_capacity(bytes.len());
 
-                    for &b in bytes.iter() {
+                    // Optimisation: avoid allocating a Vec unless a
+                    // REMERGE_EVENT: line actually needs to be stripped.
+                    // In the common case (no control lines) the original
+                    // Bytes is forwarded as a zero-copy slice.
+                    //
+                    // `forward_buf`: None  = no control lines yet; forward
+                    //                       original at the end.
+                    //                Some  = assembled output with each
+                    //                       control line's bytes removed.
+                    //
+                    // `clean_start`: first byte in `bytes` not yet flushed
+                    //   into forward_buf.  Only meaningful when Some.
+                    //
+                    // `prefix_chunk_start`: position in `bytes` where the
+                    //   current line-prefix accumulation began.
+                    //   0 for cross-chunk prefix continuations.
+                    let mut forward_buf: Option<Vec<u8>> = None;
+                    let mut clean_start: usize = 0;
+                    let mut prefix_chunk_start: usize = 0;
+
+                    for (bi, &b) in bytes.iter().enumerate() {
                         if skip_line {
                             // Consuming REMERGE_EVENT: tail — accumulate for
                             // parsing but do NOT forward to PTY clients.
@@ -698,28 +717,53 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
                                 event_line_buf.clear();
                                 skip_line = false;
                                 at_line_start = true;
+                                // forward_buf is always Some here (set when
+                                // skip_line was entered); advance past line.
+                                clean_start = bi + 1;
                             } else if event_line_buf.len() > 256 * 1024 {
                                 // Guard against runaway/unterminated control
                                 // lines to prevent unbounded memory growth.
                                 event_line_buf.clear();
                                 skip_line = false;
                                 at_line_start = true;
+                                clean_start = bi + 1;
                             }
                             continue;
                         }
 
                         if at_line_start {
+                            if prefix_buf.is_empty() {
+                                // Fresh prefix — record where it started.
+                                prefix_chunk_start = bi;
+                            }
                             prefix_buf.push(b);
                             let n = prefix_buf.len();
+                            // Bytes in prefix_buf from previous chunk(s).
+                            let prev_in_pfx = n - (bi + 1 - prefix_chunk_start);
 
                             if b == b'\n' || b == b'\r' {
                                 // Line ended (\n = newline, \r = carriage-return
                                 // used by PTY progress bars like download meters)
                                 // before we accumulated enough bytes to match the
-                                // prefix — short/empty line.  Forward immediately
-                                // and run pattern matching.
-                                forward.extend_from_slice(&prefix_buf);
-                                pattern_buf.extend_from_slice(&prefix_buf);
+                                // prefix — short/empty line.  Forward and run
+                                // pattern matching.
+                                if let Some(ref mut fw) = forward_buf {
+                                    if prev_in_pfx > 0 {
+                                        // Prev-chunk bytes aren't in bytes[];
+                                        // flush them in chronological order.
+                                        fw.extend_from_slice(
+                                            &bytes[clean_start..prefix_chunk_start],
+                                        );
+                                        fw.extend_from_slice(&prefix_buf[..prev_in_pfx]);
+                                        clean_start = prefix_chunk_start;
+                                    }
+                                    fw.extend_from_slice(&bytes[clean_start..=bi]);
+                                    clean_start = bi + 1;
+                                }
+                                if prev_in_pfx > 0 {
+                                    pattern_buf.extend_from_slice(&prefix_buf[..prev_in_pfx]);
+                                }
+                                pattern_buf.extend_from_slice(&bytes[prefix_chunk_start..=bi]);
                                 let line = String::from_utf8_lossy(&pattern_buf)
                                     .trim_end_matches(['\r', '\n'])
                                     .to_string();
@@ -739,32 +783,51 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
                                 )
                                 .await;
                             } else if REMERGE_PREFIX[..n] != prefix_buf[..] {
-                                // Prefix does not match — regular PTY line.
-                                // Flush accumulated prefix immediately and
-                                // switch to passthrough mode for the remainder.
-                                forward.extend_from_slice(&prefix_buf);
-                                pattern_buf.extend_from_slice(&prefix_buf);
+                                // Prefix mismatch — regular PTY line; switch
+                                // to passthrough for the rest of the line.
+                                if prev_in_pfx > 0 {
+                                    // Prev-chunk bytes aren't in bytes[]; must
+                                    // flush them explicitly.
+                                    let fw = forward_buf.get_or_insert_with(Vec::new);
+                                    fw.extend_from_slice(&bytes[clean_start..prefix_chunk_start]);
+                                    fw.extend_from_slice(&prefix_buf[..prev_in_pfx]);
+                                    clean_start = prefix_chunk_start;
+                                    // bytes[prefix_chunk_start..] remain in
+                                    // the clean region — no copy needed.
+                                }
+                                if prev_in_pfx > 0 {
+                                    pattern_buf.extend_from_slice(&prefix_buf[..prev_in_pfx]);
+                                }
+                                pattern_buf.extend_from_slice(&bytes[prefix_chunk_start..=bi]);
                                 prefix_buf.clear();
                                 at_line_start = false;
                             } else if n == REMERGE_PREFIX.len() {
                                 // Exact prefix match — REMERGE_EVENT: line.
-                                // Do NOT forward; start accumulating for JSON.
+                                // Flush clean bytes up to the control-line
+                                // start; do NOT forward the prefix itself.
+                                let fw = forward_buf.get_or_insert_with(Vec::new);
+                                fw.extend_from_slice(&bytes[clean_start..prefix_chunk_start]);
+                                // Prev-chunk + current-chunk prefix bytes are
+                                // the control-line header — drop them.
                                 event_line_buf.extend_from_slice(REMERGE_PREFIX);
-                                pattern_buf.clear(); // control line, not for patterns
+                                pattern_buf.clear(); // control line not for emerge patterns
                                 prefix_buf.clear();
                                 skip_line = true;
                                 at_line_start = false;
+                                // clean_start is advanced when skip_line ends at '\n'
                             }
                             // else: still building prefix — keep accumulating
                         } else {
-                            // Passthrough: forward byte immediately.
-                            forward.push(b);
+                            // Passthrough: byte contributes to emerge pattern
+                            // tracking only.  PTY forwarding is handled by
+                            // the clean region [clean_start..) in bytes[] —
+                            // no per-byte copy needed.
                             pattern_buf.push(b);
 
                             if b == b'\n' || b == b'\r' {
-                                // \r resets line-start state so a REMERGE_EVENT:
-                                // prefix right after a PTY carriage-return will
-                                // be detected on the next iteration.
+                                // \r resets line-start so a REMERGE_EVENT:
+                                // prefix right after a PTY carriage-return
+                                // will be detected on the next iteration.
                                 let line = String::from_utf8_lossy(&pattern_buf)
                                     .trim_end_matches(['\r', '\n'])
                                     .to_string();
@@ -788,8 +851,26 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
                         }
                     }
 
-                    if !forward.is_empty() {
-                        let _ = raw_tx.send(bytes::Bytes::from(forward));
+                    // Determine how many bytes from the tail of this chunk
+                    // are sitting in prefix_buf awaiting resolution in the
+                    // next chunk.  Those must not be forwarded yet.
+                    let prefix_tail = if at_line_start && !prefix_buf.is_empty() {
+                        bytes.len() - prefix_chunk_start
+                    } else {
+                        0
+                    };
+                    let forward_end = bytes.len() - prefix_tail;
+
+                    let forward_bytes = if let Some(mut fw) = forward_buf {
+                        // Control lines were stripped — finalise output.
+                        fw.extend_from_slice(&bytes[clean_start..forward_end]);
+                        bytes::Bytes::from(fw)
+                    } else {
+                        // Common case: no control lines — zero-copy slice.
+                        bytes.slice(..forward_end)
+                    };
+                    if !forward_bytes.is_empty() {
+                        let _ = raw_tx.send(forward_bytes);
                     }
                 }
                 Err(e) => {
@@ -1272,7 +1353,7 @@ mod tests {
             r#"{{"type":"log","event":{{"level":"info","target":"t","message":"m","workorder_id":"{id}","timestamp":"2026-01-01T00:00:00Z"}}}}"#
         );
 
-        // The nested format must not succesffully produce a Log variant.
+        // The nested format must not successfully produce a Log variant.
         let result = serde_json::from_str::<WorkerEvent>(&json);
         match result {
             Err(_) => {} // expected — unknown fields with strict deserialise, or missing top-level fields

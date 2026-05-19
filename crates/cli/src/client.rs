@@ -1097,8 +1097,6 @@ impl RemergeClient {
     }
 }
 
-/// Whether a [`LogEvent`] should be displayed at a given verbosity level.
-///
 /// Append `log_level=<level>` to a WebSocket URL, using `?` when the URL has
 /// no query string yet and `&` when one is already present.
 ///
