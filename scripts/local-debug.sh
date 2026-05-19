@@ -15,7 +15,54 @@ WORKER_IDLE_TIMEOUT="${REMERGE_LOCAL_DEBUG_WORKER_IDLE_TIMEOUT:-600}"
 MAX_WORKERS="${REMERGE_LOCAL_DEBUG_MAX_WORKERS:-1}"
 MAX_ACTIVE_WORKORDERS="${REMERGE_LOCAL_DEBUG_MAX_ACTIVE_WORKORDERS:-8}"
 WORKER_NETWORK_MODE="${REMERGE_LOCAL_DEBUG_WORKER_NETWORK_MODE:-bridge}"
-SKIP_WORKER_SYNC="${REMERGE_LOCAL_DEBUG_SKIP_WORKER_SYNC:-false}"
+
+normalize_bool() {
+    local value="${1:-false}"
+    case "${value,,}" in
+        1|true|yes|on)
+            printf 'true\n'
+            ;;
+        0|false|no|off|'')
+            printf 'false\n'
+            ;;
+        *)
+            echo "Invalid boolean value '$value' (expected true/false, 1/0, yes/no, or on/off)" >&2
+            exit 1
+            ;;
+    esac
+}
+
+ALLOW_REMOTE_BIND="$(normalize_bool "${REMERGE_LOCAL_DEBUG_ALLOW_REMOTE:-false}")"
+SKIP_WORKER_SYNC="$(normalize_bool "${REMERGE_LOCAL_DEBUG_SKIP_WORKER_SYNC:-false}")"
+
+is_loopback_host() {
+    case "$1" in
+        127.*|::1|localhost)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+ensure_safe_listen_host() {
+    if is_loopback_host "$LISTEN_HOST"; then
+        return
+    fi
+
+    if [[ "$ALLOW_REMOTE_BIND" == "true" ]]; then
+        echo "WARNING: starting unauthenticated local debug server on non-loopback host '$LISTEN_HOST' because REMERGE_LOCAL_DEBUG_ALLOW_REMOTE=$ALLOW_REMOTE_BIND" >&2
+        return
+    fi
+
+    cat >&2 <<EOF
+Refusing to bind local debug server to non-loopback host '$LISTEN_HOST'.
+scripts/local-debug.sh writes [auth] mode = "none" to $SERVER_CONFIG, so a non-local bind would expose an unauthenticated server.
+Keep REMERGE_LOCAL_DEBUG_HOST on localhost/127.0.0.1/::1, or set REMERGE_LOCAL_DEBUG_ALLOW_REMOTE=true if you intentionally want a remote bind.
+EOF
+    exit 1
+}
 
 case "$PROFILE" in
     debug) TARGET_DIR="$REPO_DIR/target/debug" ;;
@@ -61,6 +108,7 @@ Environment overrides:
   REMERGE_LOCAL_DEBUG_HOST=127.0.0.1
   REMERGE_LOCAL_DEBUG_PORT=17654
   REMERGE_LOCAL_DEBUG_RUST_LOG=...
+    REMERGE_LOCAL_DEBUG_ALLOW_REMOTE=false
   REMERGE_LOCAL_DEBUG_BUILD_TIMEOUT_SECS=3600
   REMERGE_LOCAL_DEBUG_WORKER_IDLE_TIMEOUT=600
   REMERGE_LOCAL_DEBUG_MAX_WORKERS=1
@@ -101,6 +149,7 @@ EOF
 
 write_server_config() {
     ensure_session_dirs
+    ensure_safe_listen_host
 
     local repos_dir="${REMERGE_LOCAL_DEBUG_REPOS_DIR:-}"
     if [[ -z "$repos_dir" && -d /var/db/repos && -r /var/db/repos ]]; then
@@ -164,10 +213,27 @@ server_pid() {
     fi
 }
 
+pid_matches_server() {
+    local pid="$1"
+    local cmdline
+
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    [[ -r "/proc/$pid/cmdline" ]] || return 1
+
+    cmdline="$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+    [[ -n "$cmdline" ]] || return 1
+
+    grep -Fxq -- "$SERVER_BIN" <<<"$cmdline" || return 1
+    grep -Fxq -- "$SERVER_CONFIG" <<<"$cmdline" || return 1
+    grep -Fxq -- "${LISTEN_HOST}:${LISTEN_PORT}" <<<"$cmdline" || return 1
+}
+
 server_running() {
     local pid
     pid="$(server_pid || true)"
-    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+    [[ -n "$pid" ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    pid_matches_server "$pid"
 }
 
 wait_for_server() {
@@ -196,6 +262,17 @@ start_server() {
         return
     fi
 
+    if [[ -f "$PID_FILE" ]]; then
+        local existing_pid
+        existing_pid="$(server_pid || true)"
+        if [[ -n "$existing_pid" ]]; then
+            if kill -0 "$existing_pid" 2>/dev/null && ! pid_matches_server "$existing_pid"; then
+                echo "Ignoring stale pidfile at $PID_FILE for unexpected live pid $existing_pid" >&2
+            fi
+        fi
+        rm -f "$PID_FILE"
+    fi
+
     : >"$SERVER_LOG"
     echo "Starting local debug server at $SERVER_URL"
     (
@@ -211,14 +288,26 @@ start_server() {
 }
 
 stop_server() {
-    if ! server_running; then
+    local pid
+    pid="$(server_pid || true)"
+
+    if [[ -z "$pid" ]]; then
         rm -f "$PID_FILE"
         echo "Local debug server is not running"
         return
     fi
 
-    local pid
-    pid="$(server_pid)"
+    if ! kill -0 "$pid" 2>/dev/null; then
+        rm -f "$PID_FILE"
+        echo "Removed stale pidfile for pid $pid"
+        return
+    fi
+
+    if ! pid_matches_server "$pid"; then
+        echo "Refusing to kill unexpected process from $PID_FILE (pid $pid)" >&2
+        return 1
+    fi
+
     kill "$pid"
     wait "$pid" 2>/dev/null || true
     rm -f "$PID_FILE"

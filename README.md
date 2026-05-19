@@ -215,9 +215,11 @@ What it does:
 
 - builds `remerge`, `remerge-server`, and `remerge-worker` in the selected cargo profile
 - writes user-owned temp config/state under `.tmp/remerge-local-debug/`
-- starts `remerge-server` on `127.0.0.1:17654` with trace logging and `RUST_BACKTRACE=1`
+- starts `remerge-server` on `127.0.0.1:17654` with trace logging, `RUST_BACKTRACE=1`, and a generated config that sets `auth.mode = "none"`
 - points the CLI at that localhost server via a generated config file
 - injects `--no-local` by default so you can exercise the remote-build flow without requiring root for the final local `emerge`
+
+Keep the local debug harness bound to localhost unless you have an explicit, separate network protection layer. The generated config disables auth, so exposing it on `0.0.0.0` or another non-loopback address would publish an unauthenticated server. The script now refuses non-loopback binds unless you opt in with `REMERGE_LOCAL_DEBUG_ALLOW_REMOTE=true`.
 
 Useful commands:
 
@@ -241,6 +243,7 @@ Useful environment overrides:
 REMERGE_LOCAL_DEBUG_PROFILE=release
 REMERGE_LOCAL_DEBUG_PORT=18654
 REMERGE_LOCAL_DEBUG_RUST_LOG='remerge=trace,remerge_server=trace,remerge_cli=trace,remerge_worker=trace,reqwest=debug'
+REMERGE_LOCAL_DEBUG_HOST=127.0.0.1
 REMERGE_LOCAL_DEBUG_WORKER_BASE_IMAGE='ghcr.io/k-forss/remerge/test-stage3:latest'
 REMERGE_LOCAL_DEBUG_REPOS_DIR=/var/db/repos
 ```

@@ -1071,8 +1071,7 @@ async fn ensure_repo_locations_remap_when_skip_sync() {
         ..common::fixtures::minimal_portage_config()
     };
 
-    // Set REMERGE_SKIP_SYNC to trigger remapping.
-    unsafe { std::env::set_var("REMERGE_SKIP_SYNC", "1") };
+    let _skip_sync = common::set_env_var("REMERGE_SKIP_SYNC", Some("1"));
 
     let result = portage_setup::ensure_repo_locations_inner(
         &config,
@@ -1081,8 +1080,6 @@ async fn ensure_repo_locations_remap_when_skip_sync() {
         &remap_base,
     )
     .await;
-
-    unsafe { std::env::remove_var("REMERGE_SKIP_SYNC") };
 
     result.expect("ensure_repo_locations_inner should succeed");
 
@@ -1132,7 +1129,7 @@ async fn ensure_repo_locations_remap_existing_directory_when_skip_sync() {
         ..common::fixtures::minimal_portage_config()
     };
 
-    unsafe { std::env::set_var("REMERGE_SKIP_SYNC", "1") };
+    let _skip_sync = common::set_env_var("REMERGE_SKIP_SYNC", Some("1"));
 
     let result = portage_setup::ensure_repo_locations_inner(
         &config,
@@ -1141,8 +1138,6 @@ async fn ensure_repo_locations_remap_existing_directory_when_skip_sync() {
         &remap_base,
     )
     .await;
-
-    unsafe { std::env::remove_var("REMERGE_SKIP_SYNC") };
 
     result.expect("ensure_repo_locations_inner should succeed");
 
@@ -1187,8 +1182,7 @@ async fn ensure_repo_locations_create_empty_dir() {
         ..common::fixtures::minimal_portage_config()
     };
 
-    // Make sure REMERGE_SKIP_SYNC is not set.
-    unsafe { std::env::remove_var("REMERGE_SKIP_SYNC") };
+    let _skip_sync = common::set_env_var("REMERGE_SKIP_SYNC", None);
 
     portage_setup::ensure_repo_locations_inner(&config, &repos_base, &repos_conf_base, &remap_base)
         .await

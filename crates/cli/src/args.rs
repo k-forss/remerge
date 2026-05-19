@@ -715,7 +715,7 @@ pub struct Cli {
 
 const SNAPSHOT_UPLOAD_MAX_ATTEMPTS: usize = 3;
 const SNAPSHOT_UPLOAD_RETRY_DELAY: Duration = Duration::from_millis(200);
-const LOCAL_FOLLOWUP_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(300);
+const LOCAL_FOLLOWUP_RESTORE_TIMEOUT: Duration = Duration::from_secs(300);
 const LOCAL_FOLLOWUP_WATCHDOG_HEARTBEAT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1446,7 +1446,7 @@ impl Cli {
         println!("Restoring local follow-up state…");
         Self::run_with_watchdog(
             "restoring local follow-up state",
-            LOCAL_FOLLOWUP_WATCHDOG_TIMEOUT,
+            LOCAL_FOLLOWUP_RESTORE_TIMEOUT,
             reconcile(),
         )
         .await
@@ -1459,12 +1459,7 @@ impl Cli {
         }
 
         println!("\nRunning emerge locally with binary packages…\n");
-        Self::run_with_watchdog(
-            "running local emerge with binary packages",
-            LOCAL_FOLLOWUP_WATCHDOG_TIMEOUT,
-            run_local(),
-        )
-        .await
+        run_local().await
     }
 
     async fn run_with_watchdog<T, Fut>(stage: &str, timeout: Duration, future: Fut) -> Result<T>

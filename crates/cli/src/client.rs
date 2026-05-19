@@ -792,20 +792,20 @@ impl RemergeClient {
         workorder_id: remerge_types::workorder::WorkorderId,
     ) -> Result<WorkorderResult> {
         let deadline = tokio::time::Instant::now() + WORKORDER_RESULT_WAIT_TIMEOUT;
-        let last_error = loop {
-            match self.fetch_result(workorder_id).await {
-                Ok(result) => return Ok(result),
-                Err(error) => {
-                    if tokio::time::Instant::now() >= deadline {
-                        break error;
-                    }
+        let result = loop {
+            match self.fetch_result_status(workorder_id).await {
+                Ok(Some(result)) => break Ok(result),
+                Ok(None) if tokio::time::Instant::now() >= deadline => {
+                    break Err(anyhow::anyhow!("Workorder has no result yet"));
                 }
+                Ok(None) => {
+                    tokio::time::sleep(WORKORDER_RESULT_POLL_INTERVAL).await;
+                }
+                Err(error) => return Err(error),
             }
-
-            tokio::time::sleep(WORKORDER_RESULT_POLL_INTERVAL).await;
         };
 
-        Err(last_error).context("Workorder finished but the final result was not available")
+        result.context("Workorder finished but the final result was not available")
     }
 
     async fn wait_for_progress_cleanup(
@@ -970,6 +970,15 @@ impl RemergeClient {
         &self,
         workorder_id: remerge_types::workorder::WorkorderId,
     ) -> Result<WorkorderResult> {
+        self.fetch_result_status(workorder_id)
+            .await?
+            .context("Workorder has no result yet")
+    }
+
+    async fn fetch_result_status(
+        &self,
+        workorder_id: remerge_types::workorder::WorkorderId,
+    ) -> Result<Option<WorkorderResult>> {
         let resp = self
             .http
             .get(format!(
@@ -977,13 +986,14 @@ impl RemergeClient {
                 self.base_url
             ))
             .send()
-            .await?;
+            .await?
+            .error_for_status()?;
 
         let status_resp = resp
             .json::<remerge_types::api::WorkorderStatusResponse>()
             .await?;
 
-        status_resp.result.context("Workorder has no result yet")
+        Ok(status_resp.result)
     }
 }
 
@@ -1042,7 +1052,87 @@ mod tests {
         PROGRESS_STREAM_CLEANUP_TIMEOUT, RemergeClient, SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES,
         SnapshotBlobChunkPolicy,
     };
+    use axum::{
+        Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get,
+    };
+    use remerge_types::{
+        api::WorkorderStatusResponse,
+        workorder::{WorkorderResult, WorkorderStatus},
+    };
+    use std::collections::BTreeMap;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use std::time::Duration;
+
+    #[derive(Clone)]
+    enum ResultResponsePlan {
+        PendingThenReady {
+            polls_before_ready: usize,
+            counter: Arc<AtomicUsize>,
+            result: WorkorderResult,
+        },
+        Unauthorized,
+    }
+
+    async fn spawn_result_server(plan: ResultResponsePlan) -> String {
+        async fn result_handler(
+            State(plan): State<ResultResponsePlan>,
+            axum::extract::Path(workorder_id): axum::extract::Path<uuid::Uuid>,
+        ) -> impl IntoResponse {
+            match plan {
+                ResultResponsePlan::PendingThenReady {
+                    polls_before_ready,
+                    counter,
+                    result,
+                } => {
+                    let poll_number = counter.fetch_add(1, Ordering::SeqCst);
+                    let response = WorkorderStatusResponse {
+                        workorder_id,
+                        status: if poll_number >= polls_before_ready {
+                            WorkorderStatus::Completed
+                        } else {
+                            WorkorderStatus::Building
+                        },
+                        result: (poll_number >= polls_before_ready).then_some(result),
+                        trace_id: None,
+                    };
+                    (StatusCode::OK, Json(response)).into_response()
+                }
+                ResultResponsePlan::Unauthorized => {
+                    (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
+                }
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind result server");
+        let addr = listener.local_addr().expect("result server addr");
+        let app = Router::new()
+            .route("/api/v1/workorders/{id}", get(result_handler))
+            .with_state(plan);
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve result server");
+        });
+
+        format!("http://{addr}")
+    }
+
+    fn sample_workorder_result(workorder_id: uuid::Uuid) -> WorkorderResult {
+        WorkorderResult {
+            workorder_id,
+            built_packages: Vec::new(),
+            failed_packages: Vec::new(),
+            binhost_uri: "https://example.invalid/binpkgs".to_string(),
+            fetched_distfiles: BTreeMap::new(),
+            parity_manifest: Default::default(),
+        }
+    }
 
     #[test]
     fn parses_workorder_id_from_progress_url() {
@@ -1155,6 +1245,49 @@ mod tests {
         );
         assert!(
             message.contains("testing cleanup watchdog"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn await_result_ready_retries_until_result_is_present() {
+        let workorder_id = uuid::Uuid::new_v4();
+        let expected = sample_workorder_result(workorder_id);
+        let polls = Arc::new(AtomicUsize::new(0));
+        let base_url = spawn_result_server(ResultResponsePlan::PendingThenReady {
+            polls_before_ready: 2,
+            counter: polls.clone(),
+            result: expected.clone(),
+        })
+        .await;
+        let client = RemergeClient::new(&base_url).expect("client");
+
+        let result = client
+            .await_result_ready(workorder_id)
+            .await
+            .expect("result should become available");
+
+        assert_eq!(result.workorder_id, expected.workorder_id);
+        assert!(polls.load(Ordering::SeqCst) >= 3);
+    }
+
+    #[tokio::test]
+    async fn await_result_ready_fails_fast_on_http_errors() {
+        let workorder_id = uuid::Uuid::new_v4();
+        let base_url = spawn_result_server(ResultResponsePlan::Unauthorized).await;
+        let client = RemergeClient::new(&base_url).expect("client");
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.await_result_ready(workorder_id),
+        )
+        .await
+        .expect("http errors should not be retried until timeout")
+        .expect_err("unauthorized result fetch should fail");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("401") || message.to_ascii_lowercase().contains("unauthorized"),
             "unexpected error: {error:#}"
         );
     }

@@ -12,6 +12,8 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
+use crate::blob_store::write_bytes_with_atomic_replace;
+
 /// Manages the binary package repository on disk.
 pub struct BinpkgRepo {
     root: PathBuf,
@@ -111,7 +113,6 @@ impl BinpkgRepo {
 
         // Write the Packages index file.
         let index_path = self.root.join("Packages");
-        let temp_index_path = self.root.join("Packages.remerge.tmp");
         let mut content = String::new();
 
         // Header.
@@ -131,8 +132,8 @@ impl BinpkgRepo {
             content.push('\n');
         }
 
-        tokio::fs::write(&temp_index_path, &content).await?;
-        tokio::fs::rename(&temp_index_path, &index_path).await?;
+        write_bytes_with_atomic_replace(&self.root, &index_path, "Packages", content.as_bytes())
+            .await?;
         info!(count = entries.len(), "Regenerated Packages index");
 
         Ok(())
