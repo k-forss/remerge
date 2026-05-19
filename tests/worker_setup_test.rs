@@ -1071,8 +1071,7 @@ async fn ensure_repo_locations_remap_when_skip_sync() {
         ..common::fixtures::minimal_portage_config()
     };
 
-    // Set REMERGE_SKIP_SYNC to trigger remapping.
-    unsafe { std::env::set_var("REMERGE_SKIP_SYNC", "1") };
+    let _skip_sync = common::set_env_var("REMERGE_SKIP_SYNC", Some("1"));
 
     let result = portage_setup::ensure_repo_locations_inner(
         &config,
@@ -1081,8 +1080,6 @@ async fn ensure_repo_locations_remap_when_skip_sync() {
         &remap_base,
     )
     .await;
-
-    unsafe { std::env::remove_var("REMERGE_SKIP_SYNC") };
 
     result.expect("ensure_repo_locations_inner should succeed");
 
@@ -1098,6 +1095,59 @@ async fn ensure_repo_locations_remap_when_skip_sync() {
     let expected_alt = format!("{}", remap_base.join("custom").display());
     assert!(
         rewritten.contains(&expected_alt),
+        "repos.conf should contain remapped path, got: {rewritten}"
+    );
+}
+
+/// Repo under a read-only repos mount should still be remapped even when the
+/// original location already exists as a directory.
+#[tokio::test]
+async fn ensure_repo_locations_remap_existing_directory_when_skip_sync() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let base = tmp.path();
+
+    let repos_base = base.join("repos");
+    let target_location = repos_base.join("remerge-src/overlay");
+    std::fs::create_dir_all(&target_location).expect("create existing overlay dir");
+
+    let repos_conf_base = base.join("repos_conf");
+    std::fs::create_dir_all(&repos_conf_base).expect("create repos_conf dir");
+    let remap_base = base.join("remap");
+
+    let conf_content = format!(
+        "[remerge]\nlocation = {}\nauto-sync = no\n",
+        target_location.display()
+    );
+    std::fs::write(repos_conf_base.join("remerge.conf"), &conf_content)
+        .expect("write initial repos.conf");
+
+    let mut repos_conf = std::collections::BTreeMap::new();
+    repos_conf.insert("remerge.conf".to_string(), conf_content);
+
+    let config = PortageConfig {
+        repos_conf,
+        ..common::fixtures::minimal_portage_config()
+    };
+
+    let _skip_sync = common::set_env_var("REMERGE_SKIP_SYNC", Some("1"));
+
+    let result = portage_setup::ensure_repo_locations_inner(
+        &config,
+        &repos_base,
+        &repos_conf_base,
+        &remap_base,
+    )
+    .await;
+
+    result.expect("ensure_repo_locations_inner should succeed");
+
+    let expected_alt = remap_base.join("remerge");
+    assert!(expected_alt.is_dir(), "remapped directory should exist");
+
+    let rewritten =
+        std::fs::read_to_string(repos_conf_base.join("remerge.conf")).expect("read rewritten conf");
+    assert!(
+        rewritten.contains(&expected_alt.display().to_string()),
         "repos.conf should contain remapped path, got: {rewritten}"
     );
 }
@@ -1132,8 +1182,7 @@ async fn ensure_repo_locations_create_empty_dir() {
         ..common::fixtures::minimal_portage_config()
     };
 
-    // Make sure REMERGE_SKIP_SYNC is not set.
-    unsafe { std::env::remove_var("REMERGE_SKIP_SYNC") };
+    let _skip_sync = common::set_env_var("REMERGE_SKIP_SYNC", None);
 
     portage_setup::ensure_repo_locations_inner(&config, &repos_base, &repos_conf_base, &remap_base)
         .await

@@ -12,6 +12,8 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
+use crate::blob_store::write_bytes_with_atomic_replace;
+
 /// Manages the binary package repository on disk.
 pub struct BinpkgRepo {
     root: PathBuf,
@@ -130,7 +132,8 @@ impl BinpkgRepo {
             content.push('\n');
         }
 
-        tokio::fs::write(&index_path, &content).await?;
+        write_bytes_with_atomic_replace(&self.root, &index_path, "Packages", content.as_bytes())
+            .await?;
         info!(count = entries.len(), "Regenerated Packages index");
 
         Ok(())
@@ -270,6 +273,7 @@ fn dir_size(path: &std::path::Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn extract_base_from_cpv() {
@@ -282,5 +286,38 @@ mod tests {
             "sys-libs/glibc"
         );
         assert_eq!(extract_package_base("dev-libs/foo"), "dev-libs/foo");
+    }
+
+    #[tokio::test]
+    async fn regenerate_index_replaces_read_only_existing_packages_file() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let repo = BinpkgRepo::new(tempdir.path().to_path_buf());
+        repo.init().await.expect("init repo");
+
+        let package_path = tempdir.path().join("dev-libs");
+        tokio::fs::create_dir_all(&package_path)
+            .await
+            .expect("create category dir");
+        tokio::fs::write(package_path.join("demo-1.0.gpkg.tar"), b"demo")
+            .await
+            .expect("write package");
+
+        let index_path = tempdir.path().join("Packages");
+        tokio::fs::write(&index_path, b"stale index")
+            .await
+            .expect("write stale index");
+        let mut permissions = std::fs::metadata(&index_path)
+            .expect("stat index")
+            .permissions();
+        permissions.set_mode(0o444);
+        std::fs::set_permissions(&index_path, permissions).expect("set readonly perms");
+
+        repo.regenerate_index().await.expect("regenerate index");
+
+        let index = tokio::fs::read_to_string(&index_path)
+            .await
+            .expect("read regenerated index");
+        assert!(index.contains("PACKAGES: 1"));
+        assert!(index.contains("CPV: dev-libs/demo-1.0"));
     }
 }

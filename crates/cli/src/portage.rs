@@ -26,6 +26,14 @@ use remerge_types::portage::*;
 
 use crate::cflags;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepoSection {
+    name: String,
+    location: String,
+    sync_uri: Option<String>,
+    auto_sync: Option<bool>,
+}
+
 /// Reads portage configuration from the local system.
 pub struct PortageReader {
     root: PathBuf,
@@ -99,17 +107,40 @@ impl PortageReader {
     fn read_make_conf(&self) -> Result<MakeConf> {
         let vars = self.read_make_conf_vars()?;
         let can_query_portageq = self.root == Path::new("/");
+        let initial_portageq = if can_query_portageq {
+            match Self::portageq_envvars(&[
+                "CFLAGS",
+                "CXXFLAGS",
+                "CHOST",
+                "USE",
+                "USE_EXPAND",
+                "USE_EXPAND_UNPREFIXED",
+                "USE_EXPAND_HIDDEN",
+                "LDFLAGS",
+                "MAKEOPTS",
+                "FEATURES",
+                "ACCEPT_LICENSE",
+                "ACCEPT_KEYWORDS",
+                "EMERGE_DEFAULT_OPTS",
+            ]) {
+                Ok(values) => Some(values),
+                Err(error) => {
+                    debug!(%error, "Failed to batch resolve initial make.conf variables via portageq");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let get = |key: &str| -> String { vars.get(key).cloned().unwrap_or_default() };
         let get_effective = |key: &str| -> String {
             if can_query_portageq {
-                match Self::portageq_envvar(key) {
-                    Ok(value) if !value.is_empty() => value,
-                    Ok(_) => get(key),
-                    Err(error) => {
-                        debug!(%error, key, "Failed to resolve make.conf variable via portageq");
-                        get(key)
-                    }
-                }
+                initial_portageq
+                    .as_ref()
+                    .and_then(|resolved| resolved.get(key))
+                    .filter(|value| !value.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| get(key))
             } else {
                 debug!(key, root = %self.root.display(), "Skipping portageq resolution for non-root snapshot tree");
                 get(key)
@@ -167,10 +198,18 @@ impl PortageReader {
         // are NOT present in make.conf.  Use `portageq envvar USE` to get
         // the fully merged value (profile defaults + make.conf + profile
         // force/mask).
-        let (use_flags, use_flags_resolved) = match can_query_portageq
-            .then(|| Self::portageq_envvar("USE"))
-            .transpose()
-        {
+        let resolved_use = if can_query_portageq {
+            initial_portageq
+                .as_ref()
+                .and_then(|resolved| resolved.get("USE"))
+                .cloned()
+                .map(Ok)
+                .unwrap_or_else(|| Self::portageq_envvar("USE"))
+                .map(Some)
+        } else {
+            Ok(None)
+        };
+        let (use_flags, use_flags_resolved) = match resolved_use {
             Ok(resolved_use) => {
                 let resolved_use = resolved_use.unwrap_or_default();
                 let flags: Vec<String> =
@@ -182,7 +221,7 @@ impl PortageReader {
                 // because they're sent separately as USE_EXPAND variables
                 // and would conflict if duplicated in the USE line (causing
                 // slot conflicts with ABI_X86, PYTHON_TARGETS, etc.).
-                let flags = Self::strip_use_expand_flags(flags);
+                let flags = Self::strip_use_expand_flags(flags, initial_portageq.as_ref());
 
                 info!(
                     count = flags.len(),
@@ -226,16 +265,19 @@ impl PortageReader {
                 if !can_query_portageq {
                     break;
                 }
-                match Self::portageq_envvar(var) {
-                    Ok(expand_str) => {
+                match initial_portageq
+                    .as_ref()
+                    .and_then(|resolved| resolved.get(var))
+                {
+                    Some(expand_str) => {
                         let found: Vec<String> =
                             expand_str.split_whitespace().map(String::from).collect();
                         debug!(var, count = found.len(), "Discovered USE_EXPAND variables");
                         keys.extend(found);
                         any_succeeded = true;
                     }
-                    Err(e) => {
-                        debug!(%e, var, "Failed to query USE_EXPAND variant");
+                    None => {
+                        debug!(var, "Failed to query USE_EXPAND variant");
                     }
                 }
             }
@@ -268,26 +310,31 @@ impl PortageReader {
         };
 
         let mut use_expand = BTreeMap::new();
+        let resolved_use_expand_values = if can_query_portageq && !use_expand_keys.is_empty() {
+            let key_refs: Vec<&str> = use_expand_keys.iter().map(String::as_str).collect();
+            match Self::portageq_envvars(&key_refs) {
+                Ok(values) => Some(values),
+                Err(error) => {
+                    debug!(%error, "Failed to batch resolve USE_EXPAND values via portageq");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         for key in &use_expand_keys {
             // CPU_FLAGS_* are handled separately via cpuid2cpuflags.
             if key.starts_with("CPU_FLAGS_") {
                 continue;
             }
-            // Try portageq first for fully-resolved values, fall back to make.conf.
-            let vals = match can_query_portageq
-                .then(|| Self::portageq_envvar(key))
-                .transpose()
-            {
-                Ok(resolved) => {
-                    let resolved = resolved.unwrap_or_default();
-                    let v: Vec<String> = resolved.split_whitespace().map(String::from).collect();
-                    if !v.is_empty() {
-                        debug!(key = %key, ?v, "USE_EXPAND resolved via portageq");
-                    }
-                    v
-                }
-                Err(_) => split_flags(key),
-            };
+            let vals: Vec<String> = resolved_use_expand_values
+                .as_ref()
+                .and_then(|resolved| resolved.get(key))
+                .map(|resolved| resolved.split_whitespace().map(String::from).collect())
+                .unwrap_or_else(|| split_flags(key));
+            if !vals.is_empty() {
+                debug!(key = %key, ?vals, "USE_EXPAND resolved");
+            }
             if !vals.is_empty() {
                 use_expand.insert(key.clone(), vals);
             }
@@ -546,22 +593,22 @@ impl PortageReader {
         let mut snapshots = BTreeMap::new();
 
         for content in repos_conf.values() {
-            for (name, location) in Self::parse_repo_sections(content) {
-                if !Self::should_snapshot_repo(&name, &location) {
+            for repo in Self::parse_repo_sections_full(content) {
+                if !Self::should_snapshot_repo(&repo) {
                     continue;
                 }
 
-                let location_path = Path::new(&location);
+                let location_path = Path::new(&repo.location);
                 if !location_path.is_dir() {
-                    debug!(repo = %name, location = %location, "Repo location missing — skipping snapshot");
+                    debug!(repo = %repo.name, location = %repo.location, "Repo location missing — skipping snapshot");
                     continue;
                 }
 
                 let mut files = BTreeMap::new();
                 Self::read_text_tree_recursive(location_path, location_path, &mut files);
                 if !files.is_empty() {
-                    info!(repo = %name, file_count = files.len(), "Captured local repo snapshot");
-                    snapshots.insert(name, files);
+                    info!(repo = %repo.name, file_count = files.len(), "Captured local repo snapshot");
+                    snapshots.insert(repo.name, files);
                 }
             }
         }
@@ -649,8 +696,8 @@ impl PortageReader {
         let mut manifest = SnapshotManifest::default();
         let repo_locations: BTreeMap<String, PathBuf> = repos_conf
             .values()
-            .flat_map(|content| Self::parse_repo_sections(content).into_iter())
-            .map(|(name, location)| (name, PathBuf::from(location)))
+            .flat_map(|content| Self::parse_repo_sections_full(content).into_iter())
+            .map(|repo| (repo.name, PathBuf::from(repo.location)))
             .collect();
 
         for (repo_name, snapshot) in repo_snapshots {
@@ -872,45 +919,84 @@ impl PortageReader {
         Ok(Self::sha256_hex(&bytes))
     }
 
-    fn should_snapshot_repo(name: &str, location: &str) -> bool {
-        if name.eq_ignore_ascii_case("gentoo") {
+    fn should_snapshot_repo(repo: &RepoSection) -> bool {
+        if repo.name.eq_ignore_ascii_case("gentoo") {
             return false;
         }
 
-        let location = location.trim_end_matches('/');
-        !location.ends_with("/gentoo")
+        let location = repo.location.trim_end_matches('/');
+        !location.ends_with("/gentoo") && (repo.auto_sync == Some(false) || repo.sync_uri.is_none())
     }
 
-    fn parse_repo_sections(content: &str) -> Vec<(String, String)> {
+    fn parse_repo_sections_full(content: &str) -> Vec<RepoSection> {
         let mut repos = Vec::new();
         let mut current_name = String::new();
         let mut current_location: Option<String> = None;
+        let mut current_sync_uri: Option<String> = None;
+        let mut current_auto_sync: Option<bool> = None;
 
-        let flush = |name: &str, location: Option<String>, out: &mut Vec<(String, String)>| {
+        let flush = |name: &str,
+                     location: Option<String>,
+                     sync_uri: Option<String>,
+                     auto_sync: Option<bool>,
+                     out: &mut Vec<RepoSection>| {
             if !name.is_empty()
                 && !name.eq_ignore_ascii_case("DEFAULT")
                 && let Some(location) = location
             {
-                out.push((name.to_string(), location));
+                out.push(RepoSection {
+                    name: name.to_string(),
+                    location,
+                    sync_uri,
+                    auto_sync,
+                });
             }
         };
 
         for line in content.lines() {
             let trimmed = line.trim();
             if trimmed.starts_with('[') && trimmed.ends_with(']') {
-                flush(&current_name, current_location.take(), &mut repos);
+                flush(
+                    &current_name,
+                    current_location.take(),
+                    current_sync_uri.take(),
+                    current_auto_sync.take(),
+                    &mut repos,
+                );
                 current_name = trimmed[1..trimmed.len() - 1].trim().to_string();
                 continue;
             }
-            if let Some((key, value)) = trimmed.split_once('=')
-                && key.trim().eq_ignore_ascii_case("location")
-            {
-                current_location = Some(value.trim().to_string());
+            if let Some((key, value)) = trimmed.split_once('=') {
+                match key.trim().to_ascii_lowercase().as_str() {
+                    "location" => current_location = Some(value.trim().to_string()),
+                    "sync-uri" => {
+                        let value = value.trim();
+                        if !value.is_empty() {
+                            current_sync_uri = Some(value.to_string());
+                        }
+                    }
+                    "auto-sync" => current_auto_sync = Self::parse_bool(value),
+                    _ => {}
+                }
             }
         }
 
-        flush(&current_name, current_location.take(), &mut repos);
+        flush(
+            &current_name,
+            current_location.take(),
+            current_sync_uri.take(),
+            current_auto_sync.take(),
+            &mut repos,
+        );
         repos
+    }
+
+    fn parse_bool(value: &str) -> Option<bool> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "yes" | "true" | "1" => Some(true),
+            "no" | "false" | "0" => Some(false),
+            _ => None,
+        }
     }
 
     fn parse_manifest_distfiles(content: &str) -> Vec<String> {
@@ -1538,23 +1624,51 @@ impl PortageReader {
     ///
     /// Falls back with an error if `portageq` is unavailable (non-Gentoo host).
     fn portageq_envvar(var: &str) -> Result<String> {
+        let mut values = Self::portageq_envvars(&[var])?;
+        values
+            .remove(var)
+            .ok_or_else(|| anyhow!("`portageq envvar {var}` returned no output line"))
+    }
+
+    fn portageq_envvars(vars: &[&str]) -> Result<BTreeMap<String, String>> {
         let output = std::process::Command::new("portageq")
-            .args(["envvar", var])
+            .arg("envvar")
+            .args(vars)
             .output()
-            .with_context(|| format!("Failed to run `portageq envvar {var}`"))?;
+            .with_context(|| format!("Failed to run `portageq envvar {}`", vars.join(" ")))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!(
-                "`portageq envvar {var}` exited with {}: {stderr}",
+                "`portageq envvar {}` exited with {}: {stderr}",
+                vars.join(" "),
                 output.status
             );
         }
 
-        Ok(String::from_utf8(output.stdout)
-            .context("portageq output is not valid UTF-8")?
-            .trim()
-            .to_string())
+        let stdout =
+            String::from_utf8(output.stdout).context("portageq output is not valid UTF-8")?;
+        let mut values = BTreeMap::new();
+        let mut lines = stdout.lines();
+        for var in vars {
+            let Some(value) = lines.next() else {
+                anyhow::bail!(
+                    "`portageq envvar {}` returned too few lines for {} variable(s)",
+                    vars.join(" "),
+                    vars.len()
+                );
+            };
+            values.insert((*var).to_string(), value.trim().to_string());
+        }
+        if lines.next().is_some() {
+            anyhow::bail!(
+                "`portageq envvar {}` returned too many lines for {} variable(s)",
+                vars.join(" "),
+                vars.len()
+            );
+        }
+
+        Ok(values)
     }
 
     /// Strip USE_EXPAND flags from a resolved USE flag list.
@@ -1569,13 +1683,16 @@ impl PortageReader {
     /// We query `portageq envvar USE_EXPAND`, `USE_EXPAND_UNPREFIXED`, and
     /// `USE_EXPAND_HIDDEN` for the authoritative list of USE_EXPAND variable
     /// names, then filter any flag matching their lowercased prefix.
-    fn strip_use_expand_flags(flags: Vec<String>) -> Vec<String> {
+    fn strip_use_expand_flags(
+        flags: Vec<String>,
+        initial_portageq: Option<&BTreeMap<String, String>>,
+    ) -> Vec<String> {
         // Collect prefixes from all USE_EXPAND variants.
         let mut prefixes = Vec::new();
         let mut any_succeeded = false;
 
         for var in ["USE_EXPAND", "USE_EXPAND_UNPREFIXED", "USE_EXPAND_HIDDEN"] {
-            if let Ok(expand_str) = Self::portageq_envvar(var) {
+            if let Some(expand_str) = initial_portageq.and_then(|resolved| resolved.get(var)) {
                 prefixes.extend(
                     expand_str
                         .split_whitespace()
@@ -2089,5 +2206,41 @@ VIDEO_CARDS="amdgpu radeonsi"
                 "hello-1.0.tar.xz".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn should_snapshot_repo_skips_syncable_overlays_but_keeps_local_ones() {
+        let repos = PortageReader::parse_repo_sections_full(
+            "[gentoo]\nlocation = /var/db/repos/gentoo\nsync-type = rsync\nsync-uri = rsync://example.invalid/gentoo\nauto-sync = yes\n\n[guru]\nlocation = /var/db/repos/guru\nsync-type = git\nsync-uri = https://github.com/gentoo-mirror/guru.git\n\n[remerge]\nlocation = /var/db/repos/remerge-src/overlay\nauto-sync = no\n\n[scratch]\nlocation = /srv/portage/scratch\n",
+        );
+
+        let selected: Vec<&str> = repos
+            .iter()
+            .filter(|repo| PortageReader::should_snapshot_repo(repo))
+            .map(|repo| repo.name.as_str())
+            .collect();
+
+        assert_eq!(selected, vec!["remerge", "scratch"]);
+    }
+
+    #[test]
+    fn strip_use_expand_flags_uses_batched_prefixes() {
+        let resolved = BTreeMap::from([
+            ("USE_EXPAND".to_string(), "ABI_X86 VIDEO_CARDS".to_string()),
+            ("USE_EXPAND_UNPREFIXED".to_string(), "LLVM_SLOT".to_string()),
+            ("USE_EXPAND_HIDDEN".to_string(), String::new()),
+        ]);
+
+        let filtered = PortageReader::strip_use_expand_flags(
+            vec![
+                "abi_x86_64".to_string(),
+                "video_cards_intel".to_string(),
+                "llvm_slot_19".to_string(),
+                "wayland".to_string(),
+            ],
+            Some(&resolved),
+        );
+
+        assert_eq!(filtered, vec!["wayland"]);
     }
 }

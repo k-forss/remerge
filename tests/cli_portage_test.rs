@@ -387,6 +387,113 @@ fn read_config_captures_local_overlay_and_distfiles() {
     );
 }
 
+/// Synced overlays should be reconstructed from repos.conf on the worker,
+/// while local auto-sync=no overlays still need full snapshot capture.
+#[test]
+fn read_config_skips_syncable_overlay_snapshots_and_their_distfiles() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let root = tmp.path().to_path_buf();
+    let portage = root.join("etc/portage");
+    std::fs::create_dir_all(portage.join("repos.conf")).expect("create repos.conf dir");
+    std::fs::write(
+        portage.join("make.conf"),
+        "CFLAGS=\"-O2\"\nCHOST=\"x86_64-pc-linux-gnu\"\n",
+    )
+    .expect("write make.conf");
+
+    let local_repo = root.join("var/db/repos/remerge-src/overlay");
+    let local_pkg = local_repo.join("dev-libs/demo");
+    std::fs::create_dir_all(local_pkg.join("metadata")).expect("create local metadata dir");
+    std::fs::create_dir_all(local_repo.join("profiles")).expect("create local profiles dir");
+    std::fs::write(local_repo.join("profiles/repo_name"), "remerge\n")
+        .expect("write local repo_name");
+    std::fs::write(
+        local_pkg.join("demo-1.0.ebuild"),
+        "EAPI=8\nDESCRIPTION=\"demo\"\nSRC_URI=\"https://example.invalid/demo-1.0.tar.xz\"\nSLOT=\"0\"\nKEYWORDS=\"~amd64\"\n",
+    )
+    .expect("write local ebuild");
+    std::fs::write(
+        local_pkg.join("Manifest"),
+        "DIST demo-1.0.tar.xz 13 BLAKE2B deadbeef SHA512 cafefood\n",
+    )
+    .expect("write local manifest");
+    std::fs::write(local_pkg.join("metadata/layout.conf"), "masters = gentoo\n")
+        .expect("write local layout.conf");
+
+    let synced_repo = root.join("var/db/repos/guru");
+    let synced_pkg = synced_repo.join("app-misc/syncdemo");
+    std::fs::create_dir_all(synced_pkg.join("metadata")).expect("create synced metadata dir");
+    std::fs::create_dir_all(synced_repo.join("profiles")).expect("create synced profiles dir");
+    std::fs::write(synced_repo.join("profiles/repo_name"), "guru\n")
+        .expect("write synced repo_name");
+    std::fs::write(
+        synced_pkg.join("syncdemo-1.0.ebuild"),
+        "EAPI=8\nDESCRIPTION=\"syncdemo\"\nSRC_URI=\"https://example.invalid/syncdemo-1.0.tar.xz\"\nSLOT=\"0\"\nKEYWORDS=\"~amd64\"\n",
+    )
+    .expect("write synced ebuild");
+    std::fs::write(
+        synced_pkg.join("Manifest"),
+        "DIST syncdemo-1.0.tar.xz 17 BLAKE2B deadbeef SHA512 cafefood\n",
+    )
+    .expect("write synced manifest");
+    std::fs::write(
+        synced_pkg.join("metadata/layout.conf"),
+        "masters = gentoo\n",
+    )
+    .expect("write synced layout.conf");
+
+    std::fs::write(
+        portage.join("repos.conf/gentoo.conf"),
+        "[gentoo]\nlocation = /var/db/repos/gentoo\nsync-type = rsync\nsync-uri = rsync://example.invalid/gentoo\nauto-sync = yes\n",
+    )
+    .expect("write gentoo.conf");
+    std::fs::write(
+        portage.join("repos.conf/guru.conf"),
+        format!(
+            "[guru]\nlocation = {}\nsync-type = git\nsync-uri = https://github.com/gentoo-mirror/guru.git\n",
+            synced_repo.display()
+        ),
+    )
+    .expect("write guru.conf");
+    std::fs::write(
+        portage.join("repos.conf/remerge.conf"),
+        format!(
+            "[remerge]\nlocation = {}\nauto-sync = no\n",
+            local_repo.display()
+        ),
+    )
+    .expect("write remerge.conf");
+
+    let distdir = root.join("var/cache/distfiles");
+    std::fs::create_dir_all(&distdir).expect("create distdir");
+    std::fs::write(distdir.join("demo-1.0.tar.xz"), b"demo-distfile")
+        .expect("write local distfile");
+
+    let _env = common::set_root_env(&root);
+    let reader = portage::PortageReader::new().unwrap();
+
+    let config = reader.read_config().expect("read portage config");
+
+    assert!(
+        config.repo_snapshots.contains_key("remerge"),
+        "local auto-sync=no overlay should be snapshotted"
+    );
+    assert!(
+        !config.repo_snapshots.contains_key("guru"),
+        "syncable overlay should be reconstructed from repos.conf instead of being snapshotted"
+    );
+    assert_eq!(
+        config.distfile_snapshots.get("demo-1.0.tar.xz"),
+        Some(&b"demo-distfile".to_vec())
+    );
+    assert!(
+        !config
+            .distfile_snapshots
+            .contains_key("syncdemo-1.0.tar.xz"),
+        "distfiles from syncable overlays should not be captured"
+    );
+}
+
 /// Fixture VDB tree creates package directories.
 #[test]
 fn fixture_vdb_tree() {

@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::future::Future;
+use std::io::IsTerminal;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
@@ -714,6 +715,8 @@ pub struct Cli {
 
 const SNAPSHOT_UPLOAD_MAX_ATTEMPTS: usize = 3;
 const SNAPSHOT_UPLOAD_RETRY_DELAY: Duration = Duration::from_millis(200);
+const LOCAL_FOLLOWUP_RESTORE_TIMEOUT: Duration = Duration::from_secs(300);
+const LOCAL_FOLLOWUP_WATCHDOG_HEARTBEAT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PackageSyncDisposition {
@@ -744,34 +747,59 @@ struct SyncProgressReporter {
     started_at: Instant,
     last_progress_draw: Option<Instant>,
     summary: BinpkgSyncSummary,
+    output_mode: SyncProgressOutputMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncProgressOutputMode {
+    Interactive,
+    Plain,
 }
 
 const SYNC_PROGRESS_DRAW_INTERVAL: Duration = Duration::from_millis(100);
+const SYNC_PROGRESS_DRAW_INTERVAL_PLAIN: Duration = Duration::from_secs(1);
 
 impl SyncProgressReporter {
     fn new(total_packages: usize, binhost_uri: impl Into<String>) -> Self {
+        Self::with_output_mode(
+            total_packages,
+            binhost_uri,
+            if std::io::stderr().is_terminal() {
+                SyncProgressOutputMode::Interactive
+            } else {
+                SyncProgressOutputMode::Plain
+            },
+        )
+    }
+
+    fn with_output_mode(
+        total_packages: usize,
+        binhost_uri: impl Into<String>,
+        output_mode: SyncProgressOutputMode,
+    ) -> Self {
         let reporter = Self {
             total_packages,
             binhost_uri: binhost_uri.into(),
             started_at: Instant::now(),
             last_progress_draw: None,
             summary: BinpkgSyncSummary::default(),
+            output_mode,
         };
 
-        println!(
+        reporter.print_line(&format!(
             "Syncing {} package(s) from {}",
             reporter.total_packages, reporter.binhost_uri
-        );
+        ));
 
         reporter
     }
 
     fn record_cache_hit(&mut self, package: &BuiltPackage) -> PackageSyncStatus {
-        println!(
+        self.print_line(&format!(
             "[CACHE-HIT] {} ({})",
             package.atom,
             Self::format_byte_count(package.size)
-        );
+        ));
         PackageSyncStatus {
             atom: package.atom.clone(),
             size: package.size,
@@ -781,11 +809,11 @@ impl SyncProgressReporter {
 
     fn start_download(&mut self, package: &BuiltPackage) {
         self.last_progress_draw = None;
-        println!(
+        self.print_line(&format!(
             "[DOWNLOAD] {} ({})",
             package.atom,
             Self::format_byte_count(package.size)
-        );
+        ));
     }
 
     fn update_download_progress(
@@ -796,12 +824,14 @@ impl SyncProgressReporter {
         elapsed: Duration,
         stalled: bool,
     ) {
-        use std::io::Write as _;
-
         let now = Instant::now();
+        let draw_interval = match self.output_mode {
+            SyncProgressOutputMode::Interactive => SYNC_PROGRESS_DRAW_INTERVAL,
+            SyncProgressOutputMode::Plain => SYNC_PROGRESS_DRAW_INTERVAL_PLAIN,
+        };
         let should_draw = self
             .last_progress_draw
-            .is_none_or(|last_draw| now.duration_since(last_draw) >= SYNC_PROGRESS_DRAW_INTERVAL)
+            .is_none_or(|last_draw| now.duration_since(last_draw) >= draw_interval)
             || received_bytes >= total_bytes;
         if !should_draw {
             return;
@@ -809,23 +839,30 @@ impl SyncProgressReporter {
 
         self.last_progress_draw = Some(now);
 
-        print!(
-            "\r{}",
-            Self::format_progress_line(atom, received_bytes, total_bytes, elapsed, stalled)
-        );
-        let _ = std::io::stdout().flush();
+        let line = Self::format_progress_line(atom, received_bytes, total_bytes, elapsed, stalled);
+        match self.output_mode {
+            SyncProgressOutputMode::Interactive => {
+                use std::io::Write as _;
+
+                eprint!("\r{line}");
+                let _ = std::io::stderr().flush();
+            }
+            SyncProgressOutputMode::Plain => eprintln!("{line}"),
+        }
     }
 
     fn finish_download(&mut self, package: &BuiltPackage, elapsed: Duration) {
-        println!(
-            "\r{}",
-            Self::format_progress_line(&package.atom, package.size, package.size, elapsed, false)
-        );
+        let line =
+            Self::format_progress_line(&package.atom, package.size, package.size, elapsed, false);
+        match self.output_mode {
+            SyncProgressOutputMode::Interactive => eprintln!("\r{line}"),
+            SyncProgressOutputMode::Plain => eprintln!("{line}"),
+        }
         self.last_progress_draw = None;
     }
 
     fn refresh_index(&self, packages_url: &str) {
-        println!("[INDEX] Refreshing Packages from {packages_url}");
+        self.print_line(&format!("[INDEX] Refreshing Packages from {packages_url}"));
     }
 
     fn record_result(&mut self, status: &PackageSyncStatus) {
@@ -843,32 +880,39 @@ impl SyncProgressReporter {
 
     fn record_failure(&mut self, atom: &str, error: &anyhow::Error) {
         self.summary.failed_package = Some(atom.to_string());
-        println!("[FAILED] {atom} — {error:#}");
+        self.print_line(&format!("[FAILED] {atom} — {error:#}"));
     }
 
     fn finish(mut self, pkgdir: &Path) -> BinpkgSyncSummary {
         self.summary.elapsed = self.started_at.elapsed();
         if self.summary.failed_package.is_some() {
-            println!("Sync incomplete:");
+            self.print_line("Sync incomplete:");
         } else {
-            println!("Sync complete:");
+            self.print_line("Sync complete:");
         }
-        println!(
+        self.print_line(&format!(
             "  Downloaded: {} package(s), {}",
             self.summary.downloaded_packages,
             Self::format_byte_count(self.summary.downloaded_bytes)
-        );
-        println!(
+        ));
+        self.print_line(&format!(
             "  Reused:     {} package(s), {}",
             self.summary.reused_packages,
             Self::format_byte_count(self.summary.reused_bytes)
-        );
+        ));
         if let Some(atom) = &self.summary.failed_package {
-            println!("  Failed:      {atom}");
+            self.print_line(&format!("  Failed:      {atom}"));
         }
-        println!("  Elapsed:    {:.1}s", self.summary.elapsed.as_secs_f64());
-        println!("  Location:   {}", pkgdir.display());
+        self.print_line(&format!(
+            "  Elapsed:    {:.1}s",
+            self.summary.elapsed.as_secs_f64()
+        ));
+        self.print_line(&format!("  Location:   {}", pkgdir.display()));
         self.summary
+    }
+
+    fn print_line(&self, line: &str) {
+        eprintln!("{line}");
     }
 
     fn format_progress_line(
@@ -1129,7 +1173,7 @@ impl Cli {
         let local_args = Self::build_local_emerge_args(&self.emerge_args);
         let binhost_uri = local_binhost_uri.or_else(|| Some(result.binhost_uri.clone()));
         self.complete_local_followup(
-            || async { self.restore_final_state_parity(&client, &result).await },
+            || async { self.restore_local_followup_state(&client, &result).await },
             || async {
                 self.run_emerge_locally(&local_args, binhost_uri.as_deref())
                     .await
@@ -1342,15 +1386,42 @@ impl Cli {
         Ok(())
     }
 
-    async fn restore_final_state_parity(
+    async fn restore_local_followup_state(
         &self,
         client: &RemergeClient,
         result: &WorkorderResult,
     ) -> Result<()> {
-        self.restore_final_state_parity_into(client, result, &Self::parity_root())
-            .await
+        self.restore_local_followup_state_into(
+            client,
+            result,
+            &Self::distdir_root(),
+            &Self::parity_root(),
+        )
+        .await
     }
 
+    async fn restore_local_followup_state_into(
+        &self,
+        client: &RemergeClient,
+        result: &WorkorderResult,
+        distdir: &Path,
+        parity_root: &Path,
+    ) -> Result<()> {
+        println!("Restoring fetched distfiles into {}…", distdir.display());
+        reconcile_fetched_distfiles_into(distdir, client, result).await?;
+        if self.no_local {
+            println!("Skipping final-state parity restore because --no-local was requested.");
+            return Ok(());
+        }
+
+        println!(
+            "Restoring final-state parity into {}…",
+            parity_root.display()
+        );
+        reconcile_final_state_parity_into(parity_root, client, result).await
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     async fn restore_final_state_parity_into(
         &self,
         client: &RemergeClient,
@@ -1372,16 +1443,55 @@ impl Cli {
         RunLocal: FnOnce() -> RunLocalFuture,
         RunLocalFuture: Future<Output = Result<()>>,
     {
-        reconcile()
-            .await
-            .context("Failed to reconcile final-state parity")?;
+        println!("Restoring local follow-up state…");
+        Self::run_with_watchdog(
+            "restoring local follow-up state",
+            LOCAL_FOLLOWUP_RESTORE_TIMEOUT,
+            reconcile(),
+        )
+        .await
+        .context("Failed to restore local follow-up state")?;
+        println!("Local follow-up state restored.");
 
         if self.no_local {
+            println!("Skipping local emerge because --no-local was requested.");
             return Ok(());
         }
 
         println!("\nRunning emerge locally with binary packages…\n");
         run_local().await
+    }
+
+    async fn run_with_watchdog<T, Fut>(stage: &str, timeout: Duration, future: Fut) -> Result<T>
+    where
+        Fut: Future<Output = Result<T>>,
+    {
+        let started_at = Instant::now();
+        let mut heartbeat = tokio::time::interval(LOCAL_FOLLOWUP_WATCHDOG_HEARTBEAT);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        heartbeat.tick().await;
+        let deadline = tokio::time::sleep(timeout);
+        tokio::pin!(deadline);
+        tokio::pin!(future);
+
+        loop {
+            tokio::select! {
+                result = &mut future => return result,
+                _ = &mut deadline => {
+                    anyhow::bail!(
+                        "CLI watchdog timed out after {}s while {stage}; the client stopped making progress in that stage",
+                        timeout.as_secs(),
+                    );
+                }
+                _ = heartbeat.tick() => {
+                    eprintln!(
+                        "CLI watchdog: still {stage} after {}s (timeout: {}s)",
+                        started_at.elapsed().as_secs(),
+                        timeout.as_secs(),
+                    );
+                }
+            }
+        }
     }
 
     async fn sync_single_binpkg(
@@ -1601,9 +1711,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        BinpkgSyncSummary, Cli, PackageSyncDisposition, SyncProgressReporter,
-        extract_package_atoms, portage_binhost_env, reconcile_fetched_distfiles_into,
-        resolve_parity_target, set_file_mtime,
+        BinpkgSyncSummary, Cli, PackageSyncDisposition, SyncProgressOutputMode,
+        SyncProgressReporter, extract_package_atoms, portage_binhost_env,
+        reconcile_fetched_distfiles_into, resolve_parity_target, set_file_mtime,
     };
     use crate::client::RemergeClient;
     use remerge_types::portage::{MakeConf, PortageConfig, SnapshotEntry};
@@ -2013,6 +2123,17 @@ mod tests {
         assert!(!line.contains("ETA"), "line: {line}");
     }
 
+    #[test]
+    fn sync_progress_reporter_can_use_plain_mode() {
+        let reporter = SyncProgressReporter::with_output_mode(
+            1,
+            "https://binhost.invalid",
+            SyncProgressOutputMode::Plain,
+        );
+
+        assert_eq!(reporter.output_mode, SyncProgressOutputMode::Plain);
+    }
+
     #[tokio::test]
     async fn repeated_sync_reuses_verified_local_binpkg_without_redownloading() {
         let payload = vec![0x5a; 512 * 1024];
@@ -2288,6 +2409,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn no_local_followup_restores_distfiles_without_attempting_parity() {
+        let distdir = TempDir::new().expect("distdir root");
+        let parity_root = TempDir::new().expect("parity root");
+
+        let distfile_digest = hex::encode(sha2::Sha256::digest(b"hello source"));
+        let parity_digest = hex::encode(sha2::Sha256::digest(b"world state"));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let base_url = spawn_blob_server(
+            HashMap::from([
+                (distfile_digest.clone(), b"hello source".to_vec()),
+                (parity_digest.clone(), b"world state".to_vec()),
+            ]),
+            requests.clone(),
+        )
+        .await;
+        let client = RemergeClient::new(&base_url).expect("client");
+        let result = WorkorderResult {
+            workorder_id: uuid::Uuid::nil(),
+            built_packages: Vec::new(),
+            failed_packages: Vec::new(),
+            binhost_uri: String::new(),
+            fetched_distfiles: BTreeMap::from([(
+                "hello-1.0.tar.xz".into(),
+                SnapshotEntry {
+                    digest: distfile_digest.clone(),
+                    size: 12,
+                    mtime_secs: 1_700_000_010,
+                },
+            )]),
+            parity_manifest: ParityManifest {
+                files: BTreeMap::from([(
+                    "var/lib/portage/world".into(),
+                    ParityFileEntry {
+                        digest: parity_digest,
+                        size: 11,
+                        mtime_secs: 1_700_000_020,
+                    },
+                )]),
+                directories: BTreeMap::new(),
+                symlinks: BTreeMap::new(),
+            },
+        };
+
+        let mut cli = test_cli();
+        cli.no_local = true;
+        cli.restore_local_followup_state_into(&client, &result, distdir.path(), parity_root.path())
+            .await
+            .expect("no-local follow-up should skip parity restore");
+
+        assert_eq!(
+            tokio::fs::read(distdir.path().join("hello-1.0.tar.xz"))
+                .await
+                .unwrap(),
+            b"hello source"
+        );
+        assert!(
+            !tokio::fs::try_exists(parity_root.path().join("var/lib/portage/world"))
+                .await
+                .unwrap()
+        );
+        assert_eq!(requests.lock().unwrap().clone(), vec![distfile_digest]);
+    }
+
+    #[tokio::test]
     async fn reconcile_fetched_distfiles_restores_missing_and_stale_files() {
         let distdir = TempDir::new().expect("temp distdir");
         let reused_path = distdir.path().join("cached.tar.xz");
@@ -2494,12 +2679,36 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("Failed to reconcile final-state parity"),
+                .contains("Failed to restore local follow-up state"),
             "unexpected error: {error:#}"
         );
         assert_eq!(
             events.lock().unwrap().clone(),
             vec!["reconcile-failed".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn local_followup_watchdog_reports_the_stuck_stage() {
+        let error = Cli::run_with_watchdog(
+            "restoring local follow-up state",
+            Duration::from_millis(10),
+            async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("watchdog should time out");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("CLI watchdog timed out"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            message.contains("restoring local follow-up state"),
+            "unexpected error: {error:#}"
         );
     }
 }

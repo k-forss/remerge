@@ -199,6 +199,67 @@ remerge --dry-run dev-libs/openssl
 alias emerge='remerge'
 ```
 
+## Local debug loop
+
+For manual end-to-end debugging without deploying a server or writing to
+`/etc` and `/var`, use the local debug harness:
+
+```bash
+scripts/local-debug.sh prepare
+scripts/local-debug.sh start
+scripts/local-debug.sh doctor
+scripts/local-debug.sh run -- --force dev-libs/openssl
+```
+
+What it does:
+
+- builds `remerge`, `remerge-server`, and `remerge-worker` in the selected cargo profile
+- writes user-owned temp config/state under `.tmp/remerge-local-debug/`
+- starts `remerge-server` on `127.0.0.1:17654` with trace logging, `RUST_BACKTRACE=1`, and a generated config that sets `auth.mode = "none"`
+- points the CLI at that localhost server via a generated config file
+- injects `--no-local` by default so you can exercise the remote-build flow without requiring root for the final local `emerge`
+
+Keep the local debug harness bound to localhost unless you have an explicit, separate network protection layer. The generated config disables auth, so exposing it on `0.0.0.0` or another non-loopback address would publish an unauthenticated server. The script now refuses non-loopback binds unless you opt in with `REMERGE_LOCAL_DEBUG_ALLOW_REMOTE=true`.
+
+Useful commands:
+
+```bash
+# Show paths, URLs, and exact commands in use
+scripts/local-debug.sh env
+
+# Tail the local server log
+scripts/local-debug.sh logs
+
+# Allow the final local emerge step as well
+scripts/local-debug.sh run-local -- --force dev-libs/openssl
+
+# Stop and remove the temp debug environment
+scripts/local-debug.sh clean
+```
+
+Useful environment overrides:
+
+```bash
+REMERGE_LOCAL_DEBUG_PROFILE=release
+REMERGE_LOCAL_DEBUG_PORT=18654
+REMERGE_LOCAL_DEBUG_RUST_LOG='remerge=trace,remerge_server=trace,remerge_cli=trace,remerge_worker=trace,reqwest=debug'
+REMERGE_LOCAL_DEBUG_HOST=127.0.0.1
+REMERGE_LOCAL_DEBUG_WORKER_BASE_IMAGE='ghcr.io/k-forss/remerge/test-stage3:latest'
+REMERGE_LOCAL_DEBUG_REPOS_DIR=/var/db/repos
+```
+
+The `doctor` command explicitly probes `POST /api/v1/snapshots/missing-blobs`,
+which is the route behind errors like:
+
+```text
+Failed to negotiate snapshot blob upload: Server returned 404 Not Found while querying missing blobs
+```
+
+If `doctor` reports a 404 for that endpoint, you are not talking to the
+current `remerge-server` route set. That usually means the CLI is pointed at
+the wrong URL, an older server binary, or a reverse proxy that is not routing
+the snapshot endpoints.
+
 ## Configuration
 
 ### CLI
