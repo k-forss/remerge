@@ -8,11 +8,11 @@ use futures::{SinkExt, StreamExt};
 use remerge_types::trace::TRACEPARENT_HEADER;
 use remerge_types::{
     api::{
-        FindMissingBlobsRequest, FindMissingBlobsResponse, SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES,
-        SNAPSHOT_BLOB_ENCODING_ZSTD, SNAPSHOT_BLOB_PROTOCOL_VERSION, SnapshotBlobChunkHeader,
-        SnapshotBlobClientControlMessage, SnapshotBlobEncodingOffer,
-        SnapshotBlobServerControlMessage, SubmitWorkorderRequest, SubmitWorkorderResponse,
-        UploadBlobResponse,
+        FindMissingBlobsRequest, FindMissingBlobsResponse, LogEvent, LogLevel,
+        SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES, SNAPSHOT_BLOB_ENCODING_ZSTD,
+        SNAPSHOT_BLOB_PROTOCOL_VERSION, SnapshotBlobChunkHeader, SnapshotBlobClientControlMessage,
+        SnapshotBlobEncodingOffer, SnapshotBlobServerControlMessage, SubmitWorkorderRequest,
+        SubmitWorkorderResponse, UploadBlobResponse,
     },
     client::{ClientId, ClientRole},
     compression,
@@ -657,8 +657,19 @@ impl RemergeClient {
     ///   the worker container for interactive emerge prompts.
     ///
     /// Returns the final [`WorkorderResult`] when the build completes.
-    pub async fn stream_progress(&self, ws_url: &str) -> Result<WorkorderResult> {
+    pub async fn stream_progress(
+        &self,
+        ws_url: &str,
+        verbosity: crate::verbosity::Verbosity,
+        log_json: bool,
+    ) -> Result<WorkorderResult> {
         use tokio_tungstenite::connect_async;
+
+        // Append the log-level ceiling as a query parameter so the server
+        // only sends events the CLI can usefully display.
+        let log_level_str = verbosity.rust_log_level();
+        let ws_url_with_level = append_log_level_param(ws_url, log_level_str);
+        let ws_url = ws_url_with_level.as_str();
 
         let (ws, _) = connect_async(ws_url)
             .await
@@ -671,6 +682,8 @@ impl RemergeClient {
         let mut result_poll = tokio::time::interval(WORKORDER_RESULT_POLL_INTERVAL);
         result_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         result_poll.tick().await;
+        // Whether the status bar has been hidden for PTY streaming yet.
+        let mut bar_hidden = false;
 
         // Disable local terminal echo so we don't double-echo input.
         // The container's PTY already echoes back everything we send.
@@ -730,7 +743,19 @@ impl RemergeClient {
                     let msg = msg.context("WebSocket error")?;
                     match msg {
                         // Binary frames carry raw PTY bytes — write directly to stdout.
-                        tokio_tungstenite::tungstenite::Message::Binary(data) => {
+                        // In log_json mode they are skipped to avoid corrupting the
+                        // NDJSON stream; CI tooling should not need raw terminal bytes.
+                        tokio_tungstenite::tungstenite::Message::Binary(data)
+                            if !log_json =>
+                        {
+                            // Hide the status bar on the first PTY frame —
+                            // raw bytes from the container would overwrite it.
+                            if !bar_hidden {
+                                if let Some(bar) = crate::status_bar::StatusBar::global() {
+                                    bar.hide();
+                                }
+                                bar_hidden = true;
+                            }
                             use std::io::Write;
                             let stdout = std::io::stdout();
                             let mut out = stdout.lock();
@@ -739,15 +764,41 @@ impl RemergeClient {
                         }
                         // Text frames carry structured JSON events.
                         tokio_tungstenite::tungstenite::Message::Text(text) => {
+                            // Parse the event first — only emit the frame to
+                            // stdout (in --log-json mode) after we know it is
+                            // a well-formed, recognised type.  Unrecognised
+                            // frames are silently dropped from the NDJSON
+                            // stream so machine consumers are not surprised.
                             if let Ok(progress) = serde_json::from_str::<BuildProgress>(&text) {
-                                Self::print_event(&progress.event);
-
+                                if log_json {
+                                    use std::io::Write;
+                                    let stdout = std::io::stdout();
+                                    let mut out = stdout.lock();
+                                    let _ = out.write_all(text.as_bytes());
+                                    let _ = out.write_all(b"\n");
+                                    let _ = out.flush();
+                                } else {
+                                    Self::print_event(&progress.event, verbosity);
+                                }
                                 // If we get a Finished event, fetch the result and exit.
                                 if matches!(progress.event, BuildEvent::Finished { .. }) {
                                     final_result = Some(
                                         self.await_result_ready(progress.workorder_id).await?
                                     );
                                     break;
+                                }
+                            } else if let Ok(log_event) =
+                                serde_json::from_str::<LogEvent>(&text)
+                            {
+                                if log_json {
+                                    use std::io::Write;
+                                    let stdout = std::io::stdout();
+                                    let mut out = stdout.lock();
+                                    let _ = out.write_all(text.as_bytes());
+                                    let _ = out.write_all(b"\n");
+                                    let _ = out.flush();
+                                } else {
+                                    Self::print_log_event(&log_event, verbosity);
                                 }
                             } else {
                                 debug!("Unrecognised WS message: {text}");
@@ -828,15 +879,70 @@ impl RemergeClient {
     fn workorder_id_from_progress_url(
         ws_url: &str,
     ) -> Option<remerge_types::workorder::WorkorderId> {
-        let segments: Vec<&str> = ws_url.split('/').collect();
+        // Strip query string before splitting so `?log_level=...` does not
+        // get included in the last path segment.
+        let path = ws_url.split('?').next().unwrap_or(ws_url);
+        let segments: Vec<&str> = path.split('/').collect();
         segments.iter().rev().nth(1)?.parse::<uuid::Uuid>().ok()
     }
 
+    /// Print a forwarded worker log event based on the current verbosity.
+    ///
+    /// Quiet     → Error only
+    /// Normal    → Warn + Error only
+    /// Verbose+  → all events the server forwarded
+    fn print_log_event(event: &LogEvent, verbosity: crate::verbosity::Verbosity) {
+        if !log_event_is_visible(event, verbosity) {
+            return;
+        }
+        let prefix = match event.level {
+            LogLevel::Error => "ERROR",
+            LogLevel::Warn => "WARN ",
+            LogLevel::Info => "INFO ",
+            LogLevel::Debug => "DEBUG",
+            LogLevel::Trace => "TRACE",
+        };
+        let msg = if verbosity.is_verbose() {
+            // Show target for verbose modes so the caller can correlate.
+            format!("[{prefix}] {}: {}", event.target, event.message)
+        } else {
+            format!("{prefix}: {}", event.message)
+        };
+        if let Some(bar) = crate::status_bar::StatusBar::global() {
+            bar.println(&msg);
+        } else {
+            eprintln!("{msg}");
+        }
+    }
+
     /// Print a build event to the terminal.
-    fn print_event(event: &BuildEvent) {
+    fn print_event(event: &BuildEvent, verbosity: crate::verbosity::Verbosity) {
         match event {
             BuildEvent::StatusChanged { from: _, to } => {
-                println!(">>> Status: {to:?}");
+                // Status transitions are low-signal in the default view;
+                // only show them at verbose level.
+                if verbosity.is_verbose() {
+                    let friendly = format!("{to:?}")
+                        .replace("WaitingForWorker", "waiting for worker")
+                        .replace("SyncingPortage", "syncing portage tree")
+                        .replace("Building", "building packages")
+                        .replace("Uploading", "uploading artefacts")
+                        .replace("Done", "done");
+                    if let Some(bar) = crate::status_bar::StatusBar::global() {
+                        bar.set_phase(format!("Build: {friendly}"));
+                    } else {
+                        eprintln!("→ Build status: {friendly}");
+                    }
+                } else if let Some(bar) = crate::status_bar::StatusBar::global() {
+                    // Update phase silently so elapsed time resets.
+                    let friendly = format!("{to:?}")
+                        .replace("WaitingForWorker", "waiting for a worker…")
+                        .replace("SyncingPortage", "syncing portage tree…")
+                        .replace("Building", "building packages…")
+                        .replace("Uploading", "uploading artefacts…")
+                        .replace("Done", "finishing…");
+                    bar.set_phase(format!("Remote build: {friendly}"));
+                }
             }
             // Log events are delivered as raw binary frames now — this
             // arm is kept for backward compatibility with older servers.
@@ -997,6 +1103,39 @@ impl RemergeClient {
     }
 }
 
+/// Append `log_level=<level>` to a WebSocket URL, using `?` when the URL has
+/// no query string yet and `&` when one is already present.
+///
+/// Extracted as a free function so it can be unit-tested independently of the
+/// full `stream_progress` async machinery.
+pub(crate) fn append_log_level_param(ws_url: &str, level: &str) -> String {
+    let sep = if ws_url.contains('?') { '&' } else { '?' };
+    format!("{ws_url}{sep}log_level={level}")
+}
+
+/// This is the client-side defence-in-depth filter.  The server already
+/// applies a per-connection ceiling before sending any frame; this function
+/// provides a second layer so that even if the server sends more than
+/// requested (e.g. during reconnect overlap), the CLI only prints what the
+/// operator asked for.
+///
+/// Extracted as a free function so it can be covered by unit tests without
+/// needing to capture `eprintln!` output.
+pub(crate) fn log_event_is_visible(
+    event: &LogEvent,
+    verbosity: crate::verbosity::Verbosity,
+) -> bool {
+    use crate::verbosity::Verbosity;
+    let max_level = match verbosity {
+        Verbosity::Quiet => LogLevel::Error,
+        Verbosity::Normal => LogLevel::Warn,
+        Verbosity::Verbose => LogLevel::Info,
+        Verbosity::VerboseDebug => LogLevel::Debug,
+        Verbosity::VerboseTrace => LogLevel::Trace,
+    };
+    event.level <= max_level
+}
+
 // ─── Terminal echo control ──────────────────────────────────────────
 
 /// RAII guard that disables terminal echo on creation and restores it on drop.
@@ -1050,7 +1189,7 @@ impl Drop for EchoGuard {
 mod tests {
     use super::{
         PROGRESS_STREAM_CLEANUP_TIMEOUT, RemergeClient, SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES,
-        SnapshotBlobChunkPolicy,
+        SnapshotBlobChunkPolicy, append_log_level_param,
     };
     use axum::{
         Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get,
@@ -1153,6 +1292,69 @@ mod tests {
                 "ws://localhost/api/v1/workorders/not-a-uuid/progress"
             ),
             None
+        );
+    }
+
+    // ── Regression: workorder_id_from_progress_url must handle query strings ──
+
+    /// Regression guard for the query-string stripping fix:
+    /// `workorder_id_from_progress_url` must strip `?…` before splitting so
+    /// the UUID is extracted correctly even when the URL already carries query
+    /// parameters like `?foo=bar` or the `log_level` param added by
+    /// `stream_progress`.
+    #[test]
+    fn parses_workorder_id_from_progress_url_with_query_string() {
+        let id = uuid::Uuid::parse_str("23137eac-2455-45cf-a09f-cbdbd3a01fcc").unwrap();
+
+        assert_eq!(
+            RemergeClient::workorder_id_from_progress_url(
+                "ws://localhost/api/v1/workorders/23137eac-2455-45cf-a09f-cbdbd3a01fcc/progress?log_level=info"
+            ),
+            Some(id)
+        );
+    }
+
+    #[test]
+    fn parses_workorder_id_from_progress_url_with_multiple_params() {
+        let id = uuid::Uuid::parse_str("23137eac-2455-45cf-a09f-cbdbd3a01fcc").unwrap();
+
+        assert_eq!(
+            RemergeClient::workorder_id_from_progress_url(
+                "ws://localhost/api/v1/workorders/23137eac-2455-45cf-a09f-cbdbd3a01fcc/progress?foo=bar&log_level=debug"
+            ),
+            Some(id)
+        );
+    }
+
+    // ── Regression: append_log_level_param must not produce a double `?` ──
+
+    /// Regression guard for the double-`?` URL bug:
+    /// when the base URL already has a query string the separator must be `&`,
+    /// not `?`, so the resulting URL is valid.
+    #[test]
+    fn append_log_level_param_uses_question_mark_for_plain_url() {
+        assert_eq!(
+            append_log_level_param("ws://host/path", "info"),
+            "ws://host/path?log_level=info"
+        );
+    }
+
+    #[test]
+    fn append_log_level_param_uses_ampersand_when_query_already_present() {
+        assert_eq!(
+            append_log_level_param("ws://host/path?foo=bar", "debug"),
+            "ws://host/path?foo=bar&log_level=debug"
+        );
+    }
+
+    /// A double `?` would produce an invalid URL.
+    #[test]
+    fn append_log_level_param_never_produces_double_question_mark() {
+        let result = append_log_level_param("ws://host/path?existing=1", "warn");
+        assert_eq!(
+            result.matches('?').count(),
+            1,
+            "must contain exactly one '?'"
         );
     }
 
@@ -1290,5 +1492,167 @@ mod tests {
             message.contains("401") || message.to_ascii_lowercase().contains("unauthorized"),
             "unexpected error: {error:#}"
         );
+    }
+}
+
+// ─── Unit tests ─────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod verbosity_filter_tests {
+    use chrono::Utc;
+    use remerge_types::api::{LogEvent, LogLevel};
+    use uuid::Uuid;
+
+    use super::log_event_is_visible;
+    use crate::verbosity::Verbosity;
+
+    fn make_event(level: LogLevel) -> LogEvent {
+        LogEvent {
+            level,
+            target: "remerge_worker::builder".to_string(),
+            message: "test message".to_string(),
+            workorder_id: Uuid::new_v4(),
+            span: None,
+            timestamp: Utc::now(),
+        }
+    }
+
+    // ── Quiet: Error passes, others suppressed ──────────────────
+
+    #[test]
+    fn quiet_shows_error() {
+        assert!(log_event_is_visible(
+            &make_event(LogLevel::Error),
+            Verbosity::Quiet
+        ));
+    }
+
+    #[test]
+    fn quiet_suppresses_warn() {
+        assert!(!log_event_is_visible(
+            &make_event(LogLevel::Warn),
+            Verbosity::Quiet
+        ));
+    }
+
+    #[test]
+    fn quiet_suppresses_info() {
+        assert!(!log_event_is_visible(
+            &make_event(LogLevel::Info),
+            Verbosity::Quiet
+        ));
+    }
+
+    // ── Normal: only Warn and Error pass ──────────────────────────
+
+    #[test]
+    fn normal_shows_error() {
+        assert!(log_event_is_visible(
+            &make_event(LogLevel::Error),
+            Verbosity::Normal
+        ));
+    }
+
+    #[test]
+    fn normal_shows_warn() {
+        assert!(log_event_is_visible(
+            &make_event(LogLevel::Warn),
+            Verbosity::Normal
+        ));
+    }
+
+    #[test]
+    fn normal_suppresses_info() {
+        assert!(!log_event_is_visible(
+            &make_event(LogLevel::Info),
+            Verbosity::Normal
+        ));
+    }
+
+    #[test]
+    fn normal_suppresses_debug() {
+        assert!(!log_event_is_visible(
+            &make_event(LogLevel::Debug),
+            Verbosity::Normal
+        ));
+    }
+
+    #[test]
+    fn normal_suppresses_trace() {
+        assert!(!log_event_is_visible(
+            &make_event(LogLevel::Trace),
+            Verbosity::Normal
+        ));
+    }
+
+    // ── Verbose: Info and above pass ─────────────────────────────
+
+    #[test]
+    fn verbose_shows_error() {
+        assert!(log_event_is_visible(
+            &make_event(LogLevel::Error),
+            Verbosity::Verbose
+        ));
+    }
+
+    #[test]
+    fn verbose_shows_warn() {
+        assert!(log_event_is_visible(
+            &make_event(LogLevel::Warn),
+            Verbosity::Verbose
+        ));
+    }
+
+    #[test]
+    fn verbose_shows_info() {
+        assert!(log_event_is_visible(
+            &make_event(LogLevel::Info),
+            Verbosity::Verbose
+        ));
+    }
+
+    #[test]
+    fn verbose_suppresses_debug() {
+        // Server sends at most Info at -v; local filter still matches server ceiling.
+        assert!(!log_event_is_visible(
+            &make_event(LogLevel::Debug),
+            Verbosity::Verbose
+        ));
+    }
+
+    // ── VerboseDebug: Debug and above pass ───────────────────────
+
+    #[test]
+    fn verbose_debug_shows_debug() {
+        assert!(log_event_is_visible(
+            &make_event(LogLevel::Debug),
+            Verbosity::VerboseDebug
+        ));
+    }
+
+    #[test]
+    fn verbose_debug_suppresses_trace() {
+        assert!(!log_event_is_visible(
+            &make_event(LogLevel::Trace),
+            Verbosity::VerboseDebug
+        ));
+    }
+
+    // ── VerboseTrace: everything passes ──────────────────────────
+
+    #[test]
+    fn verbose_trace_shows_trace() {
+        assert!(log_event_is_visible(
+            &make_event(LogLevel::Trace),
+            Verbosity::VerboseTrace
+        ));
+    }
+
+    #[test]
+    fn verbose_trace_shows_error() {
+        assert!(log_event_is_visible(
+            &make_event(LogLevel::Error),
+            Verbosity::VerboseTrace
+        ));
     }
 }

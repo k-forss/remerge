@@ -31,6 +31,7 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 libc = "0.2"
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
+crossterm = "0.28"
 filetime = { workspace = true }
 zstd = { workspace = true }
 

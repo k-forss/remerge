@@ -1,367 +1,392 @@
-# remerge Roadmap
+# remerge Roadmap — CLI UX & Developer Experience
 
-This file is the active task tracker for the current remerge transport and
-state-convergence work.
+This file is the active task tracker for the CLI verbosity, feedback, and
+operator-experience work on the `f-cli-ux` branch.
+
+The previous roadmap (transport and state-convergence, Phases 0–7) is archived in
+`docs/archive/ROADMAP-transport-convergence.md`.
 
 ## Goal
 
-The main client is the single source of truth.
-
-Running `remerge` instead of plain `emerge` must leave the client in the same
-final state with respect to:
-
-- built binary packages
-- usable local binpkg cache
-- portage-relevant repo state needed to reproduce the build
-- distfiles and other source artifacts needed to reproduce the build
-- portage metadata and related inputs required for later local `emerge` runs
-
-The server should receive only the minimum data required from the client to
-produce, cache, and serve the requested artifacts.
-
-Audit legend for this pass: `[✓]` verified from current staged code and targeted test runs, `[ ]` demoted because the current implementation or coverage does not satisfy the claim.
+The CLI must clearly communicate what it is doing at every stage without
+spamming the operator when everything is working normally. Operators must be
+able to tune verbosity to match their needs: quiet for unattended automation,
+verbose for debugging, and a sensible default in between.
 
 ## Decisions
 
-- [✓] Final-state parity means reconciling everything `remerge` touched, not only binaries.
-- [✓] The server should persist submitted workorders once blob-backed submission is the default path.
-- [✓] Large blob transport should use a pull-oriented model.
-- [✓] Pull-oriented transport must ride the normal client-initiated connection; the server cannot assume it can reach the client directly out of band.
-- [✓] Blob return over the client-initiated connection may use either bidirectional streaming or a temporary server-issued upload URL, whichever proves faster and more stable.
-- [✓] The final default for blob return over the client-initiated connection should be bidirectional chunk streaming.
-- [✓] The bidirectional chunk-streaming transport should use hybrid framing: text control messages plus binary data chunks.
-- [✓] The chunk-streaming transport should support resumable uploads with per-chunk acknowledgements and adaptive chunk sizing for backpressure.
-- [✓] Hybrid stream v1 should use JSON control frames plus self-describing binary chunks.
-- [✓] Hybrid stream v1 should start with 10 MB chunks, acknowledge each chunk, grow on healthy links, and shrink on stalls.
-- [✓] Cross-client reuse should use global content-addressed deduplication.
-- [✓] Global blob dedup must not imply a direct blob-browsing API for clients.
-- [✓] Manifest transport can be a breaking cutover rather than a long compatibility window.
-- [✓] Cleanup policy should ship with defaults plus operator-configurable retention values.
-- [✓] Aggressive size-pressure eviction remains out of scope; only age-based cleanup above a configurable global minimum retained-size floor is in scope.
-- [✓] Persisted workorders should store immutable blob and tree digest references, not absolute filesystem paths.
-- [✓] Persisted blob and tree references should be encoded in an explicit versioned manifest object with typed digest lists.
-- [✓] The versioned manifest object should be embedded directly in the persisted workorder.
-- [✓] Manifest evolution should happen at the embedded manifest-object level rather than through a separate outer workorder envelope.
-- [✓] Embedded manifest v1 should carry digest, size, and mtime for each referenced entry.
-- [✓] Embedded manifest v1 should encode mtime as Unix timestamp seconds.
-- [✓] Final-state parity must include repo metadata and eclass/cache indexes needed by later local runs.
-- [✓] Final-state parity must also include manifest-related metadata and repo cache artifacts used by later local runs.
-- [✓] Repo-derived parity should include everything under repo metadata directories that the worker touched.
-- [✓] Final-state parity must also account for relevant portage cache and metadata timestamps.
-- [✓] Final-state parity must include generated package indexes or derived metadata outside repo metadata directories when later local runs depend on them.
-- [✓] Final-state parity should target a byte-for-byte Portage cache and metadata snapshot when remote builds touch artifacts that later local runs may consult.
-- [✓] The current mandatory byte-for-byte parity set should include full /var/lib/portage state, per-repo metadata directories, eclass cache, and the Packages index; broader temporary build caches remain out of scope unless Phase 5 proves they are required.
-- [✓] Retention policy should stay global-only for now; differentiated retention classes are not part of the first cleanup implementation.
-- [✓] Retention policy should remain global-only permanently unless a future requirement proves otherwise.
-- [✓] Cached snapshot data should maintain a configurable global minimum retained-size floor, defaulting to 10 GiB, below which age-based eviction does not remove additional data.
+- [✓] Verbosity flags follow portage convention: `-q` for quiet, `-v` for
+  verbose, `-vv`/`-vvv` for deeper traces.
+- [✓] `-v` flags couple to `RUST_LOG` elevation unless `RUST_LOG` is
+  explicitly set by the caller.
+- [✓] Verbosity flags are forwarded to the remote emerge invocation so emerge
+  itself decides how much output to produce; the CLI does not suppress PTY bytes.
+- [✓] A dynamic status bar on stderr provides live phase and elapsed-time
+  feedback without cluttering stdout.
+- [✓] The status bar is hidden during PTY streaming so raw emerge output
+  reaches the terminal unobstructed.
+- [✓] `StatusChanged` events update the status bar silently at normal
+  verbosity and print a human-readable message at verbose level.
+- [✓] Watchdog heartbeats update the status bar phase rather than emitting
+  timed `eprintln!` spam; non-TTY environments receive log-line fallback.
+- [✓] The status bar uses a 100 ms background redraw loop and cleans up on
+  drop to avoid terminal corruption.
+- [✓] `crossterm` is the only new dependency; sub-50 KB, no runtime
+  overhead outside TTY check calls.
+- [✓] Portage `-q` ("reduced or condensed output") maps to: no status bar,
+  no phase messages, no sync progress bar, only errors and final result.
+  `--quiet-build` is NOT injected — emerge itself respects `--quiet` on its
+  PTY output.
+- [✓] Portage `-v` ("verbose metadata: USE flags, GNU info, repo sources")
+  maps to: status bar + verbose `StatusChanged` prints + trace ID + structured
+  server-side log events forwarded back over WS at `--verbose-events` level.
+- [✓] `RUST_LOG` at `Normal` should default to `"warn"` (not `"error"`) so
+  internal warnings surface without adding debug noise.
+- [✓] `emerge --sync` runs with `--quiet --ask=n` hardcoded in the worker;
+  at `Verbose+` the `--quiet` flag should be omitted so the operator can see
+  sync progress in the PTY stream.
+- [✓] At `-vv`, worker internal `tracing::info!` events should be forwarded
+  back to the CLI as structured log frames over the progress WebSocket,
+  distinct from raw PTY binary frames.
+- [✓] The status bar must detect non-TTY stderr and become a no-op (write
+  log-line progress instead) to avoid noise in CI pipelines and pipes.
+- [✓] Multi-level verbose (`-vv`, `-vvv`) stops injecting repeated
+  `--verbose` flags into emerge args; emerge only receives `--verbose` once
+  at most — additional levels only elevate the CLI's own `RUST_LOG`.
+- [✓] `LogEvent` frames are buffered per-workorder (bounded ring buffer,
+  256 events) and replayed to a connecting CLI before switching to live
+  forwarding, so late connections (e.g. `remerge watch <id>`) see the full
+  log.
+- [✓] Server-side events are forwarded only when scoped to the requesting
+  client's workorder. Server-wide events (auth failures for other clients,
+  pool state, scheduler internals) are never forwarded — the scope filter
+  is enforced server-side, not client-side, to prevent information leakage.
+- [✓] Verbosity is negotiated at WS upgrade time via a `?log_level=` query
+  parameter; the server applies a per-connection ceiling filter before sending
+  any `LogEvent` frame, so the client cannot receive log volume it did not
+  request and debug events from other workorders never reach the wire.
 
 ## Invariants
 
-- [✓] The client remains the authoritative source for build inputs.
-- [✓] Remote builds are non-interactive by default.
-- [✓] Remote builds can reproduce local-only or no-longer-upstream package versions.
-- [✓] Remote builds leave reusable outputs in the client's local environment.
-- [✓] The server deduplicates transferred data across workorders and clients.
-- [✓] Worker containers stay disposable and do not become the source of truth.
-- [✓] A later plain local `emerge --usepkg` can reuse artifacts produced by `remerge`.
-- [✓] Cached snapshot data is cleaned up with delayed eviction rather than immediate deletion.
-- [✓] Unreferenced snapshot data remains reusable for a grace period after client or worker churn.
-- [✓] Snapshot storage has a hard upper retention bound so it cannot grow forever.
+- [✓] Quiet mode (`-q`) suppresses non-error CLI output.
+- [✓] Default mode shows phase transitions and final results only.
+- [✓] Verbose mode (`-v`) adds `StatusChanged` transitions, trace IDs, and
+  tool-level messages.
+- [✓] Deeper verbose levels (`-vv`, `-vvv`) elevate `RUST_LOG` to `debug`
+  and `trace`.
+- [✓] PTY bytes from the remote build always reach stdout unmodified
+  regardless of verbosity level.
+- [✓] The status bar never interleaves with stdout output.
+- [✓] Non-TTY environments (CI, pipes) receive log-line progress instead of
+  status bar redraws in all phases.
+- [✓] `EMERGE_DEFAULT_OPTS` containing `-q` or `--verbose` is respected and
+  treated as the user's preferred verbosity when no explicit CLI flag overrides
+  it; both the CLI's own output level and the injected emerge arg are derived
+  from this fallback.
+- [✓] Worker internal log events are never silently discarded at `-vv` —
+  they are forwarded back to the CLI as structured WS text frames alongside
+  PTY binary frames so the operator has full visibility without needing to
+  connect to a separate log aggregator.
 
-## Phase 0: Stabilize Current Behavior
+## Phase A: Verbosity Infrastructure
 
-- [✓] Force worker-side `emerge` and sync flows into non-interactive mode by default.
-- [✓] Preserve explicit user `--ask` overrides when intentionally requested.
-- [✓] Sync completed remote binpkgs back into the client's local `PKGDIR`.
-- [✓] Prefer local `file://PKGDIR` reuse for the post-build local install step.
-- [✓] Document the local binpkg reuse path.
+- [✓] Add `-q`/`-v` CLI flags with portage-compatible semantics.
+  - [✓] `-q` and `-v` are mutually exclusive (`conflicts_with`).
+  - [✓] `-v` uses `clap::ArgAction::Count` for graduated levels.
+- [✓] Add `Verbosity` enum: `Quiet / Normal / Verbose / VerboseDebug / VerboseTrace`.
+  - [✓] `from_flags(quiet, verbose_count, emerge_default_opts)` — derives
+    from CLI flags, falls back to `EMERGE_DEFAULT_OPTS` portage env.
+  - [✓] `early_detect()` — pre-clap argv scan used in `main()` before
+    tracing init.
+  - [✓] `rust_log_level()` — maps enum to `"error"/"warn"/"info"/"debug"/"trace"`.
+  - [✓] `emerge_flag()` — returns `Some("--quiet")`, `None`, or
+    `Some("--verbose")` to inject into emerge args.
+  - [✓] `is_verbose()` / `is_quiet()` predicate helpers.
+- [✓] Early-detect verbosity from `argv` before clap parsing so `RUST_LOG`
+  is set before `init_tracing()`.
+- [✓] Set `RUST_LOG` via `std::env::set_var` in `main()` only when the
+  caller has not already set it.
+- [✓] `workorder_emerge_args()` helper injects verbosity flag into the
+  emerge arg list without duplicating an already-present `--quiet`/`--verbose`.
+- [✓] Add `crossterm = "0.28"` to `crates/cli/Cargo.toml`.
 
-## Phase 1: Capture Client State
+## Phase B: Dynamic Status Bar
 
-- [✓] Snapshot non-Gentoo local overlay working trees on the client.
-- [✓] Snapshot Manifest-backed distfiles needed for local or dropped upstream versions.
-- [✓] Keep test roots isolated from live host `portageq` lookups.
-- [✓] Add shared types for transported repo and distfile snapshots.
-- [✓] Add focused tests for client-side snapshot capture.
+- [✓] Add `StatusBar` struct with `Arc<Mutex<State>>` internal state.
+- [✓] `OnceLock<Arc<StatusBar>>` global singleton; `init()` sets it,
+  `global()` returns `Option<Arc<StatusBar>>` for call sites that tolerate
+  absence (tests, non-TTY).
+- [✓] Background 100 ms `tokio::spawn` redraw task held via
+  `Weak<Mutex<State>>` so it does not keep the bar alive past `finish()`.
+- [✓] `crossterm::terminal::size()` for width-aware phase text truncation.
+- [✓] Elapsed-time suffix appended to phase label on redraw (e.g.
+  `Checking snapshot blobs… 3s`).
+- [✓] ANSI dim styling (`\x1b[2m…\x1b[0m`) for visual hierarchy.
+- [✓] `\r\x1b[2K` overwrite strategy — no scrollback pollution.
+- [✓] `hide()` / `show()` pair for suppressing the bar during PTY relay.
+- [✓] `finish()` — clears bar and sets `finished` flag to stop redraws.
+- [✓] `println(msg)` — atomically clears bar, prints message, redraws bar
+  so concurrent output does not interleave.
+- [✓] `Drop` impl calls `clear_line()` to clean up on panic or early exit.
+- [✓] Bar initialized in `main()` after `init_tracing()`.
+- [✓] Error path in `main()` calls `bar.finish()` before printing the error.
 
-## Phase 2: Stage Worker Runtime From Client State
+## Phase C: Phase Messages and Output Quality
 
-- [✓] Stop passing full workorders through a large environment variable.
-- [✓] Stage per-workorder runtime directories under server state.
-- [✓] Mount staged workorder files into worker containers.
-- [✓] Restore staged repo snapshots into worker repo locations.
-- [✓] Restore staged distfiles into the worker distfiles cache.
-- [✓] Add focused tests for staged runtime creation and worker restore.
-- [✓] Validate the Docker `start_worker` path against the new staged-runtime contract.
+- [✓] Phase messages added throughout `run()`:
+  - [✓] `"Expanding package sets…"` before atom set reader.
+  - [✓] `"Checking installed packages…"` before VDB scan.
+  - [✓] `"Reading portage configuration…"` before portage config read.
+  - [✓] `"Checking snapshot blobs…"` before blob negotiation.
+  - [✓] `"Submitting workorder…"` before submit call.
+  - [✓] `"Waiting for build to start…"` before `stream_progress`.
+  - [✓] `"Syncing binary packages…"` before `complete_local_followup`.
+- [✓] Verbosity derived from portage config `EMERGE_DEFAULT_OPTS` after
+  the config is read, so portage-set flags are respected.
+- [✓] Dry-run path calls `bar.finish()` before printing result lines.
+- [✓] Trace ID print gated on `verbosity.is_verbose()`.
+- [✓] Already-installed package messages routed through `bar.println()`.
+- [✓] Per-blob upload progress in `prepare_manifest_submission()`:
+  `"Checking snapshot blobs ({N} repo snapshots)…"` and
+  `"Uploading snapshot blob {i}/{total}…"`.
+- [✓] `complete_local_followup()` accepts `bar: Option<&StatusBar>` param;
+  uses bar for phase and completion messages; hides bar before local emerge
+  starts; calls `bar.finish()` on all exit paths.
+- [✓] `run_with_watchdog()` heartbeat tick updates bar phase with elapsed
+  time (`"{stage} ({N}s)…"`); falls back to `eprintln!` on non-TTY.
+- [✓] `stream_progress()` accepts `verbosity: Verbosity` param.
+- [✓] Status bar hidden on first PTY binary frame in `stream_progress()`
+  via a `bar_hidden` one-shot flag.
+- [✓] `print_event()` accepts `verbosity: Verbosity`:
+  - [✓] At normal verbosity: `StatusChanged` silently updates bar phase
+    with human-readable string (e.g. `"Remote build: building packages…"`).
+  - [✓] At verbose: also prints the friendly string to stderr.
+  - [✓] Raw `{:?}` debug format replaced with mapped human-readable strings.
+- [✓] `test_cli()` fixture updated with `quiet: false, verbose: 0` fields.
+- [✓] Full workspace `cargo check` passes clean (`EXIT:0`).
 
-## Phase 3: Server-Side Deduplicated Snapshot Storage
+---
 
-- [✓] Add a content-addressed blob store under the server state directory.
-- [✓] Materialize staged runtime files from stored blobs instead of unique copies.
-- [✓] Deduplicate identical snapshot payloads across workorders.
-- [✓] Add blob-store tests proving content-hash reuse.
-- [✓] Add repo tree manifest storage for staged snapshot metadata.
-- [✓] Record blob references and repo tree digests in staged workorder metadata.
-- [✓] Keep worker behavior unchanged while the storage model evolves underneath.
+## Phase D — Portage Verbosity Alignment
 
-## Phase 4: Replace Inline Snapshot Transport With Manifest Negotiation
+*Goal: ensure remerge's verbosity model is a faithful extension of portage's
+own conventions so operators with portage muscle memory get exactly what they
+expect.*
 
-- [✓] Define the submission contract for manifest-first snapshot transport.
-  - [✓] Decide which snapshot fields remain inline versus reference-only.
-    - Breaking target state: repo and distfile payloads stop travelling inline in normal workorder submission.
-    - Portage config keeps reference metadata inline; large payload transfer moves to negotiated blob transport.
-  - [✓] Define request and response shapes for missing-blob negotiation.
-  - [✓] Define failure behavior for incomplete uploads or mismatched digests.
-- [✓] Add server API endpoints for snapshot negotiation.
-  - [✓] Query which blob digests are already present on the server.
-  - [✓] Upload missing blobs.
-  - [✓] Attach uploaded blob references to a submitted workorder.
-- [✓] Teach the CLI to submit manifests and upload only missing blobs.
-  - [✓] Compute blob digests client-side.
-  - [✓] Build repo tree manifests client-side.
-  - [✓] Retry failed uploads safely.
-- [✓] Add tests for end-to-end manifest negotiation and missing-blob upload.
-  - [✓] Cover bidirectional chunk-streaming blob transport over the normal client-initiated connection.
-  - [✓] Cover hybrid framing: text control messages plus binary data chunks.
-  - [✓] Cover resumable uploads with per-chunk acknowledgements and adaptive chunk sizing.
-  - [✓] Cover JSON control frames plus self-describing binary chunk headers.
-  - [✓] Cover the adaptive 10 MB default chunk policy, including growth and shrink behavior.
-  - [✓] Cover the breaking cutover from inline payload submission to negotiated refs.
-- [✓] Treat hybrid stream v1 as fixed by this wire contract:
-  - [✓] JSON control frames use UTF-8 objects with a required `type` field and a protocol `version` field set to `1`.
-  - [✓] Required control message types are:
-    - `upload_init`: announces `workorder_id`, `digest`, `total_size_bytes`, `chunk_size_bytes`, and optional capability flags.
-    - `upload_resume`: tells the client the next byte offset and next chunk sequence to send after reconnect or restart.
-    - `upload_ack`: acknowledges exactly one completed chunk with `sequence`, `offset_bytes`, `size_bytes`, and cumulative `received_bytes`.
-    - `upload_complete`: confirms the full blob was accepted and validated.
-    - `upload_error`: reports a terminal protocol or validation failure with machine-readable `code` and human-readable `message`.
-  - [✓] JSON control field rules:
-    - [✓] `version` is an integer and must equal `1` for v1 messages.
-    - [✓] `digest` is lowercase SHA256 hex without alternate prefixes.
-    - [✓] `workorder_id` uses the normal UUID string form.
-    - [✓] `offset_bytes`, `size_bytes`, `total_size_bytes`, `received_bytes`, and `sequence` are unsigned integers.
-  - [✓] Self-describing binary chunk header for each chunk is fixed to:
-    - 4 bytes magic: `RMCH`
-    - 1 byte protocol version: `1`
-    - 1 byte flags: reserved in v1, set to `0`
-    - 2 bytes reserved: set to `0`
-    - 8 bytes chunk sequence, big-endian
-    - 8 bytes chunk offset bytes, big-endian
-    - 8 bytes payload size bytes, big-endian
-    - 4 bytes chunk checksum, Adler-32 of payload, big-endian
-    - followed immediately by the raw payload bytes for that chunk
-  - [✓] Chunk policy rules:
-    - [✓] Start at 10 MiB chunk payloads.
-    - [✓] Acknowledge each successfully persisted chunk individually.
-    - [✓] Grow chunk size only after a stable run of healthy acknowledgements.
-    - [✓] Shrink chunk size on stalls, slow acknowledgements, or reconnect-driven resume.
-    - [✓] Never exceed negotiated blob length or send overlapping byte ranges except deliberate replay from the resume offset.
-  - [✓] Resume and backpressure rules:
-    - [✓] Server authority decides the next accepted offset; clients resume exactly from `upload_resume`.
-    - [✓] Clients may have at most one unacknowledged chunk in flight in v1.
-    - [✓] A missing acknowledgement is treated as no progress; clients must not advance local send offset speculatively.
-    - [✓] Duplicate replay of the last acknowledged chunk is allowed only when reconnect semantics require replay from the confirmed resume point.
+### Background
 
-## Phase 4.5: CLI Sync Feedback
+From the portage man page:
 
-- [✓] Show live sync progress while the CLI populates the local binpkg cache.
-  - [✓] Add a progress bar covering current package, bytes synced, throughput, and ETA.
-  - [✓] Surface cache hits clearly so repeated syncs visibly demonstrate reuse.
-  - [✓] Show a final sync summary with reused-versus-downloaded packages and bytes.
-  - [✓] Thread progress reporting through the download path without changing sync correctness.
-  - [✓] Add tests for progress reporting and cache-hit visibility during repeated syncs.
-  - [✓] Follow this UX contract so implementation does not reopen design questions:
-    - [✓] State 1, sync start: print the binhost URI and total number of built packages to inspect.
-    - [✓] State 2, package inspection: classify each package as `[CACHE-HIT]` or `[DOWNLOAD]` before any transfer begins.
-    - [✓] State 3, active download: show package atom/path label, bytes transferred, total bytes, throughput, and ETA for the current package.
-    - [✓] State 4, index refresh: show a distinct refresh step for the `Packages` index after package blobs are handled.
-    - [✓] State 5, final summary: show downloaded count and bytes, reused count and bytes, total elapsed sync time, and the PKGDIR location.
-  - [✓] Use this cache-hit rule:
-    - [✓] Treat a package as a cache hit only when the destination file already exists, matches the expected size, and matches the expected SHA256.
-    - [✓] Skip transfer entirely for verified cache hits and count them in the reuse summary.
-  - [✓] Use these progress update rules:
-    - [✓] Update visible byte progress at a human-stable cadence rather than per-chunk spam.
-    - [✓] Show ETA only for active downloads, never for cache hits.
-    - [✓] Replace ETA with a stalled indicator if throughput collapses long enough that the ETA becomes misleading.
-  - [✓] Keep failure semantics simple:
-    - [✓] Preserve the existing atomic `.part` download behavior.
-    - [✓] If a package download fails, stop sync, report the failing package, and print partial summary information for already reused/downloaded packages.
+| Flag | portage behaviour |
+|------|-------------------|
+| `--quiet` / `-q` | "Results may vary, but the general outcome is a **reduced or condensed output**." Does NOT silence build output — only condenses it. Separate from `--quiet-build`. |
+| `--verbose` / `-v` | "Currently this flag causes emerge to print out GNU info errors, if any, and to show the **USE flags** that will be used for each package when pretending." Primarily a metadata-richness flag, not a debug-dump flag. |
+| `--quiet-build` | Redirects all build output to logs. Distinct from `--quiet`. We do NOT inject this at any level — raw emerge PTY output is always passed through to the operator. |
+| `EMERGE_DEFAULT_OPTS` | User's persistent defaults in `make.conf`. We already parse this for verbosity fallback. |
 
-## Phase 4.6: Blob Compression
+portage "default" output is everything a user needs to monitor a build: package
+names, fetch progress, compilation lines, and a final summary. That is what our
+PTY relay already provides. Our CLI layers phase messages and a status bar on top.
 
-- [✓] Add compression-aware blob transport and storage without changing digest identity.
-  - [✓] Add blob metadata support for canonical raw digests plus optional encoded variants.
-  - [✓] Preserve raw-byte digest identity across storage, staging, parity, and transport.
-  - [✓] Negotiate blob upload compression over the existing blob stream control channel.
-  - [✓] Support compressed blob downloads using standard HTTP content encoding.
-  - [✓] Extend blob and tree metadata only where needed to describe stored encoded variants; parity transport relies on HTTP content encoding rather than a separate manifest field.
-  - [✓] Apply entropy-gated zstd compression for blobs when worthwhile.
-  - [✓] Apply the same compression policy to stored tree manifests.
-  - [✓] Add focused blob-store and API tests for compressed transport and raw-digest verification.
-  - [✓] Add focused parity tests for compressed transport and raw-digest verification.
-  - [✓] Document the compression model and operational behavior.
+### Identified gaps
 
-## Phase 5: Client Final-State Convergence
+1. **`rust_log_level()` Normal → `"error"`** — Should be `"warn"` so internal
+   warnings surface (e.g. "HMAC key missing", "pool exhausted") without adding
+   debug noise at default verbosity.
+2. **`emerge --sync --quiet`** — The worker hard-codes `--quiet --ask=n` for
+   the portage sync step in `crates/worker/src/builder.rs`. At `Verbose+` the
+   `--quiet` should be stripped so the operator can see rsync/sync progress in
+   the PTY stream, matching what `emerge --sync` shows locally.
+3. **crossdev `--quiet`** — Similarly hard-coded in `crates/worker/src/crossdev.rs`
+   for cross-compilation setup. Should be conditional.
+4. **`-vv`/`-vvv` don't inject repeated `--verbose`** — emerge only respects
+   one `--verbose` flag; extra levels must only elevate `RUST_LOG`.
+5. **Quiet mode and `SyncProgressReporter`** — At `-q` the sync progress bar
+   should be suppressed entirely; only a one-line "syncing portage tree…" and
+   final status should print.
+6. **Non-TTY detection** — `StatusBar::init()` must detect non-TTY stderr and
+   return a no-op path. CI environments, `tee` pipes, and `--quiet` combined
+   must not receive raw ANSI escape codes.
+7. **Watchdog heartbeats** — Should use `tracing::info!` not raw `eprintln!`
+   so they participate in the structured log pipeline and can be silenced via
+   `RUST_LOG`.
 
-- [✓] Define what "same final state as emerge" means in testable terms.
-  - [✓] Binaries
-  - [✓] local cache contents
-  - [✓] distfiles
-  - [✓] repo inputs
-  - [✓] relevant portage metadata inputs
-  - Decision: parity covers everything `remerge` touched that affects later local `emerge` behavior.
-- [✓] Audit which client-side state still diverges after a remote build.
-  - [✓] repo metadata
-    - Include eclass/cache indexes and other derived repo metadata needed by later local runs.
-    - Include manifest-related metadata and repo cache artifacts used by later local runs.
-    - Include everything under repo metadata directories touched by the worker.
-    - Current implemented slice: regular files under `/var/db/repos/*/metadata/**` are captured on the worker, stored in the blob store, restored on the client, and verified by digest plus mtime.
-  - [✓] fetched source artifacts
-    - Current implemented slice: the worker emits a digest/size/mtime manifest for final-state distfiles, the server ingests those blobs into the shared blob store, and the client restores missing or stale distfiles into the local `DISTDIR` before any follow-up local `emerge`.
-  - [✓] package metadata or indexes needed by later local runs
-    - Include generated package indexes or derived metadata outside repo metadata directories when later local runs depend on them.
-    - Current implemented slice: capture and restore `/var/cache/binpkgs/Packages` plus repo-level `/var/db/repos/*/Packages` when present.
-  - [✓] portage cache and metadata timestamps needed for honest parity
-    - Current implemented slice: regular files, directories, and symlinks under the approved parity roots are captured and restored with preserved mtime-to-the-second.
-  - [✓] full byte-for-byte Portage cache and metadata snapshot scope
-    - Mandatory parity set: full /var/lib/portage state, per-repo metadata directories, eclass cache, and Packages index.
-    - Snapshot and restore these path sets byte-for-byte, preserving file content and mtime to the second:
-      - `/var/lib/portage/**` for regular files, directories, and symlinks.
-      - `/var/db/repos/*/metadata/**` recursively for every active repo.
-      - `/var/cache/eclass/**` recursively for the configured eclass cache.
-      - `/var/cache/binpkgs/Packages` for the local PKGDIR index.
-      - `/var/db/repos/*/Packages` when a repo-level Packages index exists.
-    - Exclude these paths from the parity snapshot because they are synced elsewhere, client-owned, or regenerable temporary state:
-      - `/var/cache/binpkgs/*.gpkg.tar*` and other binpkg payload files.
-      - `/var/cache/portage/**` temporary build cache.
-      - `/var/cache/distfiles/**` source payloads already handled by distfile snapshot transport.
-      - `/var/db/pkg/**` installed-package VDB owned by the client.
-      - Version-control directories such as `.git/` and `.hg/` under repo trees.
-    - Treat sockets, FIFOs, lockfiles, and transient temp files under these trees as non-parity runtime noise unless later Phase 5 evidence proves otherwise.
-    - Implement parity capture using path-set rules rather than case-by-case heuristics so reconciliation is deterministic and testable.
-  - [✓] any transient worker-only state that should instead live on the client.
-- [✓] Implement the missing client reconciliation steps.
-  - [✓] Capture
-    - [✓] Collect the parity include set from the worker after the remote build reaches its final state.
-    - [✓] Record each captured parity entry as content plus preserved mtime-to-the-second metadata.
-    - [✓] Exclude configured non-parity paths and runtime noise during capture rather than filtering later.
-    - [✓] Emit a deterministic parity manifest for captured paths so later transfer and verification use the same file inventory.
-    - [✓] Initial approved-path slice: collect regular files under `/var/lib/portage/**`, `/var/db/repos/*/metadata/**`, `/var/cache/eclass/**`, `/var/cache/binpkgs/Packages`, and repo-level `/var/db/repos/*/Packages` after the worker reaches final build state.
-    - [✓] Initial approved-path slice: emit a deterministic manifest with SHA256 digest, size, and mtime-to-the-second for each captured file.
-    - [✓] Initial approved-path slice: exclude non-parity paths and runtime noise by traversing only the approved path set and recording regular files only.
-  - [✓] Transfer
-    - [✓] Reuse the same manifest/blob transport rules as other snapshot payloads wherever possible.
-    - [✓] Transfer only missing parity blobs to the client side when the local copy is absent or mismatched.
-    - [✓] Keep parity transfer logically separate from binpkg sync so failures are attributable to parity reconciliation rather than package download.
-    - [✓] Initial approved-path slice: reuse the shared blob store plus digest-addressed transfer path for parity payloads.
-    - [✓] Initial approved-path slice: download only mismatched approved-path parity blobs and keep parity reconciliation as a distinct post-sync step.
-  - [✓] Restore
-    - [✓] Materialize restored parity files only inside the approved include set.
-    - [✓] Restore bytes first, then restore preserved mtime to the second.
-    - [✓] Apply directory creation and file replacement atomically enough to avoid partially reconciled visible state after interruption.
-    - [✓] Avoid mutating excluded client-owned paths such as VDB, distfiles, temporary build caches, and binpkg payload files.
-    - [✓] Initial approved-path slice: restore only under the approved parity roots, write via `.part` files, then atomically rename into place.
-  - [✓] Verification
-    - [✓] Verify restored paths against the parity manifest using digest and mtime checks.
-    - [✓] Detect and report any skipped, excluded, or mismatched parity paths explicitly.
-    - [✓] Initial approved-path slice: verify restored files with digest, size, and mtime checks before accepting parity success.
-    - [✓] Ensure remote build side effects needed later are reflected locally before the CLI proceeds to any follow-up local emerge step.
-    - [✓] Fail closed when mandatory parity paths cannot be reconciled, unless a future explicit degraded-mode policy is introduced.
-- [✓] Add integration tests that compare `remerge` and local `emerge` final-state outcomes.
-  - [✓] Cover capture of the approved parity include set.
-  - [✓] Cover parity transfer when the client is already partially up to date.
-  - [✓] Cover restore and verification of bytes plus preserved mtime.
-  - [✓] Cover exclusion of VDB, distfiles, temporary build caches, and binpkg payload files from parity reconciliation.
+### Tasks
 
-## Phase 6: Smarter Assembly and Lifecycle Management
+- [✓] D1 · Change `Verbosity::Normal` `rust_log_level()` return value from
+  `"error"` to `"warn"`.
+- [✓] D2 · In `crates/worker/src/builder.rs`, make sync step `--quiet` flag
+  conditional: omit it when `emerge_args` contains `--verbose` or `-v`.
+- [✓] D3 · Same treatment for `crates/worker/src/crossdev.rs`.
+- [✓] D4 · Guard repeated `--verbose` injection: `workorder_emerge_args()`
+  already deduplicates; add comment + test asserting at most one verbosity flag.
+- [✓] D5 · In `complete_local_followup()` and any code using
+  `SyncProgressReporter`, gate writes on `!verbosity.is_quiet()`.
+- [✓] D6 · `StatusBar::init()` returns a `StatusBar` whose methods are no-ops
+  when either `is_quiet()` or not a TTY; distinguish the two cases so
+  CI-friendly one-line progress messages can be printed instead.
+- [✓] D7 · Replace `eprintln!` watchdog fallback with `tracing::info!`.
+- [✓] D8 · Integration tests: assert key lines present/absent for each of the
+  four verbosity levels against a recorded WS session fixture.
 
-- [✓] Add blob reference tracking and garbage collection.
-  - [✓] Track which staged workorders reference which blobs and trees.
-  - [✓] Record `last_referenced_at` so cleanup is based on delayed expiry rather than immediate unreachability.
-  - [✓] Account for blob and tree sizes so retention decisions can use actual on-disk usage.
-  - [✓] Clean up unreferenced data safely.
-  - [✓] Avoid deleting data still needed by active workorders.
-  - [✓] Keep newly unreferenced data for a short grace period so worker or client churn can still reuse it.
-- [✓] Add smarter runtime assembly optimizations.
-  - [✓] Prefer reflinks where supported.
-  - [✓] Fall back to hardlinks.
-  - [✓] Fall back to copies when linking is not possible.
-- [✓] Add quotas, accounting, or eviction rules for stored snapshots.
-  - [✓] Define a default warm-cache grace period for unreferenced client snapshot data.
-  - [✓] Define a separate hard-delete retention for old unreferenced blobs and trees.
-  - [✓] Define a configurable global minimum retained-size floor for cached snapshot data.
-    - [✓] Default to 10 GiB retained on the server.
-    - [✓] Only evict age-eligible unreferenced data when retained data exceeds the minimum floor.
-    - [✓] Evict oldest eligible data first until the retained-size floor is reached again.
-    - [✓] Keep the retained-size floor in force even for very old unreferenced data once the floor has been met.
-  - [✓] Expose configuration for operators to tune cleanup delays.
-    - [✓] Decision: ship defaults with operator-configurable overrides.
-  - [✓] Expose configuration for operators to tune the minimum retained-size floor.
-  - [✓] Keep retention policy global-only in the first implementation.
-- [✓] Add delayed cleanup policy and implementation.
-  - [✓] Baseline policy: keep unreferenced snapshot data reusable for 7 days.
-  - [✓] Baseline policy: hard-delete unreferenced blobs and trees after 30 days.
-  - [✓] Baseline policy: retain at least 10 GiB of cached snapshot data globally before age-based eviction removes additional data.
-  - [✓] Ensure a client config change that creates a new worker does not immediately discard still-useful cached data from the old config.
-  - [✓] Run cleanup asynchronously so builds are never blocked on large deletions.
-  - [✓] Make cleanup idempotent and restart-safe.
-- [✓] Defer aggressive size-pressure eviction until after floor-aware delayed age-based cleanup is stable.
-- [✓] Document operational behavior for deduplicated storage.
-  - [✓] Document the default 7-day reuse window and 30-day hard-delete window.
-  - [✓] Document the default 10 GiB minimum retained-size floor and how it interacts with age-based eviction.
-  - [✓] Document how operators can force cleanup or extend retention.
+---
 
-## Phase 7: Validation Matrix
+## Phase E — Server / Worker Tracing → CLI Visibility
 
-- [✓] Unit tests
-  - [✓] Blob-store dedup behavior
-  - [✓] Tree manifest staging metadata
-  - [✓] Worker restore from staged runtime
-  - [✓] Manifest negotiation edge cases
-  - [✓] Reference-tracking and GC behavior
-- [✓] Integration tests
-  - [✓] Docker worker startup with staged workorder path
-  - [✓] CLI submit with missing-blob upload
-  - [✓] Rebuild of local-only overlay package version
-  - [✓] Rebuild of upstream-dropped distfile version
-  - [✓] Client final-state parity versus local `emerge`
-- [✓] Operational validation
-  - [✓] Restart safety for staged runtimes and stored blobs
-  - [✓] Large snapshot upload behavior
-  - [✓] Multi-client dedup effectiveness
-  - [✓] Cleanup behavior under load
-  - [✓] Grace-period reuse after client config changes or worker replacement
-  - [✓] Hard-delete behavior once data ages past the retention bound.
+*Goal: give the CLI operator meaningful structured feedback from inside the
+remote worker at appropriate verbosity levels, without requiring a separate
+OTLP stack.*
 
-## Open Questions
+### Architecture
 
-No blocking roadmap questions remain for the current transport and parity design slice.
+The WebSocket progress stream already carries two frame types:
 
-Resolved implementation defaults:
+- **Binary frames** — raw PTY bytes from the emerge process.
+- **Text frames** — `BuildEvent` JSON (currently: `StatusChanged`,
+  `Heartbeat`, `Complete`).
 
-- [✓] Hybrid stream v1 uses JSON control frames plus self-describing binary chunks over `/api/v1/snapshots/blobs/stream`.
-- [✓] Hybrid stream v1 starts with 10 MB chunks, acknowledges each chunk, grows on healthy links, and shrinks on stalls.
-- [✓] Persisted repo/distfile snapshot refs now use the embedded manifest object to carry digest, size, and mtime; parity manifests already carry digest, size, and mtime with mtime encoded as Unix timestamp seconds.
-- [✓] Current mandatory parity scope is full /var/lib/portage state, per-repo metadata directories, eclass cache, and the Packages index.
-- [✓] CLI sync shows live progress, ETA, and cache-hit visibility during local binpkg cache population.
-- [✓] Retention should use a configurable global minimum retained-size floor, defaulting to 10 GiB, before age-based eviction removes additional cached snapshot data.
-- [✓] Exact parity include/exclude rules are defined by path-set: include `/var/lib/portage/**`, `/var/db/repos/*/metadata/**`, `/var/cache/eclass/**`, `/var/cache/binpkgs/Packages`, and repo-level `Packages` indexes; exclude binpkg payloads, distfiles, `/var/cache/portage/**`, `/var/db/pkg/**`, and VCS metadata.
-- [✓] Sync progress UX uses the five-state flow: start, cache-hit/download classification, active per-package progress, Packages index refresh, and final reused-versus-downloaded summary.
-- [✓] Hybrid stream v1 wire contract is fixed: JSON control frames with `upload_init`, `upload_resume`, `upload_ack`, `upload_complete`, and `upload_error`, plus `RMCH` self-describing binary chunk headers.
-- [✓] Phase 5 parity reconciliation is grouped into capture, transfer, restore, and verification so implementation can proceed without reopening scope questions.
+A third class of text frame, **`LogEvent`**, can be added to forward
+`tracing::warn!` / `tracing::info!` records from the server and worker back to
+the CLI. At normal verbosity these are discarded; at `-v` they are printed as
+annotated lines; at `-vv` they are streamed live; at `-vvv` debug records
+follow.
+
+This avoids adding OpenTelemetry infrastructure requirements for local
+development while making OTLP side-by-side export still work for production.
+
+### Trace context propagation (already in place)
+
+- CLI attaches W3C `traceparent` header when submitting a workorder.
+- Server parses the header and stores a `TraceContext` on the `Workorder`.
+- Worker reads `REMERGE_TRACEPARENT` env var and calls
+  `set_span_parent()` to link its spans into the client's trace.
+- The CLI displays the trace ID at verbose level so operators can correlate
+  with an OTLP backend.
+
+### New work
+
+**E1 · `LogEvent` WS frame type**
+
+Add to `crates/types/src/api.rs`:
+
+```rust
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LogEvent {
+    pub level: LogLevel,       // Error, Warn, Info, Debug, Trace
+    pub target: String,        // Rust module path (e.g. "remerge_worker::builder")
+    pub message: String,
+    pub workorder_id: Uuid,
+    pub span: Option<String>,  // current span name if any
+    pub timestamp: DateTime<Utc>,
+}
+```
+
+**E2 · Worker `tracing` subscriber layer for WS forwarding**
+
+Add an optional `WsLogLayer` in `crates/observability/src/ws_log.rs` that holds a
+`tokio::sync::mpsc::Sender<LogEvent>`. Worker init passes it a channel
+connected to the existing progress-event sender. The layer is registered in
+`init_tracing` only when `WS_LOG_LEVEL` is `Some`.
+
+**E3 · Server bridges worker log events into progress stream — with scope filtering**
+
+The server maintains a bounded ring buffer (capacity: N events, e.g. 256) per
+workorder. Two sources feed it:
+
+1. **Worker-scoped events**: forwarded verbatim from `WsLogLayer` over the
+   Docker attach channel or a side-channel IPC socket. All targets beginning
+   with `remerge_worker::` are eligible.
+2. **Server-scoped events**: only events whose `workorder_id` field matches the
+   requesting client's workorder are forwarded. Server-wide events (connection
+   pool exhaustion, auth failures for other clients, scheduler state) are never
+   forwarded regardless of log level — they may leak other clients' identities
+   or server internals.
+
+The filter is enforced server-side before the frame leaves the per-workorder
+WebSocket handler, not client-side. The client receives only what it owns.
+
+**Buffer and replay**: when a CLI connects (or reconnects) to the progress
+WebSocket, the server replays the buffered `LogEvent` frames for that workorder
+before switching to live forwarding. This ensures late-connecting CLIs (e.g.
+`remerge watch <id>`) see the full log for the build, not just what was
+produced after they connected. Buffer is per-workorder and discarded on
+`Complete` + a configurable TTL (default 10 minutes).
+
+**Verbosity negotiation**: the CLI includes its current verbosity level in the
+WebSocket handshake (as a query parameter or header, e.g.
+`?log_level=info`). The server uses this to gate which buffered and live
+`LogEvent` frames it actually sends — it does not rely on the client to
+discard. This prevents leaking debug-level log volume to operators who did not
+ask for it.
+
+**E4 · CLI `print_log_event()`**
+
+In `client.rs`, add a match arm for `LogEvent` frames:
+
+| Verbosity | Behaviour |
+|-----------|-----------|
+| Quiet | discard |
+| Normal | `Warn`/`Error` only → print prefixed with `▲ warn:` / `✗ error:` |
+| Verbose | `Info`+above → print prefixed with module path |
+| VerboseDebug | `Debug`+above |
+| VerboseTrace | `Trace`+above |
+
+The client still applies local filtering as a defence-in-depth layer, but the
+server's per-connection filter (E3) is the authoritative gate.
+
+**E5 · Trace ID display**
+
+At `Verbose+`, print the trace ID as a footnote after the final outcome line:
+
+```
+trace: 4bf92f3577b34da6a3ce929d0e0e4736
+```
+
+so the operator can paste it into Jaeger/Tempo if OTLP is configured.
+
+**E6 · `--log-json` / `REMERGE_LOG_JSON` flag (CLI)**
+
+Expose the server's existing `log_json` flag to CLI operator mode: when set,
+all structured frames (both `BuildEvent` and `LogEvent`) are emitted to stdout
+as newline-delimited JSON instead of human-readable text. Status bar is
+suppressed. This makes `remerge` suitable for CI log-capture tooling.
+
+### Tasks
+
+- [✓] E1 · Add `LogEvent` type + `LogLevel` enum to `crates/types/src/api.rs`.
+- [✓] E2 · Implement `WsLogLayer` tracing subscriber layer in
+  `crates/observability`.
+- [✓] E3a · Add per-workorder `LogEvent` ring buffer (bounded, 256 events) in
+  the server's workorder state.
+- [✓] E3b · Implement scope filter: only forward events with target prefix
+  `remerge_worker::` or events explicitly tagged with the matching
+  `workorder_id`; discard all server-internal events.
+- [✓] E3c · Implement verbosity negotiation: read `?log_level=` from WS
+  upgrade request and apply a per-connection `LogLevel` ceiling filter before
+  forwarding any frame.
+- [✓] E3d · Implement buffer replay: on WS connect, drain the ring buffer
+  (filtered by log level ceiling) before switching to live forwarding.
+- [✓] E4 · Add `print_log_event()` to `client.rs` with the verbosity dispatch
+  table above (client-side defence-in-depth filter).
+- [✓] E5 · Print trace ID footnote in `stream_progress()` at `Verbose+`.
+- [✓] E6 · Pass verbosity as `?log_level=` query param in the WS upgrade URL
+  built by `stream_progress()`.
+- [✓] E7 · Add `--log-json` flag and JSON output mode.
+- [✓] E8 · Document OTLP vs WS-log duality in `docs/observability.md`: OTLP
+  for production, WS log forwarding for development / `-vv`. Document the
+  scope filter invariant (client only sees its own workorder's events).
 
 ## Immediate Next Slice
 
-- [✓] Add API support for missing-blob discovery and blob upload.
-- [✓] Add CLI-side digest and tree-manifest generation for submission.
-- [✓] Replace inline repo and distfile snapshot payload submission with negotiated refs.
-- [✓] Add one integration test that proves the server only requests missing blobs.
-- [✓] Specify the CLI sync progress model, including ETA, cache-hit reporting, and repeated-sync summaries.
-- [✓] Design and implement the pull-oriented transfer replacement for the temporary upload endpoint over the normal client-initiated connection.
-- [✓] Design and implement the hybrid text-control/binary-chunk protocol for snapshot blob upload.
-- [✓] Define and implement per-chunk acknowledgement, resume, and backpressure rules for that protocol.
-- [✓] Define and implement the JSON control schema and self-describing binary chunk header for hybrid stream v1.
-- [✓] Define embedded manifest v1 field encoding for digest, size, and mtime.
-- [✓] Enumerate the exact parity file and directory paths under /var/lib/portage, repo metadata, eclass cache, and Packages handling.
-- [✓] Define the server retention accounting model for the 10 GiB minimum retained-size floor and floor-aware eviction order.
-- [✓] Persist blob-backed workorders on the server using immutable blob and tree digest references so the breaking manifest cutover has restart safety.
+- [✓] D4 — assert at most one verbosity flag in `workorder_emerge_args()` (+ unit test).
+- [✓] D8 — add integration test fixtures for verbosity levels.
+- [✓] E2 — implement `WsLogLayer` tracing subscriber in `crates/observability`.
+- [✓] E3a — per-workorder `LogEvent` ring buffer in server workorder state.
+- [✓] E3b — scope filter (target prefix `remerge_worker::` or matching `workorder_id`).
+- [✓] E3c — verbosity negotiation: read `?log_level=` at WS upgrade.
+- [✓] E3d — buffer replay on WS connect.
+- [✓] E4 — `print_log_event()` in `client.rs` with verbosity dispatch table.
+- [✓] E5 — trace ID footnote in `stream_progress()` at `Verbose+`.
+- [✓] E6 — pass verbosity as `?log_level=` query param in WS upgrade URL.
+- [✓] E7 — add `--log-json` flag and JSON output mode.
+- [✓] E8 — `docs/observability.md` documenting OTLP vs WS-log duality.

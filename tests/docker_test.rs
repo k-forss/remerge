@@ -386,7 +386,14 @@ mod docker_tests {
         let container_name = format!("remerge-test-{}", uuid::Uuid::new_v4());
 
         let container_id = manager
-            .start_worker(&container_name, &tag, &staged.runtime_dir, None, &config)
+            .start_worker(
+                &container_name,
+                &tag,
+                workorder.id,
+                &staged.runtime_dir,
+                None,
+                &config,
+            )
             .await
             .expect("start_worker should succeed with built image");
 

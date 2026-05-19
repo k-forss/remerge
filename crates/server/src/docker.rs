@@ -382,6 +382,7 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
         &self,
         container_name: &str,
         image_tag: &str,
+        workorder_id: remerge_types::workorder::WorkorderId,
         runtime_dir: &Path,
         traceparent: Option<&str>,
         server_config: &ServerConfig,
@@ -420,6 +421,14 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
         let mut env = vec![
             "REMERGE_WORKORDER_PATH=/var/cache/remerge/workorder/workorder.json".to_string(),
             "REMERGE_PARITY_OUTPUT_DIR=/var/cache/remerge/parity".to_string(),
+            format!("REMERGE_WORKORDER_ID={workorder_id}"),
+            // Inherit the worker log level from the server process environment
+            // so operators can raise it (e.g. REMERGE_WORKER_LOG_LEVEL=debug)
+            // without code changes.  Hard-code "info" only as a default.
+            format!(
+                "REMERGE_WORKER_LOG_LEVEL={}",
+                std::env::var("REMERGE_WORKER_LOG_LEVEL").unwrap_or_else(|_| "info".to_string())
+            ),
         ];
         if let Some(traceparent) = traceparent {
             env.push(format!("REMERGE_TRACEPARENT={traceparent}"));

@@ -28,7 +28,6 @@ fn build_emerge_args(workorder: &Workorder) -> Vec<String> {
     let mut args = vec![
         "--buildpkg".to_string(),
         "--usepkg".to_string(),
-        "--verbose".to_string(),
         "--ask=n".to_string(),
         "--color=y".to_string(),
         "--keep-going".to_string(),
@@ -77,8 +76,16 @@ fn should_skip_main_sync() -> bool {
 ///
 /// `emerge_cmd` is either `"emerge"` (native) or `"emerge-<CHOST>"` (cross).
 pub async fn build_packages(workorder: &Workorder, emerge_cmd: &str) -> Result<()> {
+    // Detect whether the client requested verbose output so the portage sync
+    // step can omit its own --quiet suppression and let the operator see
+    // rsync/git output in the PTY stream.
+    let verbose = workorder
+        .emerge_args
+        .iter()
+        .any(|a| a == "--verbose" || a == "-v");
+
     // Sync the portage tree first.
-    sync_portage().await?;
+    sync_portage(verbose).await?;
     let (program, args) = build_emerge_invocation(workorder, emerge_cmd);
 
     // Warn about expensive operations that are technically valid but risky.
@@ -121,7 +128,11 @@ pub async fn build_packages(workorder: &Workorder, emerge_cmd: &str) -> Result<(
 ///
 /// When `REMERGE_SKIP_SYNC` is not set, `emerge --sync` syncs ALL
 /// configured repositories (gentoo + overlays) in one go.
-async fn sync_portage() -> Result<()> {
+///
+/// `verbose`: when `true` the `--quiet` flag is omitted so the operator can
+/// see rsync/git sync progress in the PTY stream, matching local `emerge --sync`
+/// behaviour.
+async fn sync_portage(verbose: bool) -> Result<()> {
     if should_skip_main_sync() {
         info!("Main repo sync skipped (repos are bind-mounted from the server)");
         // Overlays not present on the server still need to be synced.
@@ -131,8 +142,13 @@ async fn sync_portage() -> Result<()> {
 
     info!("Syncing all configured repos");
 
+    let mut sync_args = vec!["--sync", "--ask=n"];
+    if !verbose {
+        sync_args.insert(1, "--quiet");
+    }
+
     let status = Command::new("emerge")
-        .args(["--sync", "--quiet", "--ask=n"])
+        .args(&sync_args)
         .status()
         .await
         .context("Failed to sync portage")?;
@@ -348,11 +364,7 @@ mod tests {
         );
         let (_program, args) = build_emerge_invocation(&workorder, "emerge");
 
-        assert!(args.starts_with(&[
-            "--buildpkg".to_string(),
-            "--usepkg".to_string(),
-            "--verbose".to_string(),
-        ]));
+        assert!(args.starts_with(&["--buildpkg".to_string(), "--usepkg".to_string(),]));
         assert!(args.contains(&"--ask=n".to_string()));
         assert!(args.contains(&"--emptytree".to_string()));
         assert!(args.contains(&"--jobs=4".to_string()));

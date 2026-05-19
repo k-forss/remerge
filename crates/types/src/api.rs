@@ -354,3 +354,56 @@ pub struct ServerInfoResponse {
     #[serde(default)]
     pub signing_key_endpoint: Option<String>,
 }
+
+// ─── Structured log forwarding ─────────────────────────────────────────────────
+
+/// Severity of a forwarded log event.
+///
+/// Matches the `tracing` crate level hierarchy.  The server applies a
+/// per-connection ceiling based on the verbosity the CLI requested at WS
+/// upgrade time (`?log_level=`), so the client only receives the events it
+/// asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+/// A structured tracing event forwarded from the server or worker back to the
+/// CLI over the progress WebSocket as a text frame.
+///
+/// The server only forwards events that belong to the requesting client's
+/// workorder (`workorder_id` must match, and `target` must be prefixed with
+/// `remerge_worker::` or tagged with the matching workorder ID).
+/// Server-wide events (auth failures, pool state, scheduler internals) are
+/// never forwarded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEvent {
+    pub level: LogLevel,
+    /// Rust module path of the emitting log site (e.g. `remerge_worker::builder`).
+    pub target: String,
+    pub message: String,
+    pub workorder_id: WorkorderId,
+    /// Name of the active span at the time the event was emitted, if any.
+    pub span: Option<String>,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+impl std::str::FromStr for LogLevel {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "error" => Ok(Self::Error),
+            "warn" => Ok(Self::Warn),
+            "info" => Ok(Self::Info),
+            "debug" => Ok(Self::Debug),
+            "trace" => Ok(Self::Trace),
+            other => Err(format!("unknown log level: {other}")),
+        }
+    }
+}

@@ -3,3 +3,5 @@ pub mod cflags;
 pub mod client;
 pub mod config;
 pub mod portage;
+pub mod status_bar;
+pub mod verbosity;

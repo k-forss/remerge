@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use axum::{
     Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, Path, Request, State, WebSocketUpgrade, ws},
+    extract::{DefaultBodyLimit, Path, Query, Request, State, WebSocketUpgrade, ws},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -1631,6 +1631,7 @@ async fn metrics(State(state): State<SharedState>) -> impl IntoResponse {
 async fn ws_progress(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, StatusCode> {
     let rx = state
@@ -1638,32 +1639,67 @@ async fn ws_progress(
         .await
         .ok_or(StatusCode::NOT_FOUND)?;
 
+    // Parse the optional log level ceiling from the query string.
+    // Defaults to Warn so existing clients receive only relevant log output.
+    let log_level = params
+        .get("log_level")
+        .and_then(|s| s.parse::<LogLevel>().ok())
+        .unwrap_or(LogLevel::Warn);
+
     // Raw PTY output channel — may be absent if the workorder has already
     // finished streaming (the sender was removed before this connection
     // arrived).  In that case the WS handler starts in text-only mode.
     let raw_rx = state.subscribe_raw_output(&id).await;
 
+    // Log event snapshot + live receiver, filtered at the requested level.
+    let log_sub = state.subscribe_logs(&id, log_level).await;
+
     let ws_state = state.clone();
 
-    Ok(ws.on_upgrade(move |socket| handle_ws(socket, rx, raw_rx, ws_state, id)))
+    Ok(
+        ws.on_upgrade(move |socket| {
+            handle_ws(socket, rx, raw_rx, log_sub, log_level, ws_state, id)
+        }),
+    )
 }
 
 async fn handle_ws(
     socket: ws::WebSocket,
     mut rx: tokio::sync::broadcast::Receiver<BuildProgress>,
     raw_rx: Option<tokio::sync::broadcast::Receiver<bytes::Bytes>>,
+    log_sub: Option<(Vec<LogEvent>, tokio::sync::broadcast::Receiver<LogEvent>)>,
+    log_level: LogLevel,
     state: SharedState,
     workorder_id: uuid::Uuid,
 ) {
     let (mut ws_write, mut ws_read) = socket.split();
 
-    // Task 1: Forward raw PTY output as Binary frames and structured
-    // build events as Text frames.  Binary frames carry the lossless
-    // terminal byte stream; Text frames carry only status / result events
-    // (StatusChanged, PackageBuilt, PackageFailed, Finished).
+    // Task 1: Forward raw PTY output as Binary frames, structured build events
+    // and log events as Text frames.
     let mut send_task = tokio::spawn(async move {
         use futures::SinkExt;
         use tokio::sync::broadcast::error::RecvError;
+
+        // Replay buffered log events before entering the live loop so the
+        // client receives history even when connecting mid-build.
+        let mut log_rx: Option<tokio::sync::broadcast::Receiver<LogEvent>> = None;
+        // Track the timestamp of the last event in the snapshot so we can
+        // skip duplicate events from the live receiver that were already
+        // included in the snapshot (possible because subscribe happens before
+        // snapshot, so a live event can appear in both).
+        let mut snapshot_cutoff: Option<chrono::DateTime<chrono::Utc>> = None;
+        if let Some((snapshot, rx)) = log_sub {
+            for event in &snapshot {
+                if event.level <= log_level
+                    && let Ok(text) = serde_json::to_string(event)
+                    && ws_write.send(ws::Message::Text(text.into())).await.is_err()
+                {
+                    return;
+                }
+            }
+            snapshot_cutoff = snapshot.last().map(|e| e.timestamp);
+            log_rx = Some(rx);
+        }
 
         // Start in text-only mode if the raw channel is already gone
         // (workorder finished streaming before this WS connection arrived).
@@ -1671,37 +1707,70 @@ async fn handle_ws(
         let mut raw_rx = raw_rx;
 
         loop {
+            // Determine whether we have a live log receiver to select on.
+            let log_fut = async {
+                if let Some(ref mut r) = log_rx {
+                    r.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            };
+
             if raw_done {
-                // Raw channel closed — only wait for structured events.
-                match rx.recv().await {
-                    Ok(progress) => {
-                        // Log events are superseded by the raw channel.
-                        if matches!(progress.event, BuildEvent::Log { .. }) {
-                            continue;
-                        }
-                        match serde_json::to_string(&progress) {
-                            Ok(text) => {
-                                if ws_write.send(ws::Message::Text(text.into())).await.is_err() {
+                // Raw channel closed — wait for structured build events or log events.
+                tokio::select! {
+                    biased;
+                    result = rx.recv() => {
+                        match result {
+                            Ok(progress) => {
+                                if matches!(progress.event, BuildEvent::Log { .. }) {
+                                    continue;
+                                }
+                                match serde_json::to_string(&progress) {
+                                    Ok(text) => {
+                                        if ws_write.send(ws::Message::Text(text.into())).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(error = ?e, "Failed to serialize build progress to JSON; dropping message");
+                                    }
+                                }
+                                if matches!(progress.event, BuildEvent::Finished { .. }) {
+                                    let _ = ws_write.send(ws::Message::Close(None)).await;
                                     break;
                                 }
                             }
-                            Err(e) => {
-                                warn!(error = ?e, "Failed to serialize build progress to JSON; dropping message");
+                            Err(RecvError::Lagged(n)) => {
+                                warn!(skipped = n, "Progress receiver lagged");
+                            }
+                            Err(RecvError::Closed) => {
+                                let _ = ws_write.send(ws::Message::Close(None)).await;
+                                break;
                             }
                         }
-                        if matches!(progress.event, BuildEvent::Finished { .. }) {
-                            let _ = ws_write.send(ws::Message::Close(None)).await;
-                            break;
+                    }
+                    result = log_fut => {
+                        match result {
+                            Ok(event) if event.level <= log_level => {
+                                // Skip events that were already sent as part
+                                // of the snapshot to avoid duplicates.
+                                let is_duplicate = snapshot_cutoff
+                                    .is_some_and(|cut| event.timestamp <= cut);
+                                if !is_duplicate
+                                    && let Ok(text) = serde_json::to_string(&event)
+                                        && ws_write.send(ws::Message::Text(text.into())).await.is_err() {
+                                            break;
+                                        }
+                            }
+                            Ok(_) => {} // filtered out by level
+                            Err(RecvError::Lagged(n)) => {
+                                warn!(skipped = n, "Log event receiver lagged");
+                            }
+                            Err(RecvError::Closed) => {
+                                log_rx = None;
+                            }
                         }
-                    }
-                    Err(RecvError::Lagged(n)) => {
-                        warn!(skipped = n, "Progress receiver lagged");
-                    }
-                    Err(RecvError::Closed) => {
-                        // Channel closed without a Finished event — send a
-                        // Close frame so the client doesn't hang.
-                        let _ = ws_write.send(ws::Message::Close(None)).await;
-                        break;
                     }
                 }
             } else {
@@ -1757,6 +1826,28 @@ async fn handle_ws(
                                 // send a Close frame so the client exits.
                                 let _ = ws_write.send(ws::Message::Close(None)).await;
                                 break;
+                            }
+                        }
+                    }
+                    result = log_fut => {
+                        match result {
+                            Ok(event) if event.level <= log_level => {
+                                // Skip events that were already sent as part
+                                // of the snapshot to avoid duplicates.
+                                let is_duplicate = snapshot_cutoff
+                                    .is_some_and(|cut| event.timestamp <= cut);
+                                if !is_duplicate
+                                    && let Ok(text) = serde_json::to_string(&event)
+                                        && ws_write.send(ws::Message::Text(text.into())).await.is_err() {
+                                            break;
+                                        }
+                            }
+                            Ok(_) => {} // filtered out by level
+                            Err(RecvError::Lagged(n)) => {
+                                warn!(skipped = n, "Log event receiver lagged");
+                            }
+                            Err(RecvError::Closed) => {
+                                log_rx = None;
                             }
                         }
                     }

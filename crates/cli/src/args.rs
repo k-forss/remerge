@@ -21,6 +21,8 @@ use tracing::info;
 use crate::client::RemergeClient;
 use crate::config::{self, CliConfig};
 use crate::portage::PortageReader;
+use crate::status_bar::StatusBar;
+use crate::verbosity::Verbosity;
 use remerge_types::client::ClientRole;
 use remerge_types::portage::{PortageConfig, SnapshotEntry};
 use remerge_types::validation::validate_atom;
@@ -41,7 +43,7 @@ pub async fn reconcile_final_state_parity_into(
         return Ok(());
     }
 
-    println!(
+    eprintln!(
         "Reconciling final-state parity for {} file(s), {} director(ies), and {} symlink(s)…",
         result.parity_manifest.files.len(),
         result.parity_manifest.directories.len(),
@@ -87,9 +89,9 @@ pub async fn reconcile_final_state_parity_into(
     }
 
     if !issues.is_empty() {
-        println!("Final-state parity reconciliation failed:");
+        eprintln!("Final-state parity reconciliation failed:");
         for issue in &issues {
-            println!("  - {issue}");
+            eprintln!("  - {issue}");
         }
         anyhow::bail!(
             "Final-state parity reconciliation failed for {} path(s): {}",
@@ -98,7 +100,7 @@ pub async fn reconcile_final_state_parity_into(
         );
     }
 
-    println!("Final-state parity reconciled in {}", parity_root.display());
+    eprintln!("Final-state parity reconciled in {}", parity_root.display());
     Ok(())
 }
 
@@ -111,7 +113,7 @@ pub async fn reconcile_fetched_distfiles_into(
         return Ok(());
     }
 
-    println!(
+    eprintln!(
         "Reconciling fetched distfiles for {} file(s)…",
         result.fetched_distfiles.len()
     );
@@ -126,9 +128,9 @@ pub async fn reconcile_fetched_distfiles_into(
     }
 
     if !issues.is_empty() {
-        println!("Fetched distfile reconciliation failed:");
+        eprintln!("Fetched distfile reconciliation failed:");
         for issue in &issues {
-            println!("  - {issue}");
+            eprintln!("  - {issue}");
         }
         anyhow::bail!(
             "Fetched distfile reconciliation failed for {} path(s): {}",
@@ -137,7 +139,7 @@ pub async fn reconcile_fetched_distfiles_into(
         );
     }
 
-    println!("Fetched distfiles reconciled in {}", distdir.display());
+    eprintln!("Fetched distfiles reconciled in {}", distdir.display());
     Ok(())
 }
 
@@ -708,6 +710,21 @@ pub struct Cli {
     #[arg(long)]
     force: bool,
 
+    /// Suppress all non-essential output (Portage-style -q).
+    #[arg(short = 'q', long, conflicts_with = "verbose")]
+    quiet: bool,
+
+    /// Increase output verbosity.  May be repeated: -v info, -vv debug, -vvv trace.
+    #[arg(short = 'v', long, action = clap::ArgAction::Count, conflicts_with = "quiet")]
+    verbose: u8,
+
+    /// Emit build events as newline-delimited JSON (NDJSON) instead of
+    /// human-readable output.  Implies --quiet for human messages so the JSON
+    /// stream is machine-parseable.  Can also be enabled with the
+    /// REMERGE_LOG_JSON=1 environment variable.
+    #[arg(long, env = "REMERGE_LOG_JSON")]
+    log_json: bool,
+
     /// All remaining arguments are forwarded to emerge.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     emerge_args: Vec<String>,
@@ -754,12 +771,15 @@ struct SyncProgressReporter {
 enum SyncProgressOutputMode {
     Interactive,
     Plain,
+    /// Quiet mode (`-q`) — all output suppressed.
+    Silent,
 }
 
 const SYNC_PROGRESS_DRAW_INTERVAL: Duration = Duration::from_millis(100);
 const SYNC_PROGRESS_DRAW_INTERVAL_PLAIN: Duration = Duration::from_secs(1);
 
 impl SyncProgressReporter {
+    #[cfg(test)]
     fn new(total_packages: usize, binhost_uri: impl Into<String>) -> Self {
         Self::with_output_mode(
             total_packages,
@@ -828,6 +848,7 @@ impl SyncProgressReporter {
         let draw_interval = match self.output_mode {
             SyncProgressOutputMode::Interactive => SYNC_PROGRESS_DRAW_INTERVAL,
             SyncProgressOutputMode::Plain => SYNC_PROGRESS_DRAW_INTERVAL_PLAIN,
+            SyncProgressOutputMode::Silent => return,
         };
         let should_draw = self
             .last_progress_draw
@@ -841,6 +862,7 @@ impl SyncProgressReporter {
 
         let line = Self::format_progress_line(atom, received_bytes, total_bytes, elapsed, stalled);
         match self.output_mode {
+            SyncProgressOutputMode::Silent => {}
             SyncProgressOutputMode::Interactive => {
                 use std::io::Write as _;
 
@@ -855,6 +877,7 @@ impl SyncProgressReporter {
         let line =
             Self::format_progress_line(&package.atom, package.size, package.size, elapsed, false);
         match self.output_mode {
+            SyncProgressOutputMode::Silent => {}
             SyncProgressOutputMode::Interactive => eprintln!("\r{line}"),
             SyncProgressOutputMode::Plain => eprintln!("{line}"),
         }
@@ -912,7 +935,9 @@ impl SyncProgressReporter {
     }
 
     fn print_line(&self, line: &str) {
-        eprintln!("{line}");
+        if self.output_mode != SyncProgressOutputMode::Silent {
+            eprintln!("{line}");
+        }
     }
 
     fn format_progress_line(
@@ -986,13 +1011,63 @@ impl Cli {
         Self::parse()
     }
 
-    /// Run the main CLI flow.
+    /// Derive the effective verbosity, consulting `EMERGE_DEFAULT_OPTS` as a
+    /// fallback when no explicit flag is given.  Requires the portage config
+    /// to already have been read; pass an empty string before that point.
+    fn verbosity(&self, emerge_default_opts: &str) -> Verbosity {
+        Verbosity::from_flags(self.quiet, self.verbose, emerge_default_opts)
+    }
+
+    /// Build the `emerge_args` slice to submit in the workorder, injecting a
+    /// verbosity flag and filtering flags already handled by the worker.
+    ///
+    /// **Invariant**: at most one verbosity flag (`--quiet` OR `--verbose`)
+    /// appears in the returned vec.  `VerboseDebug` and `VerboseTrace` only
+    /// elevate `RUST_LOG` — emerge still receives at most one `--verbose`
+    /// regardless of how many `-v` flags the operator typed.
+    fn workorder_emerge_args(&self, verbosity: Verbosity) -> Vec<String> {
+        let mut args = self.emerge_args.clone();
+
+        // Inject a verbosity flag if the user hasn't already provided one and
+        // the verbosity differs from Normal.
+        if let Some(flag) = verbosity.emerge_flag() {
+            let already_present = args.iter().any(|a| {
+                matches!(a.as_str(), "-q" | "--quiet" | "-v" | "--verbose") || {
+                    // Also recognise clustered short flags like -vv, -vvv, -qq.
+                    let s = a.as_str();
+                    s.starts_with('-')
+                        && s.len() > 2
+                        && s[1..].chars().all(|c| c == 'v' || c == 'q')
+                }
+            });
+            if !already_present {
+                // Prepend so it applies before any user-supplied flags.
+                args.insert(0, flag.to_string());
+            }
+        }
+
+        args
+    }
     pub async fn run(&self) -> Result<()> {
         if self.emerge_args.is_empty() {
             anyhow::bail!(
                 "No emerge arguments provided.  Usage: remerge [OPTIONS] <emerge-args>..."
             );
         }
+
+        let bar = StatusBar::global();
+        // In log_json mode suppress all status bar output so ANSI codes don't
+        // pollute the NDJSON stream on stderr and CI systems receive clean JSON.
+        // Also silence the global bar so helpers that call StatusBar::global()
+        // directly (e.g. run_with_watchdog) also become no-ops.
+        let bar = if self.log_json {
+            if let Some(b) = &bar {
+                b.silence();
+            }
+            None
+        } else {
+            bar
+        };
 
         // 0. Load persistent config (server URL + client ID).
         let cfg = CliConfig::load_or_create(&self.config).unwrap_or_else(|e| {
@@ -1017,6 +1092,9 @@ impl Cli {
         }
 
         // 1a. Expand set references (@world, @system) into individual atoms.
+        if let Some(ref b) = bar {
+            b.set_phase("Expanding package sets…");
+        }
         let reader_for_sets = PortageReader::new()?;
         let atoms: Vec<String> = raw_atoms
             .into_iter()
@@ -1040,21 +1118,42 @@ impl Cli {
             }
         }
 
-        // 1b. Check if packages are already installed (unless --force).
+        // 1c. Check if packages are already installed (unless --force).
         let atoms = if self.force {
             atoms
         } else {
+            if let Some(ref b) = bar {
+                b.set_phase("Checking installed packages…");
+            }
             let reader_for_vdb = PortageReader::new()?;
             let mut filtered = Vec::new();
             for atom in atoms {
                 if reader_for_vdb.is_installed(&atom) {
-                    println!("  ⏭  {atom} — already installed (use --force to rebuild)");
+                    if let Some(ref b) = bar {
+                        b.println(&format!(
+                            "  ⏭  {atom} — already installed (use --force to rebuild)"
+                        ));
+                    } else if self.log_json {
+                        // In log-json mode stdout carries NDJSON only; route
+                        // human-readable messages to stderr.
+                        eprintln!("  ⏭  {atom} — already installed (use --force to rebuild)");
+                    } else {
+                        println!("  ⏭  {atom} — already installed (use --force to rebuild)");
+                    }
                 } else {
                     filtered.push(atom);
                 }
             }
             if filtered.is_empty() {
-                println!("All packages are already installed. Nothing to do.");
+                if let Some(ref b) = bar {
+                    b.finish();
+                }
+                // In log-json mode stdout carries NDJSON only; route to stderr.
+                if self.log_json {
+                    eprintln!("All packages are already installed. Nothing to do.");
+                } else {
+                    println!("All packages are already installed. Nothing to do.");
+                }
                 return Ok(());
             }
             filtered
@@ -1068,6 +1167,10 @@ impl Cli {
         );
 
         // 2. Read local portage configuration.
+        //    This can take several seconds on a large Portage tree — show progress.
+        if let Some(ref b) = bar {
+            b.set_phase("Reading portage configuration…");
+        }
         let reader = PortageReader::new()?;
         let portage_config = reader
             .read_config()
@@ -1076,7 +1179,22 @@ impl Cli {
             .read_system_identity()
             .context("Failed to determine system identity")?;
 
+        // Derive final verbosity now that we have EMERGE_DEFAULT_OPTS.
+        let verbosity = self.verbosity(&portage_config.make_conf.emerge_default_opts);
+        // Retroactively silence the status bar if the real verbosity (which
+        // considers EMERGE_DEFAULT_OPTS from make.conf) turns out to be quiet,
+        // even though the bar was initialised from early_detect() which only
+        // sees raw CLI flags.
+        if verbosity.is_quiet()
+            && let Some(bar) = crate::status_bar::StatusBar::global()
+        {
+            bar.silence();
+        }
+
         if self.dry_run {
+            if let Some(ref b) = bar {
+                b.finish();
+            }
             println!("Would submit workorder for: {}", atoms.join(", "));
             println!("  Server:    {server}");
             println!("  Client ID: {}", client_id);
@@ -1098,71 +1216,137 @@ impl Cli {
             return Ok(());
         }
 
-        // 3. Submit workorder to server.
+        // 3. Upload any snapshot blobs the server is missing.
+        if let Some(ref b) = bar {
+            b.set_phase("Checking snapshot blobs…");
+        }
         let client = RemergeClient::new(server)?;
         let submitted_portage_config = self
-            .prepare_manifest_submission(&client, &portage_config)
+            .prepare_manifest_submission(&client, &portage_config, bar.as_deref())
             .await
             .context("Failed to negotiate snapshot blob upload")?;
+
+        // Build the emerge_args for the workorder, injecting a verbosity flag.
+        let workorder_emerge_args = self.workorder_emerge_args(verbosity);
+
+        // 4. Submit workorder.
+        if let Some(ref b) = bar {
+            b.set_phase("Submitting workorder…");
+        }
         let resp = client
             .submit_workorder(
                 client_id,
                 role,
                 &atoms,
-                &self.emerge_args,
+                &workorder_emerge_args,
                 &submitted_portage_config,
                 &system_id,
             )
             .await
             .context("Failed to submit workorder")?;
 
-        println!(
-            "Workorder {} submitted — streaming progress…",
-            resp.workorder_id
-        );
-        if let Some(trace_id) = &resp.trace_id {
-            println!("Trace ID: {trace_id}");
+        if let Some(ref b) = bar {
+            b.println(&format!(
+                "Workorder {} submitted — streaming progress…",
+                resp.workorder_id
+            ));
+            if let Some(ref trace_id) = resp.trace_id
+                && verbosity.is_verbose()
+            {
+                b.println(&format!("Trace ID: {trace_id}"));
+            }
+        } else {
+            // Status messages go to stderr so they do not corrupt the NDJSON
+            // stream when --log-json is active.
+            eprintln!(
+                "Workorder {} submitted — streaming progress…",
+                resp.workorder_id
+            );
+            if let Some(ref trace_id) = resp.trace_id {
+                eprintln!("Trace ID: {trace_id}");
+            }
         }
 
         if self.submit_only {
-            println!("Workorder ID: {}", resp.workorder_id);
+            if let Some(ref b) = bar {
+                b.finish();
+            }
+            if self.log_json {
+                eprintln!("Workorder ID: {}", resp.workorder_id);
+            } else {
+                println!("Workorder ID: {}", resp.workorder_id);
+            }
             return Ok(());
         }
 
-        // 4. Stream build progress via WebSocket.
+        // 5. Stream build progress via WebSocket.
+        //    PTY bytes from the remote build flow directly to stdout — hide the
+        //    status bar for the duration and restore it after.
+        if let Some(ref b) = bar {
+            b.set_phase("Waiting for build to start…");
+        }
         let result = client
-            .stream_progress(&resp.progress_ws_url)
+            .stream_progress(&resp.progress_ws_url, verbosity, self.log_json)
             .await
             .context("Failed to stream build progress")?;
 
-        // 5. Report results.
-        println!("\n─── Build complete ───");
-        println!(
-            "  Built: {}",
-            result
-                .built_packages
+        if let Some(ref b) = bar {
+            b.show();
+        }
+
+        // 6. Report results.
+        let built_list = result
+            .built_packages
+            .iter()
+            .map(|p| p.atom.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        // In log_json mode the NDJSON stream already contains the Finished frame;
+        // suppress the human-readable banner to keep stdout clean for CI tooling.
+        if !self.log_json {
+            if let Some(ref b) = bar {
+                b.println("\n─── Build complete ───");
+                b.println(&format!("  Built: {built_list}"));
+                if verbosity.is_verbose()
+                    && let Some(ref trace_id) = resp.trace_id
+                {
+                    b.println(&format!("  Trace: {trace_id}"));
+                }
+            } else {
+                eprintln!("\n─── Build complete ───");
+                eprintln!("  Built: {built_list}");
+                if verbosity.is_verbose()
+                    && let Some(ref trace_id) = resp.trace_id
+                {
+                    eprintln!("  Trace: {trace_id}");
+                }
+            }
+        }
+        if !result.failed_packages.is_empty() {
+            let failed_list = result
+                .failed_packages
                 .iter()
                 .map(|p| p.atom.as_str())
                 .collect::<Vec<_>>()
-                .join(", ")
-        );
-        if !result.failed_packages.is_empty() {
-            println!(
-                "  Failed: {}",
-                result
-                    .failed_packages
-                    .iter()
-                    .map(|p| p.atom.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
+                .join(", ");
+            if let Some(ref b) = bar {
+                b.println(&format!("  Failed: {failed_list}"));
+            } else {
+                eprintln!("  Failed: {failed_list}");
+            }
             anyhow::bail!(
                 "Remote build failed: {} package(s) failed",
                 result.failed_packages.len()
             );
         }
 
-        let local_binhost_uri = match self.sync_local_binpkg_cache(&client, &result).await {
+        if let Some(ref b) = bar {
+            b.set_phase("Syncing binary packages…");
+        }
+        let local_binhost_uri = match self
+            .sync_local_binpkg_cache(&client, &result, verbosity)
+            .await
+        {
             Ok(uri) => uri,
             Err(error) => {
                 tracing::warn!(%error, "Failed to sync local binpkg cache");
@@ -1173,6 +1357,7 @@ impl Cli {
         let local_args = Self::build_local_emerge_args(&self.emerge_args);
         let binhost_uri = local_binhost_uri.or_else(|| Some(result.binhost_uri.clone()));
         self.complete_local_followup(
+            bar.as_deref(),
             || async { self.restore_local_followup_state(&client, &result).await },
             || async {
                 self.run_emerge_locally(&local_args, binhost_uri.as_deref())
@@ -1196,12 +1381,26 @@ impl Cli {
         &self,
         client: &RemergeClient,
         portage_config: &PortageConfig,
+        bar: Option<&StatusBar>,
     ) -> Result<PortageConfig> {
         let blob_payloads = Self::snapshot_blob_payloads(portage_config)?;
         if !blob_payloads.is_empty() {
             let digests: Vec<String> = blob_payloads.keys().cloned().collect();
+            if let Some(b) = bar {
+                b.set_phase(format!(
+                    "Checking snapshot blobs ({} repo snapshots)…",
+                    digests.len()
+                ));
+            }
             let missing = client.find_missing_blobs(&digests).await?;
-            for digest in missing {
+            let total_missing = missing.len();
+            for (idx, digest) in missing.into_iter().enumerate() {
+                if let Some(b) = bar {
+                    b.set_phase(format!(
+                        "Uploading snapshot blob {}/{total_missing}…",
+                        idx + 1
+                    ));
+                }
                 let payload = blob_payloads.get(&digest).with_context(|| {
                     format!("Server requested missing blob {digest}, but the client has no payload")
                 })?;
@@ -1334,13 +1533,14 @@ impl Cli {
         &self,
         client: &RemergeClient,
         result: &WorkorderResult,
+        verbosity: Verbosity,
     ) -> Result<Option<String>> {
         if result.built_packages.is_empty() {
             return Ok(None);
         }
 
         let pkgdir = Self::detect_local_pkgdir().await?;
-        self.sync_local_binpkg_cache_into(client, result, &pkgdir)
+        self.sync_local_binpkg_cache_into(client, result, &pkgdir, verbosity)
             .await?;
 
         Ok(Self::file_binhost_uri(&pkgdir))
@@ -1351,13 +1551,24 @@ impl Cli {
         client: &RemergeClient,
         result: &WorkorderResult,
         pkgdir: &Path,
+        verbosity: Verbosity,
     ) -> Result<()> {
         tokio::fs::create_dir_all(&pkgdir)
             .await
             .with_context(|| format!("Failed to create {}", pkgdir.display()))?;
 
-        let mut reporter =
-            SyncProgressReporter::new(result.built_packages.len(), result.binhost_uri.clone());
+        let output_mode = if verbosity.is_quiet() {
+            SyncProgressOutputMode::Silent
+        } else if std::io::stderr().is_terminal() {
+            SyncProgressOutputMode::Interactive
+        } else {
+            SyncProgressOutputMode::Plain
+        };
+        let mut reporter = SyncProgressReporter::with_output_mode(
+            result.built_packages.len(),
+            result.binhost_uri.clone(),
+            output_mode,
+        );
 
         for package in &result.built_packages {
             match self
@@ -1407,17 +1618,32 @@ impl Cli {
         distdir: &Path,
         parity_root: &Path,
     ) -> Result<()> {
-        println!("Restoring fetched distfiles into {}…", distdir.display());
+        if self.log_json {
+            eprintln!("Restoring fetched distfiles into {}…", distdir.display());
+        } else {
+            println!("Restoring fetched distfiles into {}…", distdir.display());
+        }
         reconcile_fetched_distfiles_into(distdir, client, result).await?;
         if self.no_local {
-            println!("Skipping final-state parity restore because --no-local was requested.");
+            if self.log_json {
+                eprintln!("Skipping final-state parity restore because --no-local was requested.");
+            } else {
+                println!("Skipping final-state parity restore because --no-local was requested.");
+            }
             return Ok(());
         }
 
-        println!(
-            "Restoring final-state parity into {}…",
-            parity_root.display()
-        );
+        if self.log_json {
+            eprintln!(
+                "Restoring final-state parity into {}…",
+                parity_root.display()
+            );
+        } else {
+            println!(
+                "Restoring final-state parity into {}…",
+                parity_root.display()
+            );
+        }
         reconcile_final_state_parity_into(parity_root, client, result).await
     }
 
@@ -1434,6 +1660,7 @@ impl Cli {
 
     async fn complete_local_followup<Reconcile, ReconcileFuture, RunLocal, RunLocalFuture>(
         &self,
+        bar: Option<&StatusBar>,
         reconcile: Reconcile,
         run_local: RunLocal,
     ) -> Result<()>
@@ -1443,7 +1670,13 @@ impl Cli {
         RunLocal: FnOnce() -> RunLocalFuture,
         RunLocalFuture: Future<Output = Result<()>>,
     {
-        println!("Restoring local follow-up state…");
+        if let Some(b) = bar {
+            b.set_phase("Restoring local follow-up state…");
+        } else if self.log_json {
+            eprintln!("Restoring local follow-up state…");
+        } else {
+            println!("Restoring local follow-up state…");
+        }
         Self::run_with_watchdog(
             "restoring local follow-up state",
             LOCAL_FOLLOWUP_RESTORE_TIMEOUT,
@@ -1451,15 +1684,40 @@ impl Cli {
         )
         .await
         .context("Failed to restore local follow-up state")?;
-        println!("Local follow-up state restored.");
+
+        if let Some(b) = bar {
+            b.println("Local follow-up state restored.");
+        } else if self.log_json {
+            eprintln!("Local follow-up state restored.");
+        } else {
+            println!("Local follow-up state restored.");
+        }
 
         if self.no_local {
-            println!("Skipping local emerge because --no-local was requested.");
+            if self.log_json {
+                eprintln!("Skipping local emerge because --no-local was requested.");
+            } else {
+                println!("Skipping local emerge because --no-local was requested.");
+            }
+            if let Some(b) = bar {
+                b.finish();
+            }
             return Ok(());
         }
 
-        println!("\nRunning emerge locally with binary packages…\n");
-        run_local().await
+        if let Some(b) = bar {
+            b.hide();
+            eprintln!("\nRunning emerge locally with binary packages…\n");
+        } else if self.log_json {
+            eprintln!("\nRunning emerge locally with binary packages…\n");
+        } else {
+            println!("\nRunning emerge locally with binary packages…\n");
+        }
+        let result = run_local().await;
+        if let Some(b) = bar {
+            b.finish();
+        }
+        result
     }
 
     async fn run_with_watchdog<T, Fut>(stage: &str, timeout: Duration, future: Fut) -> Result<T>
@@ -1484,11 +1742,20 @@ impl Cli {
                     );
                 }
                 _ = heartbeat.tick() => {
-                    eprintln!(
-                        "CLI watchdog: still {stage} after {}s (timeout: {}s)",
-                        started_at.elapsed().as_secs(),
-                        timeout.as_secs(),
-                    );
+                    let elapsed = started_at.elapsed().as_secs();
+                    // Update the status bar if present; otherwise emit a
+                    // timed log line so non-TTY environments (CI, pipes) see
+                    // progress.
+                    if let Some(bar) = StatusBar::global() {
+                        bar.set_phase(format!("{stage} ({elapsed}s)…"));
+                    } else {
+                        tracing::info!(
+                            stage,
+                            elapsed_secs = elapsed,
+                            timeout_secs = timeout.as_secs(),
+                            "still working"
+                        );
+                    }
                 }
             }
         }
@@ -1716,6 +1983,7 @@ mod tests {
         reconcile_fetched_distfiles_into, resolve_parity_target, set_file_mtime,
     };
     use crate::client::RemergeClient;
+    use crate::verbosity::Verbosity;
     use remerge_types::portage::{MakeConf, PortageConfig, SnapshotEntry};
     use remerge_types::workorder::{
         BuiltPackage, ParityFileEntry, ParityManifest, WorkorderResult,
@@ -1731,6 +1999,9 @@ mod tests {
             no_local: false,
             dry_run: false,
             force: false,
+            quiet: false,
+            verbose: 0,
+            log_json: false,
             emerge_args: Vec::new(),
         }
     }
@@ -2266,7 +2537,7 @@ mod tests {
         let cli = test_cli();
 
         let error = cli
-            .sync_local_binpkg_cache_into(&client, &result, pkgdir.path())
+            .sync_local_binpkg_cache_into(&client, &result, pkgdir.path(), Verbosity::Normal)
             .await
             .expect_err("sync should stop on the failing package");
 
@@ -2617,6 +2888,7 @@ mod tests {
 
         test_cli()
             .complete_local_followup(
+                None,
                 {
                     let events = events.clone();
                     move || async move {
@@ -2658,6 +2930,7 @@ mod tests {
 
         let error = test_cli()
             .complete_local_followup(
+                None,
                 {
                     let events = events.clone();
                     move || async move {
@@ -2709,6 +2982,59 @@ mod tests {
         assert!(
             message.contains("restoring local follow-up state"),
             "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn test_workorder_emerge_args_at_most_one_verbosity_flag() {
+        // VerboseTrace → exactly one --verbose injected
+        let cli = test_cli();
+        let args = cli.workorder_emerge_args(Verbosity::VerboseTrace);
+        assert_eq!(
+            args.iter().filter(|a| *a == "--verbose").count(),
+            1,
+            "VerboseTrace must inject exactly one --verbose"
+        );
+
+        // If --verbose is already present, no extra flag is added
+        let cli_v = Cli {
+            emerge_args: vec!["--verbose".to_string(), "@world".to_string()],
+            ..test_cli()
+        };
+        let args = cli_v.workorder_emerge_args(Verbosity::VerboseDebug);
+        let count_v = args
+            .iter()
+            .filter(|a| *a == "--verbose" || *a == "-v")
+            .count();
+        assert_eq!(
+            count_v, 1,
+            "should not duplicate --verbose when already present"
+        );
+
+        // If -v is already present, no extra --verbose is added
+        let cli_short = Cli {
+            emerge_args: vec!["-v".to_string(), "=dev-libs/foo-1.0".to_string()],
+            ..test_cli()
+        };
+        let args = cli_short.workorder_emerge_args(Verbosity::Verbose);
+        let count_sv = args
+            .iter()
+            .filter(|a| *a == "--verbose" || *a == "-v")
+            .count();
+        assert_eq!(
+            count_sv, 1,
+            "should not add --verbose when -v already present"
+        );
+
+        // Quiet → exactly one --quiet injected
+        let cli = test_cli();
+        let args = cli.workorder_emerge_args(Verbosity::Quiet);
+        assert_eq!(
+            args.iter()
+                .filter(|a| *a == "--quiet" || *a == "-q")
+                .count(),
+            1,
+            "Quiet must inject exactly one --quiet"
         );
     }
 }

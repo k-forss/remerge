@@ -10,6 +10,7 @@ rust-version.workspace = true
 remerge-types = { workspace = true }
 
 anyhow = { workspace = true }
+chrono = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 opentelemetry_sdk = { workspace = true }
