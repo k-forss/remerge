@@ -756,16 +756,18 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
                                 // before we accumulated enough bytes to match the
                                 // prefix — short/empty line.  Forward and run
                                 // pattern matching.
+                                if prev_in_pfx > 0 {
+                                    // Prev-chunk bytes aren't in bytes[]; if we
+                                    // need to forward this line, flush them in
+                                    // chronological order first.
+                                    let fw = forward_buf.get_or_insert_with(Vec::new);
+                                    fw.extend_from_slice(
+                                        &bytes[clean_start..prefix_chunk_start],
+                                    );
+                                    fw.extend_from_slice(&prefix_buf[..prev_in_pfx]);
+                                    clean_start = prefix_chunk_start;
+                                }
                                 if let Some(ref mut fw) = forward_buf {
-                                    if prev_in_pfx > 0 {
-                                        // Prev-chunk bytes aren't in bytes[];
-                                        // flush them in chronological order.
-                                        fw.extend_from_slice(
-                                            &bytes[clean_start..prefix_chunk_start],
-                                        );
-                                        fw.extend_from_slice(&prefix_buf[..prev_in_pfx]);
-                                        clean_start = prefix_chunk_start;
-                                    }
                                     fw.extend_from_slice(&bytes[clean_start..=bi]);
                                     clean_start = bi + 1;
                                 }
