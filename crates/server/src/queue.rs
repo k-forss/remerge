@@ -1103,3 +1103,103 @@ enum WorkerEvent {
         event: remerge_types::api::LogEvent,
     },
 }
+
+// ─── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::WorkerEvent;
+    use remerge_types::api::LogLevel;
+
+    // ── WorkerEvent::Log serde regression ─────────────────────────────────
+
+    /// Regression guard for the critical serde shape mismatch: the worker
+    /// serialises `WorkerEventEnvelope::Log(LogEvent)` (tuple variant with
+    /// `#[serde(tag="type")]`) as:
+    ///
+    ///   `{"type":"log","level":"info","target":"…","message":"…", …}`
+    ///
+    /// The server's `WorkerEvent::Log { event: LogEvent }` previously
+    /// deserialised from:
+    ///
+    ///   `{"type":"log","event":{"level":"info",…}}`   ← WRONG (nested)
+    ///
+    /// With `#[serde(flatten)]` on `event` the server now accepts the flat
+    /// layout the worker actually emits.  Without the fix, every log event
+    /// from the worker was silently dropped.
+    #[test]
+    fn worker_event_log_deserializes_from_flat_wire_format() {
+        let id = uuid::Uuid::parse_str("23137eac-2455-45cf-a09f-cbdbd3a01fcc").unwrap();
+        let json = format!(
+            r#"{{"type":"log","level":"info","target":"remerge_worker::builder","message":"starting","workorder_id":"{id}","timestamp":"2026-01-01T00:00:00Z"}}"#
+        );
+
+        let event: WorkerEvent =
+            serde_json::from_str(&json).expect("flat log wire format must deserialise");
+
+        match event {
+            WorkerEvent::Log { event: log_event } => {
+                assert_eq!(log_event.level, LogLevel::Info);
+                assert_eq!(log_event.target, "remerge_worker::builder");
+                assert_eq!(log_event.message, "starting");
+                assert_eq!(log_event.workorder_id, id);
+            }
+            other => panic!("expected Log variant, got {other:?}"),
+        }
+    }
+
+    /// The old (broken) wire format had the LogEvent nested under an "event"
+    /// key.  Ensure that format is now rejected, confirming the fix is active.
+    #[test]
+    fn worker_event_log_rejects_nested_event_key_format() {
+        let id = uuid::Uuid::parse_str("23137eac-2455-45cf-a09f-cbdbd3a01fcc").unwrap();
+        let json = format!(
+            r#"{{"type":"log","event":{{"level":"info","target":"t","message":"m","workorder_id":"{id}","timestamp":"2026-01-01T00:00:00Z"}}}}"#
+        );
+
+        // The nested format must not succesffully produce a Log variant.
+        let result = serde_json::from_str::<WorkerEvent>(&json);
+        match result {
+            Err(_) => {} // expected — unknown fields with strict deserialise, or missing top-level fields
+            Ok(WorkerEvent::Log { event }) => {
+                // If it round-tripped by chance, the message must be wrong since
+                // the fields were under "event", not at the top level.
+                assert_ne!(
+                    event.message, "m",
+                    "nested 'event' key format must not be silently accepted"
+                );
+            }
+            Ok(_) => {} // PackageBuilt/Failed — also fine
+        }
+    }
+
+    #[test]
+    fn worker_event_package_built_deserializes() {
+        let json = r#"{"type":"package_built","atom":"dev-libs/openssl-3.0","duration_secs":42}"#;
+        let event: WorkerEvent = serde_json::from_str(json).expect("package_built must parse");
+        match event {
+            WorkerEvent::PackageBuilt {
+                atom,
+                duration_secs,
+            } => {
+                assert_eq!(atom, "dev-libs/openssl-3.0");
+                assert_eq!(duration_secs, 42);
+            }
+            other => panic!("expected PackageBuilt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn worker_event_package_failed_deserializes() {
+        let json =
+            r#"{"type":"package_failed","atom":"dev-libs/foo-1.0","reason":"emerge failed"}"#;
+        let event: WorkerEvent = serde_json::from_str(json).expect("package_failed must parse");
+        match event {
+            WorkerEvent::PackageFailed { atom, reason } => {
+                assert_eq!(atom, "dev-libs/foo-1.0");
+                assert_eq!(reason, "emerge failed");
+            }
+            other => panic!("expected PackageFailed, got {other:?}"),
+        }
+    }
+}

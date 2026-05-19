@@ -304,3 +304,108 @@ fn render(phase: &str, elapsed: Duration) -> String {
 
     format!("{prefix}{phase_str}{suffix}")
 }
+
+// ─── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── base_phase: heartbeat suffix stripping ─────────────────────────────
+
+    /// Regression guard for the off-by-one in the byte slice that left the
+    /// trailing `s` inside the digit check, causing `base_phase` to *never*
+    /// strip the suffix and LogLine mode to emit a new line on every heartbeat.
+    #[test]
+    fn base_phase_strips_unicode_ellipsis_suffix() {
+        // "Stage name (42s)…" — the canonical heartbeat format.
+        assert_eq!(
+            base_phase("Building packages (42s)\u{2026}"),
+            "Building packages"
+        );
+    }
+
+    #[test]
+    fn base_phase_strips_ascii_ellipsis_suffix() {
+        // Fallback format using three ASCII dots instead of the ellipsis char.
+        assert_eq!(
+            base_phase("Building packages (42s)..."),
+            "Building packages"
+        );
+    }
+
+    #[test]
+    fn base_phase_strips_single_digit_seconds() {
+        assert_eq!(base_phase("Waiting (1s)\u{2026}"), "Waiting");
+    }
+
+    #[test]
+    fn base_phase_strips_large_second_count() {
+        assert_eq!(base_phase("Long stage (12345s)\u{2026}"), "Long stage");
+    }
+
+    #[test]
+    fn base_phase_leaves_plain_phase_unchanged() {
+        // No heartbeat suffix — must be returned as-is.
+        assert_eq!(base_phase("Building packages"), "Building packages");
+    }
+
+    #[test]
+    fn base_phase_leaves_empty_string_unchanged() {
+        assert_eq!(base_phase(""), "");
+    }
+
+    #[test]
+    fn base_phase_does_not_strip_non_digit_inside_parens() {
+        // "(x42s)…" is not a valid heartbeat suffix; must not be stripped.
+        assert_eq!(base_phase("Stage (x42s)\u{2026}"), "Stage (x42s)\u{2026}");
+    }
+
+    // ── StatusBar::silence: set_phase must be a no-op after silencing ──────
+
+    /// Regression guard for the StatusBar init timing bug: when the real
+    /// verbosity (from EMERGE_DEFAULT_OPTS) turns out to be quiet after the
+    /// bar was already initialised from early_detect(), `silence()` must
+    /// prevent any subsequent `set_phase` from updating the stored phase.
+    #[test]
+    fn silence_makes_set_phase_a_noop() {
+        // Build a LogLine-mode bar directly (avoids I/O and tokio spawn).
+        let bar = StatusBar {
+            state: Arc::new(Mutex::new(State {
+                phase: "initial".to_string(),
+                phase_started: std::time::Instant::now(),
+                hidden: false,
+                finished: false,
+            })),
+            mode: StatusBarMode::LogLine,
+            silenced: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        bar.silence();
+        // After silence, set_phase must not update the stored phase.
+        bar.set_phase("should be ignored");
+
+        let phase = bar.state.lock().unwrap().phase.clone();
+        assert_eq!(
+            phase, "initial",
+            "set_phase must be a no-op after silence()"
+        );
+    }
+
+    #[test]
+    fn silence_is_idempotent() {
+        let bar = StatusBar {
+            state: Arc::new(Mutex::new(State {
+                phase: String::new(),
+                phase_started: std::time::Instant::now(),
+                hidden: true,
+                finished: false,
+            })),
+            mode: StatusBarMode::Silent,
+            silenced: std::sync::atomic::AtomicBool::new(false),
+        };
+        bar.silence();
+        bar.silence(); // second call must not panic
+        assert!(bar.silenced.load(std::sync::atomic::Ordering::Relaxed));
+    }
+}

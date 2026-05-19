@@ -668,8 +668,7 @@ impl RemergeClient {
         // Append the log-level ceiling as a query parameter so the server
         // only sends events the CLI can usefully display.
         let log_level_str = verbosity.rust_log_level();
-        let sep = if ws_url.contains('?') { '&' } else { '?' };
-        let ws_url_with_level = format!("{ws_url}{sep}log_level={log_level_str}");
+        let ws_url_with_level = append_log_level_param(ws_url, log_level_str);
         let ws_url = ws_url_with_level.as_str();
 
         let (ws, _) = connect_async(ws_url)
@@ -1103,6 +1102,16 @@ impl RemergeClient {
 
 /// Whether a [`LogEvent`] should be displayed at a given verbosity level.
 ///
+/// Append `log_level=<level>` to a WebSocket URL, using `?` when the URL has
+/// no query string yet and `&` when one is already present.
+///
+/// Extracted as a free function so it can be unit-tested independently of the
+/// full `stream_progress` async machinery.
+pub(crate) fn append_log_level_param(ws_url: &str, level: &str) -> String {
+    let sep = if ws_url.contains('?') { '&' } else { '?' };
+    format!("{ws_url}{sep}log_level={level}")
+}
+
 /// This is the client-side defence-in-depth filter.  The server already
 /// applies a per-connection ceiling before sending any frame; this function
 /// provides a second layer so that even if the server sends more than
@@ -1179,7 +1188,7 @@ impl Drop for EchoGuard {
 mod tests {
     use super::{
         PROGRESS_STREAM_CLEANUP_TIMEOUT, RemergeClient, SNAPSHOT_BLOB_DEFAULT_CHUNK_SIZE_BYTES,
-        SnapshotBlobChunkPolicy,
+        SnapshotBlobChunkPolicy, append_log_level_param,
     };
     use axum::{
         Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get,
@@ -1282,6 +1291,69 @@ mod tests {
                 "ws://localhost/api/v1/workorders/not-a-uuid/progress"
             ),
             None
+        );
+    }
+
+    // ── Regression: workorder_id_from_progress_url must handle query strings ──
+
+    /// Regression guard for the query-string stripping fix:
+    /// `workorder_id_from_progress_url` must strip `?…` before splitting so
+    /// the UUID is extracted correctly even when the URL already carries query
+    /// parameters like `?foo=bar` or the `log_level` param added by
+    /// `stream_progress`.
+    #[test]
+    fn parses_workorder_id_from_progress_url_with_query_string() {
+        let id = uuid::Uuid::parse_str("23137eac-2455-45cf-a09f-cbdbd3a01fcc").unwrap();
+
+        assert_eq!(
+            RemergeClient::workorder_id_from_progress_url(
+                "ws://localhost/api/v1/workorders/23137eac-2455-45cf-a09f-cbdbd3a01fcc/progress?log_level=info"
+            ),
+            Some(id)
+        );
+    }
+
+    #[test]
+    fn parses_workorder_id_from_progress_url_with_multiple_params() {
+        let id = uuid::Uuid::parse_str("23137eac-2455-45cf-a09f-cbdbd3a01fcc").unwrap();
+
+        assert_eq!(
+            RemergeClient::workorder_id_from_progress_url(
+                "ws://localhost/api/v1/workorders/23137eac-2455-45cf-a09f-cbdbd3a01fcc/progress?foo=bar&log_level=debug"
+            ),
+            Some(id)
+        );
+    }
+
+    // ── Regression: append_log_level_param must not produce a double `?` ──
+
+    /// Regression guard for the double-`?` URL bug:
+    /// when the base URL already has a query string the separator must be `&`,
+    /// not `?`, so the resulting URL is valid.
+    #[test]
+    fn append_log_level_param_uses_question_mark_for_plain_url() {
+        assert_eq!(
+            append_log_level_param("ws://host/path", "info"),
+            "ws://host/path?log_level=info"
+        );
+    }
+
+    #[test]
+    fn append_log_level_param_uses_ampersand_when_query_already_present() {
+        assert_eq!(
+            append_log_level_param("ws://host/path?foo=bar", "debug"),
+            "ws://host/path?foo=bar&log_level=debug"
+        );
+    }
+
+    /// A double `?` would produce an invalid URL.
+    #[test]
+    fn append_log_level_param_never_produces_double_question_mark() {
+        let result = append_log_level_param("ws://host/path?existing=1", "warn");
+        assert_eq!(
+            result.matches('?').count(),
+            1,
+            "must contain exactly one '?'"
         );
     }
 
