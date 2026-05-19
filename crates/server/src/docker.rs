@@ -422,12 +422,13 @@ ENTRYPOINT ["/usr/local/bin/remerge-worker"]
             "REMERGE_WORKORDER_PATH=/var/cache/remerge/workorder/workorder.json".to_string(),
             "REMERGE_PARITY_OUTPUT_DIR=/var/cache/remerge/parity".to_string(),
             format!("REMERGE_WORKORDER_ID={workorder_id}"),
-            // Capture at info by default.  The per-connection ceiling filter
-            // in the WS handler gates what gets forwarded to each client, so
-            // operators who need more detail can reconnect with --verbose/-vv.
-            // Set REMERGE_WORKER_LOG_LEVEL=debug/trace in the server
-            // environment to increase the capture level globally.
-            "REMERGE_WORKER_LOG_LEVEL=info".to_string(),
+            // Inherit the worker log level from the server process environment
+            // so operators can raise it (e.g. REMERGE_WORKER_LOG_LEVEL=debug)
+            // without code changes.  Hard-code "info" only as a default.
+            format!(
+                "REMERGE_WORKER_LOG_LEVEL={}",
+                std::env::var("REMERGE_WORKER_LOG_LEVEL").unwrap_or_else(|_| "info".to_string())
+            ),
         ];
         if let Some(traceparent) = traceparent {
             env.push(format!("REMERGE_TRACEPARENT={traceparent}"));

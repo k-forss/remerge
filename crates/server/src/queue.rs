@@ -712,10 +712,12 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
                             prefix_buf.push(b);
                             let n = prefix_buf.len();
 
-                            if b == b'\n' {
-                                // Line ended before we accumulated enough bytes
-                                // to match the prefix — short/empty line.
-                                // Forward immediately and run pattern matching.
+                            if b == b'\n' || b == b'\r' {
+                                // Line ended (\n = newline, \r = carriage-return
+                                // used by PTY progress bars like download meters)
+                                // before we accumulated enough bytes to match the
+                                // prefix — short/empty line.  Forward immediately
+                                // and run pattern matching.
                                 forward.extend_from_slice(&prefix_buf);
                                 pattern_buf.extend_from_slice(&prefix_buf);
                                 let line = String::from_utf8_lossy(&pattern_buf)
@@ -759,24 +761,29 @@ async fn process_workorder(state: &Arc<AppState>, workorder: Workorder) -> anyho
                             forward.push(b);
                             pattern_buf.push(b);
 
-                            if b == b'\n' {
+                            if b == b'\n' || b == b'\r' {
+                                // \r resets line-start state so a REMERGE_EVENT:
+                                // prefix right after a PTY carriage-return will
+                                // be detected on the next iteration.
                                 let line = String::from_utf8_lossy(&pattern_buf)
                                     .trim_end_matches(['\r', '\n'])
                                     .to_string();
                                 pattern_buf.clear();
                                 at_line_start = true;
-                                match_emerge_line(
-                                    &line,
-                                    &re_emerging,
-                                    &re_completed,
-                                    &re_error,
-                                    &re_missing_dep,
-                                    &re_use_conflict,
-                                    &re_fetch_fail,
-                                    &mut current_package,
-                                    &event_tx,
-                                )
-                                .await;
+                                if b == b'\n' {
+                                    match_emerge_line(
+                                        &line,
+                                        &re_emerging,
+                                        &re_completed,
+                                        &re_error,
+                                        &re_missing_dep,
+                                        &re_use_conflict,
+                                        &re_fetch_fail,
+                                        &mut current_package,
+                                        &event_tx,
+                                    )
+                                    .await;
+                                }
                             }
                         }
                     }
